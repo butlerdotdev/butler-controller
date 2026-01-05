@@ -14,141 +14,370 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package addons provides utilities for installing and managing cluster addons.
 package addons
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"os/exec"
 
-	"k8s.io/client-go/rest"
-
-	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// Installer handles addon installation for tenant clusters.
-//
-// It uses the Helm SDK to install, upgrade, and remove addons.
-// For Butler built-in addons, it knows the chart repository and
-// default values. For custom addons, it uses the HelmChartSpec.
-//
-// Installation order matters for some addons:
-// 1. CNI (Cilium) - required for networking
-// 2. LoadBalancer (MetalLB) - needs memberlist secret created first
-// 3. cert-manager - may be required by other addons
-// 4. Storage (Longhorn) - needs iscsi on nodes
-// 5. Ingress (Traefik)
-// 6. GitOps (Flux) - bootstraps last, then hands off
+// Default addon versions
+const (
+	DefaultCiliumVersion      = "1.17.0"
+	DefaultCertManagerVersion = "v1.16.2"
+	DefaultLonghornVersion    = "1.7.2"
+	DefaultMetalLBVersion     = "0.14.9"
+	DefaultTraefikVersion     = "34.3.0"
+)
+
+// Installer handles addon installations on tenant clusters.
+// Tenant clusters use Kamaji hosted control planes, so Cilium must be
+// configured to reach the API server via kubernetes.default.svc.cluster.local
+// rather than localhost:7445 used on management clusters.
 type Installer struct {
-	// BuiltinCharts maps addon names to chart info.
-	BuiltinCharts map[string]ChartInfo
+	kubectlPath string
+	helmPath    string
 }
 
-// ChartInfo describes a Helm chart.
-type ChartInfo struct {
-	Repository    string
-	ChartName     string
-	DefaultValues map[string]interface{}
-}
-
-// NewInstaller creates a new addon installer.
+// NewInstaller creates a new tenant addon installer.
 func NewInstaller() *Installer {
 	return &Installer{
-		BuiltinCharts: map[string]ChartInfo{
-			"cilium": {
-				Repository: "https://helm.cilium.io/",
-				ChartName:  "cilium",
-			},
-			"metallb": {
-				Repository: "https://metallb.github.io/metallb",
-				ChartName:  "metallb",
-			},
-			"cert-manager": {
-				Repository: "https://charts.jetstack.io",
-				ChartName:  "cert-manager",
-				DefaultValues: map[string]interface{}{
-					"installCRDs": true,
-				},
-			},
-			"longhorn": {
-				Repository: "https://charts.longhorn.io",
-				ChartName:  "longhorn",
-			},
-			"traefik": {
-				Repository: "https://traefik.github.io/charts",
-				ChartName:  "traefik",
-			},
-		},
+		kubectlPath: "kubectl",
+		helmPath:    "helm",
 	}
 }
 
-// Install installs an addon into the tenant cluster.
-func (i *Installer) Install(ctx context.Context, restConfig *rest.Config, addon AddonSpec) error {
-	// TODO: Implement using Helm SDK
-	// 1. Create Helm action configuration with tenant REST config
-	// 2. Check if release already exists
-	// 3. If exists, upgrade if version changed
-	// 4. If not exists, install
-	// 5. Wait for release to be healthy
+func (i *Installer) writeKubeconfig(kubeconfig []byte) (string, func(), error) {
+	f, err := os.CreateTemp("", "kubeconfig-*")
+	if err != nil {
+		return "", nil, err
+	}
+	if _, err := f.Write(kubeconfig); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", nil, err
+	}
+	f.Close()
+	return f.Name(), func() { os.Remove(f.Name()) }, nil
+}
+
+func (i *Installer) runHelm(ctx context.Context, kubeconfigPath string, args ...string) error {
+	var fullArgs []string
+
+	if len(args) > 0 && args[0] == "repo" {
+		fullArgs = args
+	} else {
+		fullArgs = append(args, "--kubeconfig", kubeconfigPath)
+	}
+
+	cmd := exec.CommandContext(ctx, i.helmPath, fullArgs...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("helm failed: %w, output: %s", err, string(output))
+	}
 	return nil
 }
 
-// Uninstall removes an addon from the tenant cluster.
-func (i *Installer) Uninstall(ctx context.Context, restConfig *rest.Config, releaseName, namespace string) error {
-	// TODO: Implement using Helm SDK
-	// 1. Create Helm action configuration
-	// 2. Uninstall release
+func (i *Installer) runKubectl(ctx context.Context, kubeconfigPath string, args ...string) error {
+	fullArgs := append([]string{"--kubeconfig", kubeconfigPath}, args...)
+	cmd := exec.CommandContext(ctx, i.kubectlPath, fullArgs...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("kubectl failed: %w, output: %s", err, string(output))
+	}
 	return nil
 }
 
-// IsInstalled checks if an addon is installed.
-func (i *Installer) IsInstalled(ctx context.Context, restConfig *rest.Config, releaseName, namespace string) (bool, string, error) {
-	// TODO: Implement using Helm SDK
-	// Returns: installed, version, error
-	return false, "", nil
+func (i *Installer) ensurePrivilegedNamespace(ctx context.Context, kubeconfigPath string, namespace string) error {
+	logger := log.FromContext(ctx)
+
+	i.runKubectl(ctx, kubeconfigPath, "create", "namespace", namespace)
+
+	if err := i.runKubectl(ctx, kubeconfigPath, "label", "namespace", namespace,
+		"pod-security.kubernetes.io/enforce=privileged",
+		"pod-security.kubernetes.io/enforce-version=latest",
+		"pod-security.kubernetes.io/warn=privileged",
+		"pod-security.kubernetes.io/warn-version=latest",
+		"pod-security.kubernetes.io/audit=privileged",
+		"pod-security.kubernetes.io/audit-version=latest",
+		"--overwrite"); err != nil {
+		logger.Error(err, "failed to label namespace as privileged", "namespace", namespace)
+		return err
+	}
+
+	return nil
 }
 
-// AddonSpec is a simplified addon specification.
-type AddonSpec struct {
-	Name        string
-	Version     string
-	Namespace   string
-	ReleaseName string
-	Values      map[string]interface{}
-	Chart       *CustomChart
+// InstallCilium installs Cilium CNI configured for hosted control planes.
+func (i *Installer) InstallCilium(ctx context.Context, kubeconfig []byte, version string, apiServerHost string, apiServerPort string) error {
+	logger := log.FromContext(ctx)
+
+	kubeconfigPath, cleanup, err := i.writeKubeconfig(kubeconfig)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if version == "" {
+		version = DefaultCiliumVersion
+	}
+
+	logger.Info("installing Cilium for tenant cluster", "version", version)
+
+	i.ensurePrivilegedNamespace(ctx, kubeconfigPath, "kube-system")
+
+	if err := i.runHelm(ctx, kubeconfigPath, "repo", "add", "cilium", "https://helm.cilium.io/"); err != nil {
+		logger.V(1).Info("helm repo add failed (may already exist)", "error", err)
+	}
+	if err := i.runHelm(ctx, kubeconfigPath, "repo", "update"); err != nil {
+		logger.V(1).Info("helm repo update failed", "error", err)
+	}
+
+	args := []string{
+		"upgrade", "--install", "cilium", "cilium/cilium",
+		"--version", version,
+		"--namespace", "kube-system",
+		"--set", "ipam.mode=kubernetes",
+		"--set", "kubeProxyReplacement=true",
+		"--set", "securityContext.capabilities.ciliumAgent={CHOWN,KILL,NET_ADMIN,NET_RAW,IPC_LOCK,SYS_ADMIN,SYS_RESOURCE,DAC_OVERRIDE,FOWNER,SETGID,SETUID}",
+		"--set", "securityContext.capabilities.cleanCiliumState={NET_ADMIN,SYS_ADMIN,SYS_RESOURCE}",
+		"--set", "cgroup.autoMount.enabled=false",
+		"--set", "cgroup.hostRoot=/sys/fs/cgroup",
+		"--set", "k8sServiceHost=kubernetes.default.svc.cluster.local",
+		"--set", "k8sServicePort=443",
+		"--set", "hubble.relay.enabled=true",
+		"--set", "hubble.ui.enabled=true",
+		"--set", fmt.Sprintf("k8sServiceHost=%s", apiServerHost),
+		"--set", fmt.Sprintf("k8sServicePort=%s", apiServerPort),
+		"--wait",
+		"--timeout", "10m",
+	}
+
+	if err := i.runHelm(ctx, kubeconfigPath, args...); err != nil {
+		return fmt.Errorf("failed to install Cilium: %w", err)
+	}
+
+	logger.Info("Cilium installed successfully")
+	return nil
 }
 
-// CustomChart represents a non-builtin Helm chart.
-type CustomChart struct {
-	Repository string
-	ChartName  string
+// InstallCertManager installs cert-manager for TLS certificate management.
+func (i *Installer) InstallCertManager(ctx context.Context, kubeconfig []byte, version string) error {
+	logger := log.FromContext(ctx)
+
+	kubeconfigPath, cleanup, err := i.writeKubeconfig(kubeconfig)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if version == "" {
+		version = DefaultCertManagerVersion
+	}
+
+	logger.Info("installing cert-manager", "version", version)
+
+	if err := i.ensurePrivilegedNamespace(ctx, kubeconfigPath, "cert-manager"); err != nil {
+		return fmt.Errorf("failed to prepare cert-manager namespace: %w", err)
+	}
+
+	if err := i.runHelm(ctx, kubeconfigPath, "repo", "add", "jetstack", "https://charts.jetstack.io"); err != nil {
+		logger.V(1).Info("helm repo add failed (may already exist)", "error", err)
+	}
+	if err := i.runHelm(ctx, kubeconfigPath, "repo", "update"); err != nil {
+		logger.V(1).Info("helm repo update failed", "error", err)
+	}
+
+	args := []string{
+		"upgrade", "--install", "cert-manager", "jetstack/cert-manager",
+		"--namespace", "cert-manager",
+		"--version", version,
+		"--set", "crds.enabled=true",
+		"--wait",
+		"--timeout", "5m",
+	}
+
+	if err := i.runHelm(ctx, kubeconfigPath, args...); err != nil {
+		return fmt.Errorf("failed to install cert-manager: %w", err)
+	}
+
+	logger.Info("cert-manager installed successfully")
+	return nil
 }
 
-// InstallCNI installs the CNI addon.
-func (i *Installer) InstallCNI(ctx context.Context, restConfig *rest.Config, spec *butlerv1alpha1.CNISpec) error {
-	// Cilium-specific installation
-	return i.Install(ctx, restConfig, AddonSpec{
-		Name:        "cilium",
-		Version:     spec.Version,
-		Namespace:   "kube-system",
-		ReleaseName: "cilium",
-		// TODO: Merge default values with spec.Values
-	})
+// InstallLonghorn installs Longhorn distributed storage.
+func (i *Installer) InstallLonghorn(ctx context.Context, kubeconfig []byte, version string) error {
+	logger := log.FromContext(ctx)
+
+	kubeconfigPath, cleanup, err := i.writeKubeconfig(kubeconfig)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if version == "" {
+		version = DefaultLonghornVersion
+	}
+
+	logger.Info("installing Longhorn", "version", version)
+
+	if err := i.ensurePrivilegedNamespace(ctx, kubeconfigPath, "longhorn-system"); err != nil {
+		return fmt.Errorf("failed to prepare longhorn-system namespace: %w", err)
+	}
+
+	if err := i.runHelm(ctx, kubeconfigPath, "repo", "add", "longhorn", "https://charts.longhorn.io"); err != nil {
+		logger.V(1).Info("helm repo add failed (may already exist)", "error", err)
+	}
+	if err := i.runHelm(ctx, kubeconfigPath, "repo", "update"); err != nil {
+		logger.V(1).Info("helm repo update failed", "error", err)
+	}
+
+	args := []string{
+		"upgrade", "--install", "longhorn", "longhorn/longhorn",
+		"--version", version,
+		"--namespace", "longhorn-system",
+		"--set", "defaultSettings.defaultReplicaCount=2",
+		"--set", "defaultSettings.defaultDataPath=/var/lib/longhorn",
+		"--wait",
+		"--timeout", "10m",
+	}
+
+	if err := i.runHelm(ctx, kubeconfigPath, args...); err != nil {
+		return fmt.Errorf("failed to install Longhorn: %w", err)
+	}
+
+	logger.Info("Longhorn installed successfully")
+	return nil
 }
 
-// InstallLoadBalancer installs the load balancer addon.
-func (i *Installer) InstallLoadBalancer(ctx context.Context, restConfig *rest.Config, spec *butlerv1alpha1.LoadBalancerSpec) error {
-	// TODO: Create memberlist secret first
-	return i.Install(ctx, restConfig, AddonSpec{
-		Name:        "metallb",
-		Version:     spec.Version,
-		Namespace:   "metallb-system",
-		ReleaseName: "metallb",
-	})
+// InstallMetalLB installs MetalLB load balancer and configures the IP pool.
+func (i *Installer) InstallMetalLB(ctx context.Context, kubeconfig []byte, version string, poolStart string, poolEnd string) error {
+	logger := log.FromContext(ctx)
+
+	kubeconfigPath, cleanup, err := i.writeKubeconfig(kubeconfig)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if version == "" {
+		version = DefaultMetalLBVersion
+	}
+
+	logger.Info("installing MetalLB", "version", version)
+
+	if err := i.ensurePrivilegedNamespace(ctx, kubeconfigPath, "metallb-system"); err != nil {
+		return fmt.Errorf("failed to prepare metallb-system namespace: %w", err)
+	}
+
+	if err := i.runHelm(ctx, kubeconfigPath, "repo", "add", "metallb", "https://metallb.github.io/metallb"); err != nil {
+		logger.V(1).Info("helm repo add failed (may already exist)", "error", err)
+	}
+	if err := i.runHelm(ctx, kubeconfigPath, "repo", "update"); err != nil {
+		logger.V(1).Info("helm repo update failed", "error", err)
+	}
+
+	args := []string{
+		"upgrade", "--install", "metallb", "metallb/metallb",
+		"--namespace", "metallb-system",
+		"--version", version,
+		"--wait",
+		"--timeout", "5m",
+	}
+
+	if err := i.runHelm(ctx, kubeconfigPath, args...); err != nil {
+		return fmt.Errorf("failed to install MetalLB: %w", err)
+	}
+
+	if poolStart != "" && poolEnd != "" {
+		addressRange := fmt.Sprintf("%s-%s", poolStart, poolEnd)
+		logger.Info("configuring MetalLB IP pool", "range", addressRange)
+
+		poolManifest := fmt.Sprintf(`apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: default-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - %s
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: default
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - default-pool
+`, addressRange)
+
+		tmpFile, err := os.CreateTemp("", "metallb-pool-*.yaml")
+		if err != nil {
+			return fmt.Errorf("failed to create temp file: %w", err)
+		}
+		defer os.Remove(tmpFile.Name())
+
+		if _, err := tmpFile.WriteString(poolManifest); err != nil {
+			return fmt.Errorf("failed to write pool manifest: %w", err)
+		}
+		tmpFile.Close()
+
+		if err := i.runKubectl(ctx, kubeconfigPath, "apply", "-f", tmpFile.Name()); err != nil {
+			return fmt.Errorf("failed to apply MetalLB pool: %w", err)
+		}
+	}
+
+	logger.Info("MetalLB installed successfully")
+	return nil
 }
 
-// CreateMetalLBPrerequisites creates resources needed before MetalLB install.
-func (i *Installer) CreateMetalLBPrerequisites(ctx context.Context, restConfig *rest.Config) error {
-	// TODO: Create memberlist secret
-	// The secret needs to be created before MetalLB starts
+// InstallTraefik installs Traefik ingress controller.
+func (i *Installer) InstallTraefik(ctx context.Context, kubeconfig []byte, version string) error {
+	logger := log.FromContext(ctx)
+
+	kubeconfigPath, cleanup, err := i.writeKubeconfig(kubeconfig)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if version == "" {
+		version = DefaultTraefikVersion
+	}
+
+	logger.Info("installing Traefik", "version", version)
+
+	if err := i.ensurePrivilegedNamespace(ctx, kubeconfigPath, "traefik"); err != nil {
+		return fmt.Errorf("failed to prepare traefik namespace: %w", err)
+	}
+
+	if err := i.runHelm(ctx, kubeconfigPath, "repo", "add", "traefik", "https://traefik.github.io/charts"); err != nil {
+		logger.V(1).Info("helm repo add failed (may already exist)", "error", err)
+	}
+	if err := i.runHelm(ctx, kubeconfigPath, "repo", "update"); err != nil {
+		logger.V(1).Info("helm repo update failed", "error", err)
+	}
+
+	args := []string{
+		"upgrade", "--install", "traefik", "traefik/traefik",
+		"--namespace", "traefik",
+		"--version", version,
+		"--set", "ingressClass.enabled=true",
+		"--set", "ingressClass.isDefaultClass=true",
+		"--set", "service.type=LoadBalancer",
+		"--wait",
+		"--timeout", "5m",
+	}
+
+	if err := i.runHelm(ctx, kubeconfigPath, args...); err != nil {
+		return fmt.Errorf("failed to install Traefik: %w", err)
+	}
+
+	logger.Info("Traefik installed successfully")
 	return nil
 }

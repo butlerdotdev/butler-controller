@@ -32,6 +32,7 @@ import (
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
 
+	"github.com/butlerdotdev/butler-controller/internal/addons"
 	"github.com/butlerdotdev/butler-controller/internal/controller/butlerconfig"
 	"github.com/butlerdotdev/butler-controller/internal/controller/kamajisecret"
 	"github.com/butlerdotdev/butler-controller/internal/controller/kamajistatus"
@@ -112,8 +113,9 @@ func main() {
 
 	// TenantCluster controller. Orchestrates CAPI resources
 	if err = (&tenantcluster.Reconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Installer: addons.NewInstaller(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "TenantCluster")
 		os.Exit(1)

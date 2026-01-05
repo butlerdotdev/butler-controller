@@ -243,20 +243,6 @@ func (b *Builder) buildKamajiControlPlane(name string) *unstructured.Unstructure
 		"replicas":      replicas,
 		"dataStoreName": dataStoreName,
 
-		// API server configuration - required for external cloud provider (Harvester)
-		"apiServer": map[string]interface{}{
-			"extraArgs": []interface{}{
-				"--cloud-provider=external",
-			},
-		},
-
-		// Controller manager configuration - required for external cloud provider
-		"controllerManager": map[string]interface{}{
-			"extraArgs": []interface{}{
-				"--cloud-provider=external",
-			},
-		},
-
 		// Addons - Kamaji manages these automatically
 		// konnectivity is enabled by default, version matched automatically
 		"addons": map[string]interface{}{
@@ -539,9 +525,7 @@ func (b *Builder) buildKubeadmConfigTemplate(name string) *unstructured.Unstruct
 			"spec": map[string]interface{}{
 				"joinConfiguration": map[string]interface{}{
 					"nodeRegistration": map[string]interface{}{
-						"kubeletExtraArgs": map[string]interface{}{
-							"cloud-provider": "external",
-						},
+						"imagePullPolicy": "IfNotPresent",
 					},
 				},
 				"preKubeadmCommands": b.buildRockyLinuxBootstrapCommands(k8sMinorVersion),

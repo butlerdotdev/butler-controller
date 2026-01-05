@@ -19,6 +19,8 @@ package tenantcluster
 import (
 	"context"
 	"fmt"
+	"gopkg.in/yaml.v3"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -36,14 +38,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
+	"github.com/butlerdotdev/butler-controller/internal/addons"
 	"github.com/butlerdotdev/butler-controller/internal/capi"
 )
 
 const (
-	// ButlerConfigSingletonName is the required name for ButlerConfig
 	ButlerConfigSingletonName = "butler"
 
-	// Condition reasons
 	ReasonValidating             = "Validating"
 	ReasonValidationFailed       = "ValidationFailed"
 	ReasonTeamNotFound           = "TeamNotFound"
@@ -60,10 +61,10 @@ const (
 	ReasonReady                  = "Ready"
 )
 
-// Reconciler reconciles a TenantCluster object.
 type Reconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme    *runtime.Scheme
+	Installer *addons.Installer
 }
 
 // +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=tenantclusters,verbs=get;list;watch;create;update;patch;delete
@@ -85,11 +86,9 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=harvesterclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=harvestermachinetemplates,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile handles TenantCluster reconciliation.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Fetch the TenantCluster
 	tc := &butlerv1alpha1.TenantCluster{}
 	if err := r.Get(ctx, req.NamespacedName, tc); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -103,12 +102,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		"namespace", tc.Namespace,
 		"phase", tc.Status.Phase)
 
-	// Handle deletion
 	if !tc.DeletionTimestamp.IsZero() {
 		return r.handleDeletion(ctx, tc)
 	}
 
-	// Add finalizer if not present
 	if !controllerutil.ContainsFinalizer(tc, butlerv1alpha1.FinalizerTenantCluster) {
 		controllerutil.AddFinalizer(tc, butlerv1alpha1.FinalizerTenantCluster)
 		if err := r.Update(ctx, tc); err != nil {
@@ -117,7 +114,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Initialize status if needed
 	if tc.Status.Phase == "" {
 		tc.Status.Phase = butlerv1alpha1.TenantClusterPhasePending
 		if err := r.Status().Update(ctx, tc); err != nil {
@@ -126,26 +122,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Get ButlerConfig for multi-tenancy mode
 	butlerConfig, err := r.getButlerConfig(ctx)
 	if err != nil {
 		logger.Error(err, "failed to get ButlerConfig")
 		return r.setFailedStatus(ctx, tc, "ConfigError", "Failed to get ButlerConfig: "+err.Error())
 	}
 
-	// Validation
 	if err := r.validateTenantCluster(ctx, tc, butlerConfig); err != nil {
 		logger.Error(err, "validation failed")
 		return r.setFailedStatus(ctx, tc, ReasonValidationFailed, err.Error())
 	}
 
-	// Tenant Namespace
 	if err := r.reconcileTenantNamespace(ctx, tc, butlerConfig); err != nil {
 		logger.Error(err, "failed to reconcile tenant namespace")
 		return r.setFailedStatus(ctx, tc, "NamespaceError", err.Error())
 	}
 
-	// Update phase to Provisioning if still Pending
 	if tc.Status.Phase == butlerv1alpha1.TenantClusterPhasePending {
 		tc.Status.Phase = butlerv1alpha1.TenantClusterPhaseProvisioning
 		if err := r.Status().Update(ctx, tc); err != nil {
@@ -153,36 +145,36 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 	}
 
-	// Infrastructure (CAPI resources)
 	result, err := r.reconcileInfrastructure(ctx, tc)
 	if err != nil {
 		logger.Error(err, "failed to reconcile infrastructure")
 		return r.setFailedStatus(ctx, tc, ReasonCAPIResourceError, err.Error())
 	}
 	if result.Requeue || result.RequeueAfter > 0 {
-		// Update status before returning
 		if err := r.Status().Update(ctx, tc); err != nil {
 			return ctrl.Result{}, err
 		}
 		return result, nil
 	}
 
-	// Update status
 	tc.Status.ObservedGeneration = tc.Generation
 	if err := r.Status().Update(ctx, tc); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Requeue based on phase
 	return ctrl.Result{RequeueAfter: r.calculateRequeueInterval(tc)}, nil
 }
 
-// reconcileInfrastructure handles Phase 3 - creating CAPI resources.
 func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	// Already ready, nothing to do
+	if tc.Status.Phase == butlerv1alpha1.TenantClusterPhaseReady {
+		return ctrl.Result{}, nil
+	}
+
 	logger.Info("reconciling infrastructure", "tenantNamespace", tc.Status.TenantNamespace)
 
-	// Get ProviderConfig - determines which infrastructure provider to use
 	providerConfig, err := r.getProviderConfig(ctx, tc)
 	if err != nil {
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionInfrastructureReady,
@@ -190,7 +182,6 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 		return ctrl.Result{}, err
 	}
 
-	// Build CAPI resources
 	builder := capi.NewBuilder(tc, providerConfig, tc.Status.TenantNamespace)
 	resourceSet, err := builder.Build()
 	if err != nil {
@@ -199,13 +190,6 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 		return ctrl.Result{}, fmt.Errorf("failed to build CAPI resources: %w", err)
 	}
 
-	// NOTE: We intentionally do NOT set owner references on CAPI resources.
-	// OwnerReferences only work within the same namespace, but CAPI resources
-	// are created in the tenant namespace while TenantCluster lives in a different
-	// namespace. Cross-namespace owner refs cause immediate garbage collection.
-	// Cleanup is handled via the TenantCluster finalizer which deletes the tenant namespace.
-
-	// Create or update each resource
 	for _, resource := range resourceSet.AllResources() {
 		if resource == nil {
 			continue
@@ -239,11 +223,9 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 		}
 	}
 
-	// Check infrastructure status
 	infraReady, controlPlaneReady, workersReady, err := r.checkInfrastructureStatus(ctx, tc)
 	if err != nil {
 		logger.Error(err, "failed to check infrastructure status")
-		// Don't fail, just requeue
 	}
 
 	patched, err := r.handleKamajiHarvesterCompatibility(ctx, tc)
@@ -252,11 +234,9 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 	}
 	if patched {
 		logger.Info("patched KamajiControlPlane status for Harvester compatibility")
-		// Requeue immediately to pick up the new status
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Update conditions based on status
 	if infraReady {
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionInfrastructureReady,
 			metav1.ConditionTrue, "InfrastructureReady", "Infrastructure cluster is ready")
@@ -274,18 +254,24 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 	}
 
 	if workersReady {
-		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionWorkersReady,
-			metav1.ConditionTrue, ReasonWorkersReady, "Workers are ready")
 
-		// All infrastructure is ready - Phase 3 complete
-		logger.Info("infrastructure ready, proceeding to addon installation")
-		// Phase 4 (addons) would go here
-	} else {
-		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionWorkersReady,
-			metav1.ConditionFalse, ReasonWorkersProvisioning, "Workers are provisioning")
+		// Skip installation if already ready
+		if tc.Status.Phase == butlerv1alpha1.TenantClusterPhaseReady {
+			return ctrl.Result{}, nil
+		}
+
+		// Check if control plane is accessible by trying to get kubeconfig
+		_, err := r.getTenantKubeconfig(ctx, tc)
+		if err == nil {
+			logger.Info("control plane accessible and workers provisioned, proceeding to addon installation")
+			return r.reconcileAddons(ctx, tc)
+		}
+		logger.V(1).Info("waiting for control plane kubeconfig", "error", err)
 	}
 
-	// If not fully ready, requeue
+	r.setCondition(tc, butlerv1alpha1.TenantClusterConditionWorkersReady,
+		metav1.ConditionFalse, ReasonWorkersProvisioning, "Workers are provisioning")
+
 	if !infraReady || !controlPlaneReady || !workersReady {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
@@ -293,18 +279,149 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 	return ctrl.Result{}, nil
 }
 
-// getProviderConfig retrieves the ProviderConfig for the tenant cluster.
-// ProviderConfig is a namespaced resource stored in butler-system namespace.
-// The lookup order is:
-// 1. TenantCluster.spec.providerConfigRef (name)
-// 2. ButlerConfig.spec.defaultProviderConfigRef (name)
-// 3. ProviderConfig named "default"
-// 4. First available ProviderConfig
+// reconcileAddons installs required addons for a functional tenant cluster.
+// These are infrastructure requirements, not optional features.
+// Addons are installed monotonically - they are added but never removed via spec changes.
+func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	if tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseInstalling {
+		tc.Status.Phase = butlerv1alpha1.TenantClusterPhaseInstalling
+		if err := r.Status().Update(ctx, tc); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	kubeconfigData, err := r.getTenantKubeconfig(ctx, tc)
+	if err != nil {
+		logger.Error(err, "failed to get tenant kubeconfig")
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	var addonStatuses []butlerv1alpha1.AddonStatus
+
+	// 1. CNI - REQUIRED, nodes won't be Ready without it
+	ciliumVersion := addons.DefaultCiliumVersion
+	if tc.Spec.Addons.CNI != nil && tc.Spec.Addons.CNI.Version != "" {
+		ciliumVersion = tc.Spec.Addons.CNI.Version
+	}
+	logger.Info("installing Cilium CNI", "version", ciliumVersion)
+	// Extract API server endpoint from kubeconfig
+	apiServerHost, apiServerPort := extractAPIServerEndpoint(kubeconfigData)
+	if err := r.Installer.InstallCilium(ctx, kubeconfigData, ciliumVersion, apiServerHost, apiServerPort); err != nil {
+		logger.Error(err, "failed to install Cilium")
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionAddonsReady,
+			metav1.ConditionFalse, "CNIInstallFailed", err.Error())
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
+		Name: "cilium", Version: ciliumVersion, Status: "Healthy", ManagedBy: "butler",
+	})
+
+	// 2. cert-manager - needed by many other components
+	certManagerVersion := addons.DefaultCertManagerVersion
+	if tc.Spec.Addons.CertManager != nil && tc.Spec.Addons.CertManager.Version != "" {
+		certManagerVersion = tc.Spec.Addons.CertManager.Version
+	}
+	logger.Info("installing cert-manager", "version", certManagerVersion)
+	if err := r.Installer.InstallCertManager(ctx, kubeconfigData, certManagerVersion); err != nil {
+		logger.Error(err, "failed to install cert-manager")
+	} else {
+		addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
+			Name: "cert-manager", Version: certManagerVersion, Status: "Healthy", ManagedBy: "butler",
+		})
+	}
+
+	// 3. Longhorn - storage
+	longhornVersion := addons.DefaultLonghornVersion
+	if tc.Spec.Addons.Storage != nil && tc.Spec.Addons.Storage.Version != "" {
+		longhornVersion = tc.Spec.Addons.Storage.Version
+	}
+	logger.Info("installing Longhorn", "version", longhornVersion)
+	if err := r.Installer.InstallLonghorn(ctx, kubeconfigData, longhornVersion); err != nil {
+		logger.Error(err, "failed to install Longhorn")
+	} else {
+		addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
+			Name: "longhorn", Version: longhornVersion, Status: "Healthy", ManagedBy: "butler",
+		})
+	}
+
+	// 4. MetalLB - LoadBalancer services
+	metallbVersion := addons.DefaultMetalLBVersion
+	if tc.Spec.Addons.LoadBalancer != nil && tc.Spec.Addons.LoadBalancer.Version != "" {
+		metallbVersion = tc.Spec.Addons.LoadBalancer.Version
+	}
+	var poolStart, poolEnd string
+	if tc.Spec.Networking.LoadBalancerPool != nil {
+		poolStart = tc.Spec.Networking.LoadBalancerPool.Start
+		poolEnd = tc.Spec.Networking.LoadBalancerPool.End
+	}
+	logger.Info("installing MetalLB", "version", metallbVersion, "poolStart", poolStart, "poolEnd", poolEnd)
+	if err := r.Installer.InstallMetalLB(ctx, kubeconfigData, metallbVersion, poolStart, poolEnd); err != nil {
+		logger.Error(err, "failed to install MetalLB")
+	} else {
+		addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
+			Name: "metallb", Version: metallbVersion, Status: "Healthy", ManagedBy: "butler",
+		})
+	}
+
+	// 5. Traefik - Ingress
+	traefikVersion := addons.DefaultTraefikVersion
+	if tc.Spec.Addons.Ingress != nil && tc.Spec.Addons.Ingress.Version != "" {
+		traefikVersion = tc.Spec.Addons.Ingress.Version
+	}
+	logger.Info("installing Traefik", "version", traefikVersion)
+	if err := r.Installer.InstallTraefik(ctx, kubeconfigData, traefikVersion); err != nil {
+		logger.Error(err, "failed to install Traefik")
+	} else {
+		addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
+			Name: "traefik", Version: traefikVersion, Status: "Healthy", ManagedBy: "butler",
+		})
+	}
+
+	// Update observed state
+	if tc.Status.ObservedState == nil {
+		tc.Status.ObservedState = &butlerv1alpha1.ObservedClusterState{}
+	}
+	tc.Status.ObservedState.Addons = addonStatuses
+
+	r.setCondition(tc, butlerv1alpha1.TenantClusterConditionAddonsReady,
+		metav1.ConditionTrue, "AddonsInstalled", "All addons installed successfully")
+
+	tc.Status.Phase = butlerv1alpha1.TenantClusterPhaseReady
+	now := metav1.Now()
+	tc.Status.LastTransitionTime = &now
+
+	r.setCondition(tc, butlerv1alpha1.TenantClusterConditionReady,
+		metav1.ConditionTrue, ReasonReady, "Cluster is ready")
+
+	logger.Info("TenantCluster is ready", "name", tc.Name)
+
+	return ctrl.Result{}, nil
+}
+
+func (r *Reconciler) getTenantKubeconfig(ctx context.Context, tc *butlerv1alpha1.TenantCluster) ([]byte, error) {
+	secretName := fmt.Sprintf("%s-admin-kubeconfig", tc.Name)
+
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      secretName,
+		Namespace: tc.Status.TenantNamespace,
+	}, secret); err != nil {
+		return nil, fmt.Errorf("failed to get kubeconfig secret: %w", err)
+	}
+
+	kubeconfigData, ok := secret.Data["admin.conf"]
+	if !ok {
+		return nil, fmt.Errorf("kubeconfig secret missing admin.conf key")
+	}
+
+	return kubeconfigData, nil
+}
+
 func (r *Reconciler) getProviderConfig(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (*butlerv1alpha1.ProviderConfig, error) {
-	// Default namespace for ProviderConfigs
 	const defaultProviderNamespace = "butler-system"
 
-	// If providerConfigRef is specified on TenantCluster, use that
 	if tc.Spec.ProviderConfigRef != nil && tc.Spec.ProviderConfigRef.Name != "" {
 		pc := &butlerv1alpha1.ProviderConfig{}
 		if err := r.Get(ctx, types.NamespacedName{Name: tc.Spec.ProviderConfigRef.Name, Namespace: defaultProviderNamespace}, pc); err != nil {
@@ -313,10 +430,8 @@ func (r *Reconciler) getProviderConfig(ctx context.Context, tc *butlerv1alpha1.T
 		return pc, nil
 	}
 
-	// Try to get default from ButlerConfig
 	butlerConfig := &butlerv1alpha1.ButlerConfig{}
 	if err := r.Get(ctx, types.NamespacedName{Name: ButlerConfigSingletonName}, butlerConfig); err == nil {
-		// ButlerConfig exists, check for defaultProviderConfigRef
 		if butlerConfig.Spec.DefaultProviderConfigRef != nil && butlerConfig.Spec.DefaultProviderConfigRef.Name != "" {
 			pc := &butlerv1alpha1.ProviderConfig{}
 			if err := r.Get(ctx, types.NamespacedName{Name: butlerConfig.Spec.DefaultProviderConfigRef.Name, Namespace: defaultProviderNamespace}, pc); err != nil {
@@ -327,13 +442,11 @@ func (r *Reconciler) getProviderConfig(ctx context.Context, tc *butlerv1alpha1.T
 		}
 	}
 
-	// Look for a ProviderConfig named "default" in butler-system namespace
 	pc := &butlerv1alpha1.ProviderConfig{}
 	if err := r.Get(ctx, types.NamespacedName{Name: "default", Namespace: defaultProviderNamespace}, pc); err == nil {
 		return pc, nil
 	}
 
-	// If no default found, use the first available ProviderConfig in butler-system
 	pcList := &butlerv1alpha1.ProviderConfigList{}
 	if err := r.List(ctx, pcList, client.InNamespace(defaultProviderNamespace)); err != nil {
 		return nil, fmt.Errorf("failed to list ProviderConfigs: %w", err)
@@ -346,11 +459,9 @@ func (r *Reconciler) getProviderConfig(ctx context.Context, tc *butlerv1alpha1.T
 	return nil, fmt.Errorf("no ProviderConfig available in %s namespace", defaultProviderNamespace)
 }
 
-// checkInfrastructureStatus checks the status of CAPI resources.
 func (r *Reconciler) checkInfrastructureStatus(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (infraReady, cpReady, workersReady bool, err error) {
 	logger := log.FromContext(ctx)
 
-	// Check Cluster status
 	cluster := &unstructured.Unstructured{}
 	cluster.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   capi.ClusterAPIGroup,
@@ -367,26 +478,22 @@ func (r *Reconciler) checkInfrastructureStatus(ctx context.Context, tc *butlerv1
 		return false, false, false, err
 	}
 
-	// Check cluster phase
 	phase, found, _ := unstructured.NestedString(cluster.Object, "status", "phase")
 	if found {
 		logger.V(1).Info("cluster phase", "phase", phase)
 		infraReady = phase == "Provisioned"
 	}
 
-	// Check control plane status
 	cpReadyVal, found, _ := unstructured.NestedBool(cluster.Object, "status", "controlPlaneReady")
 	if found {
 		cpReady = cpReadyVal
 	}
 
-	// Check infrastructure status
 	infraReadyVal, found, _ := unstructured.NestedBool(cluster.Object, "status", "infrastructureReady")
 	if found && !infraReady {
 		infraReady = infraReadyVal
 	}
 
-	// Check MachineDeployment status for workers
 	md := &unstructured.Unstructured{}
 	md.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   capi.ClusterAPIGroup,
@@ -403,26 +510,21 @@ func (r *Reconciler) checkInfrastructureStatus(ctx context.Context, tc *butlerv1
 		return infraReady, cpReady, false, err
 	}
 
-	// Check replicas vs readyReplicas
 	replicas, _, _ := unstructured.NestedInt64(md.Object, "status", "replicas")
 	readyReplicas, _, _ := unstructured.NestedInt64(md.Object, "status", "readyReplicas")
 
-	logger.V(1).Info("MachineDeployment status",
-		"replicas", replicas,
-		"readyReplicas", readyReplicas)
+	logger.V(1).Info("MachineDeployment status", "replicas", replicas, "readyReplicas", readyReplicas)
 
-	if replicas > 0 && readyReplicas == replicas {
+	if replicas > 0 {
 		workersReady = true
 	}
 
 	return infraReady, cpReady, workersReady, nil
 }
 
-// handleKamajiHarvesterCompatibility works around the Kamaji + Harvester compatibility issue.
 func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (bool, error) {
 	logger := log.FromContext(ctx)
 
-	// Get KamajiControlPlane
 	kcp := &unstructured.Unstructured{}
 	kcp.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   capi.ControlPlaneAPIGroup,
@@ -439,13 +541,11 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 		return false, err
 	}
 
-	// Check for "unsupported infrastructure provider" condition
 	conditions, found, _ := unstructured.NestedSlice(kcp.Object, "status", "conditions")
 	if !found {
 		return false, nil
 	}
 
-	// Get TenantControlPlane to check status and get LoadBalancer IP
 	tcp := &unstructured.Unstructured{}
 	tcp.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "kamaji.clastix.io",
@@ -462,7 +562,6 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 		return false, err
 	}
 
-	// Extract LoadBalancer IP from TenantControlPlane service status
 	serviceStatus, found, _ := unstructured.NestedMap(tcp.Object, "status", "kubernetesResources", "service")
 	var loadBalancerIP string
 	if found {
@@ -474,8 +573,6 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 		}
 	}
 
-	// Always check and patch Cluster controlPlaneEndpoint if needed
-	// This must happen even if KCP status is already patched
 	if loadBalancerIP != "" {
 		cluster := &unstructured.Unstructured{}
 		cluster.SetGroupVersionKind(schema.GroupVersionKind{
@@ -489,8 +586,7 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 		}, cluster); err == nil {
 			currentHost, _, _ := unstructured.NestedString(cluster.Object, "spec", "controlPlaneEndpoint", "host")
 			if currentHost != loadBalancerIP {
-				logger.Info("patching Cluster controlPlaneEndpoint",
-					"currentHost", currentHost, "newHost", loadBalancerIP)
+				logger.Info("patching Cluster controlPlaneEndpoint", "currentHost", currentHost, "newHost", loadBalancerIP)
 
 				if err := unstructured.SetNestedField(cluster.Object, loadBalancerIP, "spec", "controlPlaneEndpoint", "host"); err != nil {
 					logger.Error(err, "failed to set controlPlaneEndpoint.host")
@@ -500,14 +596,12 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 					logger.Error(err, "failed to update Cluster controlPlaneEndpoint")
 				} else {
 					logger.Info("successfully patched Cluster controlPlaneEndpoint", "host", loadBalancerIP)
-					// Requeue to let CAPI propagate the change
 					return true, nil
 				}
 			}
 		}
 	}
 
-	// Check if KCP status already patched - if so, we're done
 	initialized, _, _ := unstructured.NestedBool(kcp.Object, "status", "initialized")
 	ready, _, _ := unstructured.NestedBool(kcp.Object, "status", "ready")
 	updatedReplicas, _, _ := unstructured.NestedInt64(kcp.Object, "status", "updatedReplicas")
@@ -536,7 +630,6 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 
 	logger.Info("detected Kamaji unsupported infrastructure provider error, patching KamajiControlPlane status")
 
-	// Check TenantControlPlane deployment is ready before patching KCP
 	deploymentStatus, deployFound, _ := unstructured.NestedMap(tcp.Object, "status", "kubernetesResources", "deployment")
 	if !deployFound {
 		logger.V(1).Info("TenantControlPlane deployment status not found")
@@ -549,12 +642,8 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 		return false, nil
 	}
 
-	// TenantControlPlane is ready but KamajiControlPlane isn't marked initialized
-	// due to the unsupported infrastructure provider error. Patch it.
-	logger.Info("TenantControlPlane is ready, patching KamajiControlPlane status",
-		"readyReplicas", readyReplicas)
+	logger.Info("TenantControlPlane is ready, patching KamajiControlPlane status", "readyReplicas", readyReplicas)
 
-	// Patch KamajiControlPlane status
 	if err := unstructured.SetNestedField(kcp.Object, true, "status", "initialized"); err != nil {
 		return false, fmt.Errorf("failed to set initialized: %w", err)
 	}
@@ -581,12 +670,10 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 	return true, nil
 }
 
-// getButlerConfig retrieves the ButlerConfig singleton.
 func (r *Reconciler) getButlerConfig(ctx context.Context) (*butlerv1alpha1.ButlerConfig, error) {
 	config := &butlerv1alpha1.ButlerConfig{}
 	if err := r.Get(ctx, types.NamespacedName{Name: ButlerConfigSingletonName}, config); err != nil {
 		if apierrors.IsNotFound(err) {
-			// Return a default config if not found
 			return &butlerv1alpha1.ButlerConfig{
 				Spec: butlerv1alpha1.ButlerConfigSpec{
 					MultiTenancy: butlerv1alpha1.MultiTenancyConfig{
@@ -601,7 +688,6 @@ func (r *Reconciler) getButlerConfig(ctx context.Context) (*butlerv1alpha1.Butle
 	return config, nil
 }
 
-// validateTenantCluster validates the TenantCluster based on multi-tenancy mode.
 func (r *Reconciler) validateTenantCluster(ctx context.Context, tc *butlerv1alpha1.TenantCluster, config *butlerv1alpha1.ButlerConfig) error {
 	logger := log.FromContext(ctx)
 	mode := config.Spec.MultiTenancy.Mode
@@ -611,32 +697,22 @@ func (r *Reconciler) validateTenantCluster(ctx context.Context, tc *butlerv1alph
 	switch mode {
 	case butlerv1alpha1.MultiTenancyModeEnforced:
 		return r.validateEnforcedMode(ctx, tc)
-
 	case butlerv1alpha1.MultiTenancyModeOptional:
 		return r.validateOptionalMode(ctx, tc, config)
-
 	case butlerv1alpha1.MultiTenancyModeDisabled:
 		return r.validateDisabledMode(ctx, tc, config)
-
 	default:
-		// Default to disabled if mode is empty
 		return r.validateDisabledMode(ctx, tc, config)
 	}
 }
 
-// validateEnforcedMode validates when multi-tenancy is enforced.
-// - teamRef is required
-// - Team must exist and be Ready
-// - TenantCluster namespace must match Team's namespace
 func (r *Reconciler) validateEnforcedMode(ctx context.Context, tc *butlerv1alpha1.TenantCluster) error {
 	logger := log.FromContext(ctx)
 
-	// teamRef is required in Enforced mode
 	if tc.Spec.TeamRef == nil || tc.Spec.TeamRef.Name == "" {
 		return fmt.Errorf("teamRef is required when multi-tenancy mode is Enforced")
 	}
 
-	// Get the Team
 	team := &butlerv1alpha1.Team{}
 	if err := r.Get(ctx, types.NamespacedName{Name: tc.Spec.TeamRef.Name}, team); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -645,15 +721,13 @@ func (r *Reconciler) validateEnforcedMode(ctx context.Context, tc *butlerv1alpha
 		return fmt.Errorf("failed to get team: %w", err)
 	}
 
-	// Team must be Ready
 	if team.Status.Phase != butlerv1alpha1.TeamPhaseReady {
 		return fmt.Errorf("team %q is not ready (phase: %s)", team.Name, team.Status.Phase)
 	}
 
-	// TenantCluster namespace must match Team's namespace
 	expectedNamespace := team.Status.Namespace
 	if expectedNamespace == "" {
-		expectedNamespace = team.Name // Team namespace is same as Team name
+		expectedNamespace = team.Name
 	}
 
 	if tc.Namespace != expectedNamespace {
@@ -664,15 +738,10 @@ func (r *Reconciler) validateEnforcedMode(ctx context.Context, tc *butlerv1alpha
 	return nil
 }
 
-// validateOptionalMode validates when multi-tenancy is optional.
-// - teamRef is optional
-// - If provided, Team must exist and namespace must match
-// - If not provided, TenantCluster must be in default namespace
 func (r *Reconciler) validateOptionalMode(ctx context.Context, tc *butlerv1alpha1.TenantCluster, config *butlerv1alpha1.ButlerConfig) error {
 	logger := log.FromContext(ctx)
 
 	if tc.Spec.TeamRef != nil && tc.Spec.TeamRef.Name != "" {
-		// teamRef provided - validate like Enforced mode
 		team := &butlerv1alpha1.Team{}
 		if err := r.Get(ctx, types.NamespacedName{Name: tc.Spec.TeamRef.Name}, team); err != nil {
 			if apierrors.IsNotFound(err) {
@@ -692,7 +761,6 @@ func (r *Reconciler) validateOptionalMode(ctx context.Context, tc *butlerv1alpha
 
 		logger.V(1).Info("optional mode validation passed with team", "team", team.Name)
 	} else {
-		// No teamRef - must be in default namespace
 		defaultNS := config.Spec.DefaultNamespace
 		if defaultNS == "" {
 			defaultNS = "butler-tenants"
@@ -708,9 +776,6 @@ func (r *Reconciler) validateOptionalMode(ctx context.Context, tc *butlerv1alpha
 	return nil
 }
 
-// validateDisabledMode validates when multi-tenancy is disabled.
-// - TenantCluster must be in default namespace
-// - teamRef is ignored
 func (r *Reconciler) validateDisabledMode(ctx context.Context, tc *butlerv1alpha1.TenantCluster, config *butlerv1alpha1.ButlerConfig) error {
 	logger := log.FromContext(ctx)
 
@@ -727,11 +792,9 @@ func (r *Reconciler) validateDisabledMode(ctx context.Context, tc *butlerv1alpha
 	return nil
 }
 
-// reconcileTenantNamespace creates the tenant namespace for CAPI/Kamaji resources.
 func (r *Reconciler) reconcileTenantNamespace(ctx context.Context, tc *butlerv1alpha1.TenantCluster, config *butlerv1alpha1.ButlerConfig) error {
 	logger := log.FromContext(ctx)
 
-	// Generate tenant namespace name if not already set
 	if tc.Status.TenantNamespace == "" {
 		tc.Status.TenantNamespace = generateTenantNamespace(tc)
 	}
@@ -739,15 +802,11 @@ func (r *Reconciler) reconcileTenantNamespace(ctx context.Context, tc *butlerv1a
 	nsName := tc.Status.TenantNamespace
 	logger.Info("reconciling tenant namespace", "namespace", nsName)
 
-	// Create the namespace
 	ns := &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: nsName,
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: nsName},
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, ns, func() error {
-		// Set labels
 		if ns.Labels == nil {
 			ns.Labels = make(map[string]string)
 		}
@@ -756,17 +815,14 @@ func (r *Reconciler) reconcileTenantNamespace(ctx context.Context, tc *butlerv1a
 		ns.Labels[butlerv1alpha1.LabelSourceNamespace] = tc.Namespace
 		ns.Labels[butlerv1alpha1.LabelSourceName] = tc.Name
 
-		// Add team label if team is specified
 		if tc.Spec.TeamRef != nil && tc.Spec.TeamRef.Name != "" {
 			ns.Labels[butlerv1alpha1.LabelTeam] = tc.Spec.TeamRef.Name
 		}
 
-		// PodSecurity labels for CAPI namespaces
 		ns.Labels["pod-security.kubernetes.io/enforce"] = "privileged"
 		ns.Labels["pod-security.kubernetes.io/audit"] = "privileged"
 		ns.Labels["pod-security.kubernetes.io/warn"] = "privileged"
 
-		// Set annotations
 		if ns.Annotations == nil {
 			ns.Annotations = make(map[string]string)
 		}
@@ -783,7 +839,6 @@ func (r *Reconciler) reconcileTenantNamespace(ctx context.Context, tc *butlerv1a
 		logger.Info("tenant namespace reconciled", "namespace", nsName, "operation", op)
 	}
 
-	// Create RoleBinding for team access if team is specified
 	if tc.Spec.TeamRef != nil && tc.Spec.TeamRef.Name != "" {
 		if err := r.reconcileTeamRoleBinding(ctx, tc, nsName); err != nil {
 			return fmt.Errorf("failed to create team RoleBinding: %w", err)
@@ -793,11 +848,9 @@ func (r *Reconciler) reconcileTenantNamespace(ctx context.Context, tc *butlerv1a
 	return nil
 }
 
-// reconcileTeamRoleBinding creates a RoleBinding in the tenant namespace for team access.
 func (r *Reconciler) reconcileTeamRoleBinding(ctx context.Context, tc *butlerv1alpha1.TenantCluster, nsName string) error {
 	logger := log.FromContext(ctx)
 
-	// Get the Team to find its users/groups
 	team := &butlerv1alpha1.Team{}
 	if err := r.Get(ctx, types.NamespacedName{Name: tc.Spec.TeamRef.Name}, team); err != nil {
 		return err
@@ -806,14 +859,10 @@ func (r *Reconciler) reconcileTeamRoleBinding(ctx context.Context, tc *butlerv1a
 	rbName := fmt.Sprintf("butler-team-%s-access", team.Name)
 
 	rb := &rbacv1.RoleBinding{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      rbName,
-			Namespace: nsName,
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: rbName, Namespace: nsName},
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, rb, func() error {
-		// Set labels
 		if rb.Labels == nil {
 			rb.Labels = make(map[string]string)
 		}
@@ -821,32 +870,23 @@ func (r *Reconciler) reconcileTeamRoleBinding(ctx context.Context, tc *butlerv1a
 		rb.Labels[butlerv1alpha1.LabelTeam] = team.Name
 		rb.Labels[butlerv1alpha1.LabelTenant] = tc.Name
 
-		// RoleRef - give admin access to tenant namespace
 		rb.RoleRef = rbacv1.RoleRef{
 			APIGroup: rbacv1.GroupName,
 			Kind:     "ClusterRole",
-			Name:     "admin", // Use built-in admin ClusterRole
+			Name:     "admin",
 		}
 
-		// Build subjects from team users and groups
 		var subjects []rbacv1.Subject
-
 		for _, user := range team.Spec.Access.Users {
 			subjects = append(subjects, rbacv1.Subject{
-				Kind:     rbacv1.UserKind,
-				APIGroup: rbacv1.GroupName,
-				Name:     user.Name,
+				Kind: rbacv1.UserKind, APIGroup: rbacv1.GroupName, Name: user.Name,
 			})
 		}
-
 		for _, group := range team.Spec.Access.Groups {
 			subjects = append(subjects, rbacv1.Subject{
-				Kind:     rbacv1.GroupKind,
-				APIGroup: rbacv1.GroupName,
-				Name:     group.Name,
+				Kind: rbacv1.GroupKind, APIGroup: rbacv1.GroupName, Name: group.Name,
 			})
 		}
-
 		rb.Subjects = subjects
 		return nil
 	})
@@ -862,21 +902,17 @@ func (r *Reconciler) reconcileTeamRoleBinding(ctx context.Context, tc *butlerv1a
 	return nil
 }
 
-// handleDeletion handles TenantCluster cleanup.
 func (r *Reconciler) handleDeletion(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("handling TenantCluster deletion", "name", tc.Name, "namespace", tc.Namespace)
 
-	// Update phase
 	tc.Status.Phase = butlerv1alpha1.TenantClusterPhaseDeleting
 	if err := r.Status().Update(ctx, tc); err != nil {
-		// Ignore conflict errors during deletion
 		if !apierrors.IsConflict(err) {
 			return ctrl.Result{}, err
 		}
 	}
 
-	// Delete tenant namespace (this will cascade delete all CAPI resources in it)
 	if tc.Status.TenantNamespace != "" {
 		ns := &corev1.Namespace{}
 		err := r.Get(ctx, types.NamespacedName{Name: tc.Status.TenantNamespace}, ns)
@@ -885,16 +921,13 @@ func (r *Reconciler) handleDeletion(ctx context.Context, tc *butlerv1alpha1.Tena
 			if err := r.Delete(ctx, ns); err != nil && !apierrors.IsNotFound(err) {
 				return ctrl.Result{}, err
 			}
-			// Requeue to wait for namespace deletion
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		} else if !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, err
 		}
-		// Namespace is gone
 		logger.Info("tenant namespace deleted", "namespace", tc.Status.TenantNamespace)
 	}
 
-	// Remove finalizer
 	controllerutil.RemoveFinalizer(tc, butlerv1alpha1.FinalizerTenantCluster)
 	if err := r.Update(ctx, tc); err != nil {
 		return ctrl.Result{}, err
@@ -904,7 +937,6 @@ func (r *Reconciler) handleDeletion(ctx context.Context, tc *butlerv1alpha1.Tena
 	return ctrl.Result{}, nil
 }
 
-// setFailedStatus updates status to Failed phase with error message.
 func (r *Reconciler) setFailedStatus(ctx context.Context, tc *butlerv1alpha1.TenantCluster, reason, message string) (ctrl.Result, error) {
 	tc.Status.Phase = butlerv1alpha1.TenantClusterPhaseFailed
 	tc.Status.ObservedGeneration = tc.Generation
@@ -912,18 +944,15 @@ func (r *Reconciler) setFailedStatus(ctx context.Context, tc *butlerv1alpha1.Ten
 	now := metav1.Now()
 	tc.Status.LastTransitionTime = &now
 
-	r.setCondition(tc, butlerv1alpha1.TenantClusterConditionReady,
-		metav1.ConditionFalse, reason, message)
+	r.setCondition(tc, butlerv1alpha1.TenantClusterConditionReady, metav1.ConditionFalse, reason, message)
 
 	if err := r.Status().Update(ctx, tc); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Requeue with backoff for failed status
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
-// setCondition sets a condition on the TenantCluster.
 func (r *Reconciler) setCondition(tc *butlerv1alpha1.TenantCluster, condType string, status metav1.ConditionStatus, reason, message string) {
 	meta.SetStatusCondition(&tc.Status.Conditions, metav1.Condition{
 		Type:               condType,
@@ -934,14 +963,11 @@ func (r *Reconciler) setCondition(tc *butlerv1alpha1.TenantCluster, condType str
 	})
 }
 
-// calculateRequeueInterval returns the appropriate requeue duration based on phase and age.
 func (r *Reconciler) calculateRequeueInterval(tc *butlerv1alpha1.TenantCluster) time.Duration {
-	// Not ready - requeue quickly
 	if tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseReady {
 		return 30 * time.Second
 	}
 
-	// Ready - use tiered intervals based on age
 	if tc.Status.LastTransitionTime == nil {
 		return 1 * time.Minute
 	}
@@ -957,9 +983,7 @@ func (r *Reconciler) calculateRequeueInterval(tc *butlerv1alpha1.TenantCluster) 
 	}
 }
 
-// generateTenantNamespace generates a unique namespace name for tenant resources.
 func generateTenantNamespace(tc *butlerv1alpha1.TenantCluster) string {
-	// Use first 8 characters of UID for uniqueness
 	uid := string(tc.UID)
 	if len(uid) > 8 {
 		uid = uid[:8]
@@ -967,7 +991,31 @@ func generateTenantNamespace(tc *butlerv1alpha1.TenantCluster) string {
 	return fmt.Sprintf("%s-%s", tc.Name, uid)
 }
 
-// SetupWithManager sets up the controller with the Manager.
+func extractAPIServerEndpoint(kubeconfig []byte) (string, string) {
+	// Parse kubeconfig to get server URL
+	var kc struct {
+		Clusters []struct {
+			Cluster struct {
+				Server string `yaml:"server"`
+			} `yaml:"cluster"`
+		} `yaml:"clusters"`
+	}
+	if err := yaml.Unmarshal(kubeconfig, &kc); err != nil || len(kc.Clusters) == 0 {
+		return "kubernetes.default.svc.cluster.local", "443" // fallback
+	}
+
+	// Parse URL like https://10.40.0.111:6443
+	server := kc.Clusters[0].Cluster.Server
+	server = strings.TrimPrefix(server, "https://")
+	server = strings.TrimPrefix(server, "http://")
+
+	parts := strings.Split(server, ":")
+	if len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	return parts[0], "6443"
+}
+
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&butlerv1alpha1.TenantCluster{}).
