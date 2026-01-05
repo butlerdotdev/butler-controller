@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: butlerdotdev/butler-controller
+
+jobs:
+  build:
+    runs-on: butler-runners
+    container: golang:1.24-alpine
+    steps:
+      - name: Install dependencies
+        run: apk add --no-cache make git bash curl
+
+      - name: Configure git
+        run: git config --global --add safe.directory '*'
+
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make build
+
+      # - name: Lint
+      #   run: make lint
+      #
+      # - name: Test
+      #   run: make test
+
+  image:
+    runs-on: butler-runners
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
