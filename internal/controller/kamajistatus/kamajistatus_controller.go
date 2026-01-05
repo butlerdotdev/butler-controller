@@ -1,5 +1,5 @@
 /*
-Copyright 2026 Butler Labs.
+Copyright 2026 The Butler Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,139 +14,194 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package kamajistatus provides a controller that synchronizes Kamaji TenantControlPlane
+// status to KamajiControlPlane for CAPI compatibility.
+//
+// Problem: The Kamaji CAPI provider sometimes fails to properly synchronize status
+// from the Kamaji TenantControlPlane to the KamajiControlPlane resource, causing
+// CAPI to not recognize the control plane as ready.
+//
+// Solution: Watch TenantControlPlane resources and patch the corresponding
+// KamajiControlPlane status when the TCP is ready.
 package kamajistatus
 
 import (
 	"context"
+	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// Reconciler reconciles KamajiControlPlane status.
-//
-// The CAPI Harvester provider has a bug where it doesn't sync the
-// KamajiControlPlane status properly, causing CAPI to not recognize
-// when the control plane is ready. This controller watches
-// KamajiControlPlane resources and patches the status to make it
-// compatible with what CAPI expects.
-//
-// This is a workaround for a known integration issue. Once this is
-// fixed in the CAPI Kamaji or Harvester provider, this controller
-// can be removed.
-//
-// What it does:
-//  1. Watch TenantControlPlane (Kamaji's CRD) resources
-//  2. When Kamaji reports the TCP is ready, patch the CAPI Cluster
-//     status to reflect the control plane is ready
-type Reconciler struct {
-	client.Client
-	Scheme *runtime.Scheme
-}
-
 var (
-	// TenantControlPlaneGVK is the GroupVersionKind for Kamaji's TenantControlPlane.
 	TenantControlPlaneGVK = schema.GroupVersionKind{
 		Group:   "kamaji.clastix.io",
 		Version: "v1alpha1",
 		Kind:    "TenantControlPlane",
 	}
+
+	KamajiControlPlaneGVK = schema.GroupVersionKind{
+		Group:   "controlplane.cluster.x-k8s.io",
+		Version: "v1alpha1",
+		Kind:    "KamajiControlPlane",
+	}
 )
+
+// Reconciler watches Kamaji TenantControlPlane resources and syncs status to KamajiControlPlane.
+type Reconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+}
 
 // +kubebuilder:rbac:groups=kamaji.clastix.io,resources=tenantcontrolplanes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kamaji.clastix.io,resources=tenantcontrolplanes/status,verbs=get
-// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes/status,verbs=get;update;patch
 
-// Reconcile handles KamajiControlPlane status synchronization.
-//
-// The reconciliation:
-// 1. Get the TenantControlPlane resource
-// 2. Check if Kamaji reports it as ready
-// 3. Find the corresponding CAPI Cluster
-// 4. Patch the Cluster status if needed
+// Reconcile handles TenantControlPlane status synchronization.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Fetch the TenantControlPlane (using unstructured since we don't import Kamaji types)
+	// Get the TenantControlPlane
 	tcp := &unstructured.Unstructured{}
 	tcp.SetGroupVersionKind(TenantControlPlaneGVK)
 
 	if err := r.Get(ctx, req.NamespacedName, tcp); err != nil {
-		if client.IgnoreNotFound(err) != nil {
-			logger.Error(err, "unable to fetch TenantControlPlane")
-			return ctrl.Result{}, err
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
 		}
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, err
 	}
 
-	logger.Info("reconciling TenantControlPlane status",
-		"name", tcp.GetName(),
-		"namespace", tcp.GetNamespace())
-
-	// Check if the TCP is ready
-	if !r.isTCPReady(tcp) {
-		logger.V(1).Info("TenantControlPlane not ready yet")
-		return ctrl.Result{}, nil
-	}
-
-	// Get the control plane endpoint
-	endpoint, err := r.getControlPlaneEndpoint(tcp)
+	// Check if TCP is ready
+	tcpReady, version, err := r.isTCPReady(tcp)
 	if err != nil {
-		logger.V(1).Info("could not extract control plane endpoint", "error", err)
+		logger.Error(err, "failed to check TCP status")
+		return ctrl.Result{}, err
+	}
+
+	if !tcpReady {
+		logger.V(1).Info("TenantControlPlane not yet ready", "name", req.Name, "namespace", req.Namespace)
 		return ctrl.Result{}, nil
 	}
 
-	logger.Info("TenantControlPlane is ready",
-		"endpoint", endpoint)
+	// Find the corresponding KamajiControlPlane
+	// The KCP typically has the same name as the TCP
+	kcp := &unstructured.Unstructured{}
+	kcp.SetGroupVersionKind(KamajiControlPlaneGVK)
 
-	// TODO: Patch the corresponding CAPI Cluster status
-	// This requires finding the Cluster that references this TCP
-	// and updating its status.controlPlaneReady = true
+	if err := r.Get(ctx, req.NamespacedName, kcp); err != nil {
+		if apierrors.IsNotFound(err) {
+			// KCP doesn't exist yet, that's fine
+			logger.V(1).Info("KamajiControlPlane not found", "name", req.Name, "namespace", req.Namespace)
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	// Check if KCP status already reflects ready state
+	kcpReady, err := r.isKCPReady(kcp)
+	if err != nil {
+		logger.Error(err, "failed to check KCP status")
+		return ctrl.Result{}, err
+	}
+
+	if kcpReady {
+		logger.V(1).Info("KamajiControlPlane already shows ready", "name", req.Name)
+		return ctrl.Result{}, nil
+	}
+
+	// Patch KCP status to reflect TCP ready state
+	logger.Info("patching KamajiControlPlane status to ready",
+		"name", req.Name,
+		"namespace", req.Namespace,
+		"version", version)
+
+	patch := client.RawPatch(types.MergePatchType, []byte(fmt.Sprintf(`{
+		"status": {
+			"replicas": 1,
+			"readyReplicas": 1,
+			"updatedReplicas": 1,
+			"version": "%s",
+			"ready": true,
+			"initialized": true
+		}
+	}`, version)))
+
+	if err := r.Status().Patch(ctx, kcp, patch); err != nil {
+		logger.Error(err, "failed to patch KamajiControlPlane status")
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("KamajiControlPlane status patched successfully",
+		"name", req.Name,
+		"namespace", req.Namespace)
 
 	return ctrl.Result{}, nil
 }
 
-// isTCPReady checks if the TenantControlPlane is ready.
-func (r *Reconciler) isTCPReady(tcp *unstructured.Unstructured) bool {
-	// Check status.kubernetesResources.version.status == "Ready"
-	// or other relevant conditions
+// isTCPReady checks if a TenantControlPlane is ready.
+func (r *Reconciler) isTCPReady(tcp *unstructured.Unstructured) (bool, string, error) {
 	status, found, err := unstructured.NestedMap(tcp.Object, "status")
-	if err != nil || !found {
-		return false
+	if err != nil {
+		return false, "", err
+	}
+	if !found {
+		return false, "", nil
 	}
 
-	// Check for Ready condition
-	conditions, found, err := unstructured.NestedSlice(status, "conditions")
-	if err != nil || !found {
-		return false
+	kubernetesStatus, found, err := unstructured.NestedMap(status, "kubernetes")
+	if err != nil {
+		return false, "", err
+	}
+	if !found {
+		return false, "", nil
 	}
 
-	for _, c := range conditions {
-		condition, ok := c.(map[string]interface{})
-		if !ok {
-			continue
+	// Get version
+	versionInfo, found, err := unstructured.NestedMap(kubernetesStatus, "version")
+	if err != nil {
+		return false, "", err
+	}
+
+	var version string
+	if found {
+		if v, ok := versionInfo["version"].(string); ok {
+			version = v
 		}
-		if condition["type"] == "Ready" && condition["status"] == "True" {
-			return true
-		}
 	}
 
-	return false
+	// Get status (should be "Ready")
+	kubeStatus, found, err := unstructured.NestedString(kubernetesStatus, "status")
+	if err != nil {
+		return false, version, err
+	}
+
+	return found && kubeStatus == "Ready", version, nil
 }
 
-// getControlPlaneEndpoint extracts the control plane endpoint from the TCP.
-func (r *Reconciler) getControlPlaneEndpoint(tcp *unstructured.Unstructured) (string, error) {
-	// Extract from status.controlPlaneEndpoint or similar
-	endpoint, found, err := unstructured.NestedString(tcp.Object, "status", "controlPlaneEndpoint")
-	if err != nil || !found {
-		return "", err
+// isKCPReady checks if a KamajiControlPlane is already showing ready status.
+func (r *Reconciler) isKCPReady(kcp *unstructured.Unstructured) (bool, error) {
+	readyReplicas, found, err := unstructured.NestedInt64(kcp.Object, "status", "readyReplicas")
+	if err != nil {
+		return false, err
 	}
-	return endpoint, nil
+	if !found || readyReplicas == 0 {
+		return false, nil
+	}
+
+	ready, found, err := unstructured.NestedBool(kcp.Object, "status", "ready")
+	if err != nil {
+		return false, err
+	}
+
+	return found && ready, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
