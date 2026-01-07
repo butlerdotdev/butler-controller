@@ -19,12 +19,9 @@ package tenantcluster
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/exec"
+	"gopkg.in/yaml.v3"
 	"strings"
 	"time"
-
-	"gopkg.in/yaml.v3"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -47,9 +44,6 @@ import (
 
 const (
 	ButlerConfigSingletonName = "butler"
-
-	// DefaultNutanixCCMVersion is the default version of Nutanix Cloud Controller Manager
-	DefaultNutanixCCMVersion = "0.4.0"
 
 	ReasonValidating             = "Validating"
 	ReasonValidationFailed       = "ValidationFailed"
@@ -91,10 +85,6 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=harvesterclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=harvestermachinetemplates,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=kubevirtclusters,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=kubevirtmachinetemplates,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=nutanixclusters,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=nutanixmachinetemplates,verbs=get;list;watch;create;update;patch;delete
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -167,6 +157,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return result, nil
 	}
 
+	// Sync MachineDeployment replicas for Ready clusters
+	// This handles scaling operations after initial provisioning
+	if err := r.reconcileMachineDeploymentReplicas(ctx, tc); err != nil {
+		logger.Error(err, "failed to reconcile MachineDeployment replicas")
+		// Don't fail the reconcile, just log - scaling is not critical path
+	}
+
 	tc.Status.ObservedGeneration = tc.Generation
 	if err := r.Status().Update(ctx, tc); err != nil {
 		return ctrl.Result{}, err
@@ -193,18 +190,6 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 	}
 
 	builder := capi.NewBuilder(tc, providerConfig, tc.Status.TenantNamespace)
-
-	// For Nutanix provider, fetch credentials and pass to builder
-	if providerConfig.Spec.Provider == butlerv1alpha1.ProviderTypeNutanix {
-		username, password, err := r.getNutanixCredentials(ctx, providerConfig)
-		if err != nil {
-			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionInfrastructureReady,
-				metav1.ConditionFalse, "CredentialsError", err.Error())
-			return ctrl.Result{}, fmt.Errorf("failed to get Nutanix credentials: %w", err)
-		}
-		builder.WithNutanixCredentials(username, password)
-	}
-
 	resourceSet, err := builder.Build()
 	if err != nil {
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionInfrastructureReady,
@@ -322,8 +307,7 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 
 	var addonStatuses []butlerv1alpha1.AddonStatus
 
-	// 1. CNI - REQUIRED FIRST, pods need networking before they can start
-	// CNI DaemonSets tolerate all taints, so they can run before taint removal
+	// 1. CNI - REQUIRED, nodes won't be Ready without it
 	ciliumVersion := addons.DefaultCiliumVersion
 	if tc.Spec.Addons.CNI != nil && tc.Spec.Addons.CNI.Version != "" {
 		ciliumVersion = tc.Spec.Addons.CNI.Version
@@ -340,12 +324,6 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 	addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
 		Name: "cilium", Version: ciliumVersion, Status: "Healthy", ManagedBy: "butler",
 	})
-
-	// Remove CAPX uninitialized taint AFTER CNI is running
-	// This ensures nodes are registered before we try to remove taints
-	if err := r.removeCAPINodeTaint(ctx, kubeconfigData); err != nil {
-		logger.Info("failed to remove CAPI node taint, will retry", "error", err)
-	}
 
 	// 2. cert-manager - needed by many other components
 	certManagerVersion := addons.DefaultCertManagerVersion
@@ -429,7 +407,6 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 	return ctrl.Result{}, nil
 }
 
-// getTenantKubeconfig retrieves the kubeconfig for the tenant cluster.
 func (r *Reconciler) getTenantKubeconfig(ctx context.Context, tc *butlerv1alpha1.TenantCluster) ([]byte, error) {
 	secretName := fmt.Sprintf("%s-admin-kubeconfig", tc.Name)
 
@@ -449,7 +426,6 @@ func (r *Reconciler) getTenantKubeconfig(ctx context.Context, tc *butlerv1alpha1
 	return kubeconfigData, nil
 }
 
-// getProviderConfig retrieves the ProviderConfig for the TenantCluster.
 func (r *Reconciler) getProviderConfig(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (*butlerv1alpha1.ProviderConfig, error) {
 	const defaultProviderNamespace = "butler-system"
 
@@ -490,175 +466,8 @@ func (r *Reconciler) getProviderConfig(ctx context.Context, tc *butlerv1alpha1.T
 	return nil, fmt.Errorf("no ProviderConfig available in %s namespace", defaultProviderNamespace)
 }
 
-// getNutanixCredentials fetches Nutanix credentials from the Secret referenced
-// in the ProviderConfig's credentialsRef.
-func (r *Reconciler) getNutanixCredentials(ctx context.Context, pc *butlerv1alpha1.ProviderConfig) (string, string, error) {
-	if pc.Spec.CredentialsRef.Name == "" {
-		return "", "", fmt.Errorf("credentialsRef.name is required for Nutanix provider")
-	}
-
-	// Determine secret namespace, default to butler-system
-	secretNS := pc.Spec.CredentialsRef.Namespace
-	if secretNS == "" {
-		secretNS = "butler-system"
-	}
-
-	secret := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      pc.Spec.CredentialsRef.Name,
-		Namespace: secretNS,
-	}, secret); err != nil {
-		return "", "", fmt.Errorf("failed to get credentials secret %s/%s: %w", secretNS, pc.Spec.CredentialsRef.Name, err)
-	}
-
-	// Extract username and password from secret
-	username, ok := secret.Data["username"]
-	if !ok {
-		return "", "", fmt.Errorf("credentials secret missing 'username' key")
-	}
-
-	password, ok := secret.Data["password"]
-	if !ok {
-		return "", "", fmt.Errorf("credentials secret missing 'password' key")
-	}
-
-	return string(username), string(password), nil
-}
-
-// installNutanixCCM installs the Nutanix Cloud Controller Manager on a tenant cluster.
-// CCM is required to remove the node.cluster.x-k8s.io/uninitialized taint and
-// manage node lifecycle for Nutanix-based clusters.
-// TODO: Either use this later or remove it altogether if we decide to stay with our own taint removal.
-func (r *Reconciler) installNutanixCCM(ctx context.Context, kubeconfig []byte, version string,
-	endpoint string, port int32, username string, password string, insecure bool) error {
-	logger := log.FromContext(ctx)
-
-	// Write kubeconfig to temp file
-	kubeconfigFile, err := os.CreateTemp("", "kubeconfig-*")
-	if err != nil {
-		return fmt.Errorf("failed to create temp kubeconfig: %w", err)
-	}
-	defer os.Remove(kubeconfigFile.Name())
-	if _, err := kubeconfigFile.Write(kubeconfig); err != nil {
-		return fmt.Errorf("failed to write kubeconfig: %w", err)
-	}
-	kubeconfigFile.Close()
-	kubeconfigPath := kubeconfigFile.Name()
-
-	// Parse endpoint to get address without scheme
-	address := endpoint
-	address = strings.TrimPrefix(address, "https://")
-	address = strings.TrimPrefix(address, "http://")
-
-	// Default port
-	if port == 0 {
-		port = 9440
-	}
-
-	logger.Info("installing Nutanix CCM", "version", version, "endpoint", address)
-
-	// Create namespace
-	nsCmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", kubeconfigPath,
-		"create", "namespace", "nutanix-system")
-	nsCmd.CombinedOutput() // Ignore error if exists
-
-	// Label namespace as privileged
-	labelCmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", kubeconfigPath,
-		"label", "namespace", "nutanix-system",
-		"pod-security.kubernetes.io/enforce=privileged",
-		"pod-security.kubernetes.io/warn=privileged",
-		"pod-security.kubernetes.io/audit=privileged",
-		"--overwrite")
-	labelCmd.CombinedOutput()
-
-	// Add Nutanix helm repo
-	repoAddCmd := exec.CommandContext(ctx, "helm", "repo", "add", "nutanix",
-		"https://nutanix.github.io/helm-releases")
-	repoAddCmd.CombinedOutput() // Ignore if exists
-
-	repoUpdateCmd := exec.CommandContext(ctx, "helm", "repo", "update")
-	repoUpdateCmd.CombinedOutput()
-
-	// The CCM needs tolerations to run on nodes with the uninitialized taint
-	args := []string{
-		"upgrade", "--install", "nutanix-ccm", "nutanix/nutanix-cloud-provider",
-		"--namespace", "nutanix-system",
-		"--version", version,
-		"--kubeconfig", kubeconfigPath,
-		"--set", fmt.Sprintf("prismCentralEndPoint=%s", address),
-		"--set", fmt.Sprintf("prismCentralPort=%d", port),
-		"--set", fmt.Sprintf("prismCentralInsecure=%t", insecure),
-		// Pass credentials directly to helm (not via separate secret)
-		"--set", fmt.Sprintf("username=%s", username),
-		"--set", fmt.Sprintf("password=%s", password),
-		// Remove control-plane nodeSelector - Kamaji hosts control plane externally
-		"--set-json", `nodeSelector={}`,
-		// Add toleration for CAPX taint (node.cluster.x-k8s.io/uninitialized)
-		// Default tolerations only have node.cloudprovider.kubernetes.io/uninitialized
-		"--set", "tolerations[0].key=node.cluster.x-k8s.io/uninitialized",
-		"--set", "tolerations[0].operator=Exists",
-		"--set", "tolerations[0].effect=NoSchedule",
-		"--set", "tolerations[1].key=node.kubernetes.io/not-ready",
-		"--set", "tolerations[1].operator=Exists",
-		"--set", "tolerations[1].effect=NoSchedule",
-		"--set", "tolerations[2].key=node.kubernetes.io/not-ready",
-		"--set", "tolerations[2].operator=Exists",
-		"--set", "tolerations[2].effect=NoExecute",
-		"--set", "tolerations[2].tolerationSeconds=120",
-		"--set", "tolerations[3].key=node.kubernetes.io/unreachable",
-		"--set", "tolerations[3].operator=Exists",
-		"--set", "tolerations[3].effect=NoExecute",
-		"--set", "tolerations[3].tolerationSeconds=120",
-		"--wait",
-		"--timeout", "5m",
-	}
-
-	cmd := exec.CommandContext(ctx, "helm", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to install Nutanix CCM: %w, output: %s", err, string(output))
-	}
-
-	logger.Info("Nutanix CCM installed successfully")
-	return nil
-}
-
-// removeCAPINodeTaint removes the node.cluster.x-k8s.io/uninitialized taint
-// that CAPX adds to nodes. This taint prevents pods from scheduling until
-// a cloud controller manager initializes the node. In Kamaji-hosted control
-// planes, we handle this ourselves since CCM may not have providerID available.
-func (r *Reconciler) removeCAPINodeTaint(ctx context.Context, kubeconfig []byte) error {
-	logger := log.FromContext(ctx)
-
-	kubeconfigFile, err := os.CreateTemp("", "kubeconfig-*")
-	if err != nil {
-		return fmt.Errorf("failed to create temp kubeconfig: %w", err)
-	}
-	defer os.Remove(kubeconfigFile.Name())
-	if _, err := kubeconfigFile.Write(kubeconfig); err != nil {
-		return fmt.Errorf("failed to write kubeconfig: %w", err)
-	}
-	kubeconfigFile.Close()
-
-	logger.Info("removing CAPI node taint")
-
-	cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", kubeconfigFile.Name(),
-		"taint", "nodes", "--all", "node.cluster.x-k8s.io/uninitialized:NoSchedule-")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		// Ignore "not found" errors - taint may already be removed
-		if strings.Contains(string(output), "not found") {
-			logger.Info("CAPI node taint already removed or not present")
-			return nil
-		}
-		return fmt.Errorf("failed to remove taint: %w, output: %s", err, string(output))
-	}
-
-	logger.Info("CAPI node taint removed successfully")
-	return nil
-}
-
-// checkInfrastructureStatus checks the status of the CAPI Cluster and MachineDeployment
+// checkInfrastructureStatus checks the status of the CAPI Cluster and MachineDeployment.
+// It updates the TenantCluster status with current worker node counts.
 func (r *Reconciler) checkInfrastructureStatus(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (infraReady, cpReady, workersReady bool, err error) {
 	logger := log.FromContext(ctx)
 
@@ -715,6 +524,14 @@ func (r *Reconciler) checkInfrastructureStatus(ctx context.Context, tc *butlerv1
 
 	logger.V(1).Info("MachineDeployment status", "replicas", replicas, "readyReplicas", readyReplicas)
 
+	// Update TenantCluster status with worker counts
+	desiredReplicas := int64(tc.Spec.Workers.Replicas)
+	if desiredReplicas < 1 {
+		desiredReplicas = 1
+	}
+	tc.Status.WorkerNodesReady = int32(readyReplicas)
+	tc.Status.WorkerNodesDesired = int32(desiredReplicas)
+
 	if replicas > 0 {
 		workersReady = true
 	}
@@ -722,8 +539,84 @@ func (r *Reconciler) checkInfrastructureStatus(ctx context.Context, tc *butlerv1
 	return infraReady, cpReady, workersReady, nil
 }
 
-// handleKamajiHarvesterCompatibility checks if the KamajiControlPlane is compatible with Harvester
-// TODO: This is a workaround for Harvester compatibility issues with KamajiControlPlane. We pivoted to Kubevirt provider to avoid this. Probably remove this later.
+// reconcileMachineDeploymentReplicas syncs worker count from TenantCluster spec to MachineDeployment.
+// This is called on every reconcile to ensure spec.workers.replicas changes are propagated
+// to the underlying CAPI MachineDeployment, enabling cluster scaling operations.
+// It also updates the TenantCluster status with current worker counts.
+func (r *Reconciler) reconcileMachineDeploymentReplicas(ctx context.Context, tc *butlerv1alpha1.TenantCluster) error {
+	logger := log.FromContext(ctx)
+
+	// Only sync when cluster is Ready or Installing
+	// During Provisioning, initial creation handles replicas
+	if tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseReady &&
+		tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseInstalling {
+		return nil
+	}
+
+	// Need tenant namespace to find MachineDeployment
+	if tc.Status.TenantNamespace == "" {
+		return nil
+	}
+
+	// Get the MachineDeployment
+	mdName := fmt.Sprintf("%s-workers", tc.Name)
+	md := &unstructured.Unstructured{}
+	md.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   capi.ClusterAPIGroup,
+		Version: capi.ClusterAPIVersion,
+		Kind:    "MachineDeployment",
+	})
+
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: tc.Status.TenantNamespace,
+		Name:      mdName,
+	}, md); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Not created yet, will be handled by initial provisioning
+			return nil
+		}
+		return fmt.Errorf("failed to get MachineDeployment: %w", err)
+	}
+
+	// Get current spec replicas and desired replicas from TenantCluster
+	currentSpecReplicas, _, _ := unstructured.NestedInt64(md.Object, "spec", "replicas")
+	desiredReplicas := int64(tc.Spec.Workers.Replicas)
+
+	// Default to 1 if not specified (matches builder.go behavior)
+	if desiredReplicas < 1 {
+		desiredReplicas = 1
+	}
+
+	// Update TenantCluster status with worker counts from MachineDeployment
+	readyReplicas, _, _ := unstructured.NestedInt64(md.Object, "status", "readyReplicas")
+	tc.Status.WorkerNodesReady = int32(readyReplicas)
+	tc.Status.WorkerNodesDesired = int32(desiredReplicas)
+
+	// Check if MachineDeployment spec needs to be scaled
+	if currentSpecReplicas == desiredReplicas {
+		// Already in sync, nothing more to do
+		return nil
+	}
+
+	logger.Info("scaling MachineDeployment",
+		"name", mdName,
+		"from", currentSpecReplicas,
+		"to", desiredReplicas)
+
+	// Patch MachineDeployment replicas
+	patch := []byte(fmt.Sprintf(`{"spec":{"replicas":%d}}`, desiredReplicas))
+
+	if err := r.Patch(ctx, md, client.RawPatch(types.MergePatchType, patch)); err != nil {
+		return fmt.Errorf("failed to patch MachineDeployment replicas: %w", err)
+	}
+
+	logger.Info("MachineDeployment scaled successfully",
+		"name", mdName,
+		"replicas", desiredReplicas)
+
+	return nil
+}
+
 func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (bool, error) {
 	logger := log.FromContext(ctx)
 
@@ -872,7 +765,6 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 	return true, nil
 }
 
-// getButlerConfig retrieves the ButlerConfig singleton.
 func (r *Reconciler) getButlerConfig(ctx context.Context) (*butlerv1alpha1.ButlerConfig, error) {
 	config := &butlerv1alpha1.ButlerConfig{}
 	if err := r.Get(ctx, types.NamespacedName{Name: ButlerConfigSingletonName}, config); err != nil {
@@ -891,7 +783,6 @@ func (r *Reconciler) getButlerConfig(ctx context.Context) (*butlerv1alpha1.Butle
 	return config, nil
 }
 
-// validateTenantCluster validates the TenantCluster based on the ButlerConfig multi-tenancy mode.
 func (r *Reconciler) validateTenantCluster(ctx context.Context, tc *butlerv1alpha1.TenantCluster, config *butlerv1alpha1.ButlerConfig) error {
 	logger := log.FromContext(ctx)
 	mode := config.Spec.MultiTenancy.Mode
@@ -910,7 +801,6 @@ func (r *Reconciler) validateTenantCluster(ctx context.Context, tc *butlerv1alph
 	}
 }
 
-// validateEnforcedMode validates the TenantCluster in Enforced multi-tenancy mode.
 func (r *Reconciler) validateEnforcedMode(ctx context.Context, tc *butlerv1alpha1.TenantCluster) error {
 	logger := log.FromContext(ctx)
 
@@ -943,7 +833,6 @@ func (r *Reconciler) validateEnforcedMode(ctx context.Context, tc *butlerv1alpha
 	return nil
 }
 
-// validateOptionalMode validates the TenantCluster in Optional multi-tenancy mode.
 func (r *Reconciler) validateOptionalMode(ctx context.Context, tc *butlerv1alpha1.TenantCluster, config *butlerv1alpha1.ButlerConfig) error {
 	logger := log.FromContext(ctx)
 
@@ -982,7 +871,6 @@ func (r *Reconciler) validateOptionalMode(ctx context.Context, tc *butlerv1alpha
 	return nil
 }
 
-// validateDisabledMode validates the TenantCluster in Disabled multi-tenancy mode.
 func (r *Reconciler) validateDisabledMode(ctx context.Context, tc *butlerv1alpha1.TenantCluster, config *butlerv1alpha1.ButlerConfig) error {
 	logger := log.FromContext(ctx)
 
@@ -999,7 +887,6 @@ func (r *Reconciler) validateDisabledMode(ctx context.Context, tc *butlerv1alpha
 	return nil
 }
 
-// validateOptionalMode validates the TenantCluster in Optional multi-tenancy mode.
 func (r *Reconciler) reconcileTenantNamespace(ctx context.Context, tc *butlerv1alpha1.TenantCluster, config *butlerv1alpha1.ButlerConfig) error {
 	logger := log.FromContext(ctx)
 
@@ -1056,7 +943,6 @@ func (r *Reconciler) reconcileTenantNamespace(ctx context.Context, tc *butlerv1a
 	return nil
 }
 
-// reconcileTeamRoleBinding creates or updates a RoleBinding for the team
 func (r *Reconciler) reconcileTeamRoleBinding(ctx context.Context, tc *butlerv1alpha1.TenantCluster, nsName string) error {
 	logger := log.FromContext(ctx)
 
@@ -1111,7 +997,6 @@ func (r *Reconciler) reconcileTeamRoleBinding(ctx context.Context, tc *butlerv1a
 	return nil
 }
 
-// handleDeletion handles the deletion of a TenantCluster.
 func (r *Reconciler) handleDeletion(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("handling TenantCluster deletion", "name", tc.Name, "namespace", tc.Namespace)
@@ -1147,7 +1032,6 @@ func (r *Reconciler) handleDeletion(ctx context.Context, tc *butlerv1alpha1.Tena
 	return ctrl.Result{}, nil
 }
 
-// setFailedStatus sets the TenantCluster status to Failed and updates the conditions.
 func (r *Reconciler) setFailedStatus(ctx context.Context, tc *butlerv1alpha1.TenantCluster, reason, message string) (ctrl.Result, error) {
 	tc.Status.Phase = butlerv1alpha1.TenantClusterPhaseFailed
 	tc.Status.ObservedGeneration = tc.Generation
@@ -1164,7 +1048,6 @@ func (r *Reconciler) setFailedStatus(ctx context.Context, tc *butlerv1alpha1.Ten
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
-// setCondition sets a condition on the TenantCluster status.
 func (r *Reconciler) setCondition(tc *butlerv1alpha1.TenantCluster, condType string, status metav1.ConditionStatus, reason, message string) {
 	meta.SetStatusCondition(&tc.Status.Conditions, metav1.Condition{
 		Type:               condType,
@@ -1175,7 +1058,6 @@ func (r *Reconciler) setCondition(tc *butlerv1alpha1.TenantCluster, condType str
 	})
 }
 
-// calculateRequeueInterval calculates the requeue interval based on the TenantCluster status.
 func (r *Reconciler) calculateRequeueInterval(tc *butlerv1alpha1.TenantCluster) time.Duration {
 	if tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseReady {
 		return 30 * time.Second
@@ -1196,7 +1078,6 @@ func (r *Reconciler) calculateRequeueInterval(tc *butlerv1alpha1.TenantCluster) 
 	}
 }
 
-// generateTenantNamespace generates a unique namespace name for the TenantCluster.
 func generateTenantNamespace(tc *butlerv1alpha1.TenantCluster) string {
 	uid := string(tc.UID)
 	if len(uid) > 8 {
@@ -1205,7 +1086,6 @@ func generateTenantNamespace(tc *butlerv1alpha1.TenantCluster) string {
 	return fmt.Sprintf("%s-%s", tc.Name, uid)
 }
 
-// extractAPIServerEndpoint extracts the API server endpoint from the kubeconfig.
 func extractAPIServerEndpoint(kubeconfig []byte) (string, string) {
 	// Parse kubeconfig to get server URL
 	var kc struct {
@@ -1231,7 +1111,6 @@ func extractAPIServerEndpoint(kubeconfig []byte) (string, string) {
 	return parts[0], "6443"
 }
 
-// SetupWithManager sets up the controller with the Manager.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&butlerv1alpha1.TenantCluster{}).
