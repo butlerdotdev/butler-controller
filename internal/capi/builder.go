@@ -329,6 +329,9 @@ func (b *Builder) buildKubevirtMachineTemplate(name string) *unstructured.Unstru
 	if imageName == "" {
 		imageName = "default/image-b8c6x"
 	}
+	if b.tc.Spec.Workers.MachineTemplate.OS.ImageRef != "" {
+		imageName = b.tc.Spec.Workers.MachineTemplate.OS.ImageRef
+	}
 
 	// Parse image ID for storage class name
 	_, imageID := parseImageNamespace(imageName)
@@ -579,6 +582,12 @@ func (b *Builder) buildNutanixMachineTemplate(name string) *unstructured.Unstruc
 	vcpuSockets := cpu
 	vcpusPerSocket := int64(1)
 
+	// Determine image UUID - TenantCluster spec takes precedence over ProviderConfig
+	imageUUID := nutanixSpec.ImageUUID
+	if b.tc.Spec.Workers.MachineTemplate.OS.ImageRef != "" {
+		imageUUID = b.tc.Spec.Workers.MachineTemplate.OS.ImageRef
+	}
+
 	spec := map[string]interface{}{
 		"template": map[string]interface{}{
 			"spec": map[string]interface{}{
@@ -590,7 +599,7 @@ func (b *Builder) buildNutanixMachineTemplate(name string) *unstructured.Unstruc
 				// Image reference by UUID
 				"image": map[string]interface{}{
 					"type": "uuid",
-					"uuid": nutanixSpec.ImageUUID,
+					"uuid": imageUUID,
 				},
 				// Prism Element cluster reference by UUID
 				"cluster": map[string]interface{}{
