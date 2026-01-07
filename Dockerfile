@@ -27,7 +27,14 @@ RUN apk add --no-cache ca-certificates curl bash && \
     mv linux-amd64/helm /usr/local/bin/helm && \
     rm -rf linux-amd64
 
+# Create non-root user with writable home directory
+RUN adduser -D -u 65532 -h /home/nonroot nonroot && \
+    mkdir -p /home/nonroot/.config /home/nonroot/.cache && \
+    chown -R nonroot:nonroot /home/nonroot
+
 WORKDIR /
 COPY --from=builder /workspace/manager .
+
 USER 65532:65532
+ENV HOME=/home/nonroot
 ENTRYPOINT ["/manager"]
