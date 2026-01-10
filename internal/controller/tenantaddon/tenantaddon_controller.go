@@ -18,8 +18,13 @@ package tenantaddon
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -27,65 +32,54 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
+	"github.com/butlerdotdev/butler-controller/internal/addons"
+)
+
+const (
+	ReasonAddonNotFound   = "AddonNotFound"
+	ReasonClusterNotFound = "ClusterNotFound"
+	ReasonClusterNotReady = "ClusterNotReady"
+	ReasonKubeconfigError = "KubeconfigError"
+	ReasonInstallFailed   = "InstallFailed"
+	ReasonInstalled       = "Installed"
 )
 
 // Reconciler reconciles a TenantAddon object.
-//
-// TenantAddon represents an addon to be installed in a TenantCluster.
-// Unlike addons in TenantCluster.spec.addons (which are monotonic/install-only),
-// TenantAddons support full lifecycle management including removal.
-//
-// Key behaviors:
-// - Waits for target TenantCluster to be Ready before installing
-// - Respects DependsOn for addon ordering
-// - Supports both Butler built-in addons and custom Helm charts
-// - Deletion of TenantAddon CR triggers addon removal from cluster
-// - Uses Helm SDK for installation/upgrade/removal
 type Reconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme    *runtime.Scheme
+	Installer *addons.Installer
+	APIReader client.Reader // Uncached reader for cross-type lookups
 }
 
 // +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=tenantaddons,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=tenantaddons/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=tenantaddons/finalizers,verbs=update
 // +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=tenantclusters,verbs=get;list;watch
+// +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=addondefinitions,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
-// Reconcile handles TenantAddon reconciliation.
-//
-// The reconciliation loop:
-// 1. Check if TenantAddon is being deleted
-//   - If yes, uninstall addon from target cluster and remove finalizer
-//
-// 2. Add finalizer if not present
-// 3. Wait for target TenantCluster to be Ready
-// 4. Wait for dependencies (DependsOn) to be Ready
-// 5. Install or upgrade addon
-// 6. Update status with Helm release info
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	// Fetch the TenantAddon instance
 	addon := &butlerv1alpha1.TenantAddon{}
 	if err := r.Get(ctx, req.NamespacedName, addon); err != nil {
-		if client.IgnoreNotFound(err) != nil {
-			logger.Error(err, "unable to fetch TenantAddon")
-			return ctrl.Result{}, err
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
 		}
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, err
 	}
 
 	logger.Info("reconciling TenantAddon",
 		"name", addon.Name,
 		"namespace", addon.Namespace,
-		"cluster", addon.Spec.ClusterRef.Name,
 		"addon", addon.Spec.Addon,
 		"phase", addon.Status.Phase)
 
 	// Handle deletion
 	if !addon.DeletionTimestamp.IsZero() {
-		return r.handleDeletion(ctx, addon)
+		return r.handleDeletion(ctx, req, addon)
 	}
 
 	// Add finalizer if not present
@@ -98,31 +92,124 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Check if target cluster is ready
+	// Get addon definition
+	addonDef, err := r.getAddonDefinition(ctx, addon)
+	if err != nil {
+		logger.Error(err, "failed to get AddonDefinition")
+		return r.setFailedStatus(ctx, req, ReasonAddonNotFound, err.Error())
+	}
+
+	// Get target cluster
 	cluster, err := r.getTargetCluster(ctx, addon)
 	if err != nil {
 		logger.Error(err, "failed to get target cluster")
-		return r.updateStatusPending(ctx, addon, "WaitingForCluster", "Target cluster not found")
+		return r.setPendingStatus(ctx, req, ReasonClusterNotFound, "Waiting for cluster: "+err.Error())
 	}
 
+	// Check if cluster is ready
 	if cluster.Status.Phase != butlerv1alpha1.TenantClusterPhaseReady {
-		logger.Info("waiting for target cluster to be ready")
-		return r.updateStatusPending(ctx, addon, "WaitingForCluster", "Target cluster is not ready")
+		logger.V(1).Info("waiting for cluster to be ready", "clusterPhase", cluster.Status.Phase)
+		return r.setPendingStatus(ctx, req, ReasonClusterNotReady,
+			fmt.Sprintf("Cluster is %s, waiting for Ready", cluster.Status.Phase))
 	}
 
-	// Check dependencies
-	if !r.dependenciesMet(ctx, addon) {
-		logger.Info("waiting for dependencies")
-		return r.updateStatusPending(ctx, addon, "WaitingForDependencies", "Dependencies not yet ready")
+	// Get kubeconfig for tenant cluster
+	kubeconfig, err := r.getTenantKubeconfig(ctx, cluster)
+	if err != nil {
+		logger.Error(err, "failed to get kubeconfig")
+		return r.setFailedStatus(ctx, req, ReasonKubeconfigError, err.Error())
 	}
 
-	// Install or upgrade addon
-	if err := r.installOrUpgrade(ctx, addon, cluster); err != nil {
-		logger.Error(err, "failed to install/upgrade addon")
-		return r.updateStatusFailed(ctx, addon, err)
+	// Determine version
+	version := addon.Spec.Version
+	if version == "" {
+		version = addonDef.Spec.Chart.DefaultVersion
 	}
 
-	return r.updateStatusInstalled(ctx, addon)
+	if addon.Status.Phase == butlerv1alpha1.TenantAddonPhaseInstalled &&
+		addon.Status.InstalledVersion == version {
+		logger.V(1).Info("addon already installed", "version", version)
+		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+	}
+
+	// Update status to installing (re-fetch first to avoid conflict)
+	if addon.Status.Phase != butlerv1alpha1.TenantAddonPhaseInstalled {
+		if err := r.Get(ctx, req.NamespacedName, addon); err != nil {
+			return ctrl.Result{}, err
+		}
+		addon.Status.Phase = butlerv1alpha1.TenantAddonPhaseInstalling
+		addon.Status.Message = "Installing addon"
+		if err := r.Status().Update(ctx, addon); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Install using shared Installer
+	logger.Info("installing addon",
+		"chart", addonDef.Spec.Chart.Name,
+		"repository", addonDef.Spec.Chart.Repository,
+		"version", version,
+		"namespace", addonDef.GetNamespace(),
+		"release", addonDef.GetReleaseName())
+
+	if err := r.Installer.InstallChart(ctx, kubeconfig, addons.ChartInstallOptions{
+		RepoName:    "butler-" + addon.Spec.Addon,
+		RepoURL:     addonDef.Spec.Chart.Repository,
+		ChartName:   addonDef.Spec.Chart.Name,
+		ReleaseName: addonDef.GetReleaseName(),
+		Namespace:   addonDef.GetNamespace(),
+		Version:     version,
+		Values:      nil, // TODO: merge addon.Spec.Values with addonDef.Spec.Defaults.Values
+	}); err != nil {
+		logger.Error(err, "failed to install addon")
+		return r.setFailedStatus(ctx, req, ReasonInstallFailed, err.Error())
+	}
+
+	// Re-fetch to get latest resourceVersion after helm install
+	if err := r.Get(ctx, req.NamespacedName, addon); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Update status to installed
+	addon.Status.Phase = butlerv1alpha1.TenantAddonPhaseInstalled
+	addon.Status.InstalledVersion = version
+	addon.Status.Message = ""
+	addon.Status.ObservedGeneration = addon.Generation
+	now := metav1.Now()
+	addon.Status.LastTransitionTime = &now
+	addon.Status.HelmRelease = &butlerv1alpha1.HelmReleaseStatus{
+		Name:      addonDef.GetReleaseName(),
+		Namespace: addonDef.GetNamespace(),
+		Status:    "deployed",
+	}
+
+	if err := r.Status().Update(ctx, addon); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("addon installed successfully",
+		"release", addonDef.GetReleaseName(),
+		"namespace", addonDef.GetNamespace(),
+		"version", version)
+
+	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+}
+
+// getAddonDefinition retrieves the AddonDefinition for this addon.
+func (r *Reconciler) getAddonDefinition(ctx context.Context, addon *butlerv1alpha1.TenantAddon) (*butlerv1alpha1.AddonDefinition, error) {
+	if addon.Spec.Addon == "" {
+		return nil, fmt.Errorf("addon name not specified")
+	}
+
+	addonDef := &butlerv1alpha1.AddonDefinition{}
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Name: addon.Spec.Addon}, addonDef); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("AddonDefinition %q not found", addon.Spec.Addon)
+		}
+		return nil, fmt.Errorf("failed to get AddonDefinition: %w", err)
+	}
+
+	return addonDef, nil
 }
 
 // getTargetCluster retrieves the TenantCluster referenced by the addon.
@@ -138,103 +225,166 @@ func (r *Reconciler) getTargetCluster(ctx context.Context, addon *butlerv1alpha1
 	return cluster, nil
 }
 
-// dependenciesMet checks if all dependencies are satisfied.
-func (r *Reconciler) dependenciesMet(ctx context.Context, addon *butlerv1alpha1.TenantAddon) bool {
-	logger := log.FromContext(ctx)
+// getTenantKubeconfig retrieves the kubeconfig for the tenant cluster.
+// Uses the same pattern as TenantCluster controller.
+func (r *Reconciler) getTenantKubeconfig(ctx context.Context, cluster *butlerv1alpha1.TenantCluster) ([]byte, error) {
+	// Prefer kubeconfigSecretRef if set
+	var secretName string
+	if cluster.Status.KubeconfigSecretRef != nil && cluster.Status.KubeconfigSecretRef.Name != "" {
+		secretName = cluster.Status.KubeconfigSecretRef.Name
+	} else {
+		// Fallback to convention: <cluster-name>-admin-kubeconfig
+		secretName = fmt.Sprintf("%s-admin-kubeconfig", cluster.Name)
+	}
 
-	for _, dep := range addon.Spec.DependsOn {
-		depAddon := &butlerv1alpha1.TenantAddon{}
-		key := client.ObjectKey{
-			Name:      dep.Name,
-			Namespace: addon.Namespace,
-		}
-		if err := r.Get(ctx, key, depAddon); err != nil {
-			logger.V(1).Info("dependency not found", "dependency", dep.Name)
-			return false
-		}
-		if depAddon.Status.Phase != butlerv1alpha1.TenantAddonPhaseInstalled {
-			logger.V(1).Info("dependency not ready", "dependency", dep.Name, "phase", depAddon.Status.Phase)
-			return false
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{
+		Name:      secretName,
+		Namespace: cluster.Status.TenantNamespace,
+	}, secret); err != nil {
+		return nil, fmt.Errorf("failed to get kubeconfig secret %s/%s: %w",
+			cluster.Status.TenantNamespace, secretName, err)
+	}
+
+	// Try common kubeconfig key names
+	for _, key := range []string{"admin.conf", "value", "kubeconfig"} {
+		if data, ok := secret.Data[key]; ok {
+			return data, nil
 		}
 	}
-	return true
+
+	return nil, fmt.Errorf("kubeconfig not found in secret (tried: admin.conf, value, kubeconfig)")
 }
 
-// installOrUpgrade installs or upgrades the addon.
-func (r *Reconciler) installOrUpgrade(ctx context.Context, addon *butlerv1alpha1.TenantAddon, cluster *butlerv1alpha1.TenantCluster) error {
+// handleDeletion handles TenantAddon deletion.
+func (r *Reconciler) handleDeletion(ctx context.Context, req ctrl.Request, addon *butlerv1alpha1.TenantAddon) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.V(1).Info("installing/upgrading addon")
+	logger.Info("handling TenantAddon deletion", "name", addon.Name, "namespace", addon.Namespace)
 
-	// TODO: Implement addon installation
-	// 1. Get kubeconfig for tenant cluster
-	// 2. Create Helm client for tenant cluster
-	// 3. Determine if this is a Butler built-in addon or custom Helm chart
-	// 4. Install or upgrade Helm release
-	// 5. Wait for release to be healthy
+	// Update phase to Deleting
+	if addon.Status.Phase != butlerv1alpha1.TenantAddonPhaseDeleting {
+		addon.Status.Phase = butlerv1alpha1.TenantAddonPhaseDeleting
+		if err := r.Status().Update(ctx, addon); err != nil {
+			if !apierrors.IsConflict(err) {
+				return ctrl.Result{}, err
+			}
+		}
+	}
 
-	return nil
-}
+	// Get cluster
+	cluster, err := r.getTargetCluster(ctx, addon)
+	if err != nil {
+		// Cluster gone, just remove finalizer
+		logger.Info("target cluster not found, skipping uninstall")
+		// Re-fetch before removing finalizer
+		if err := r.Get(ctx, req.NamespacedName, addon); err != nil {
+			if apierrors.IsNotFound(err) {
+				return ctrl.Result{}, nil
+			}
+			return ctrl.Result{}, err
+		}
+		controllerutil.RemoveFinalizer(addon, butlerv1alpha1.FinalizerTenantAddon)
+		return ctrl.Result{}, r.Update(ctx, addon)
+	}
 
-// handleDeletion handles TenantAddon cleanup.
-func (r *Reconciler) handleDeletion(ctx context.Context, addon *butlerv1alpha1.TenantAddon) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-	logger.Info("handling TenantAddon deletion", "name", addon.Name)
+	// Only uninstall if cluster is ready
+	if cluster.Status.Phase == butlerv1alpha1.TenantClusterPhaseReady {
+		kubeconfig, err := r.getTenantKubeconfig(ctx, cluster)
+		if err != nil {
+			logger.Error(err, "failed to get kubeconfig for uninstall, proceeding with finalizer removal")
+		} else {
+			// Get addon definition for release name
+			addonDef, _ := r.getAddonDefinition(ctx, addon)
+			releaseName := addon.Name
+			namespace := addon.Name
+			if addonDef != nil {
+				releaseName = addonDef.GetReleaseName()
+				namespace = addonDef.GetNamespace()
+			}
 
-	// TODO: Implement addon removal
-	// 1. Get kubeconfig for tenant cluster
-	// 2. Create Helm client for tenant cluster
-	// 3. Uninstall Helm release
+			logger.Info("uninstalling helm release", "release", releaseName, "namespace", namespace)
+			if err := r.Installer.UninstallChart(ctx, kubeconfig, releaseName, namespace); err != nil {
+				// "not found" is expected if already uninstalled
+				if strings.Contains(err.Error(), "not found") {
+					logger.Info("helm release already removed", "release", releaseName)
+				} else {
+					logger.Error(err, "helm uninstall failed, proceeding with finalizer removal")
+				}
+			}
+		}
+	} else {
+		logger.Info("cluster not ready, skipping uninstall", "clusterPhase", cluster.Status.Phase)
+	}
 
-	// Remove finalizer to allow deletion
-	controllerutil.RemoveFinalizer(addon, butlerv1alpha1.FinalizerTenantAddon)
-	if err := r.Update(ctx, addon); err != nil {
-		logger.Error(err, "failed to remove finalizer")
+	// Re-fetch before removing finalizer to get latest resourceVersion
+	if err := r.Get(ctx, req.NamespacedName, addon); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Already deleted, nothing to do
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{}, err
 	}
 
+	// Remove finalizer
+	controllerutil.RemoveFinalizer(addon, butlerv1alpha1.FinalizerTenantAddon)
+	if err := r.Update(ctx, addon); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("TenantAddon deletion complete", "name", addon.Name)
 	return ctrl.Result{}, nil
 }
 
-// updateStatusPending updates status to pending with a reason.
-func (r *Reconciler) updateStatusPending(ctx context.Context, addon *butlerv1alpha1.TenantAddon, reason, message string) (ctrl.Result, error) {
+// setFailedStatus sets the addon status to Failed.
+func (r *Reconciler) setFailedStatus(ctx context.Context, req ctrl.Request, reason, message string) (ctrl.Result, error) {
+	addon := &butlerv1alpha1.TenantAddon{}
+	if err := r.Get(ctx, req.NamespacedName, addon); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	addon.Status.Phase = butlerv1alpha1.TenantAddonPhaseFailed
+	addon.Status.Message = message
+	addon.Status.ObservedGeneration = addon.Generation
+	now := metav1.Now()
+	addon.Status.LastTransitionTime = &now
+
+	if err := r.Status().Update(ctx, addon); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+}
+
+// setPendingStatus sets the addon status to Pending.
+func (r *Reconciler) setPendingStatus(ctx context.Context, req ctrl.Request, reason, message string) (ctrl.Result, error) {
+	addon := &butlerv1alpha1.TenantAddon{}
+	if err := r.Get(ctx, req.NamespacedName, addon); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	addon.Status.Phase = butlerv1alpha1.TenantAddonPhasePending
 	addon.Status.Message = message
-	// TODO: Update conditions
+	addon.Status.ObservedGeneration = addon.Generation
+	now := metav1.Now()
+	addon.Status.LastTransitionTime = &now
 
 	if err := r.Status().Update(ctx, addon); err != nil {
 		return ctrl.Result{}, err
 	}
+
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-}
-
-// updateStatusFailed updates status to failed.
-func (r *Reconciler) updateStatusFailed(ctx context.Context, addon *butlerv1alpha1.TenantAddon, err error) (ctrl.Result, error) {
-	addon.Status.Phase = butlerv1alpha1.TenantAddonPhaseFailed
-	addon.Status.Message = err.Error()
-	// TODO: Update conditions
-
-	if updateErr := r.Status().Update(ctx, addon); updateErr != nil {
-		return ctrl.Result{}, updateErr
-	}
-	return ctrl.Result{RequeueAfter: 1 * time.Minute}, err
-}
-
-// updateStatusInstalled updates status to installed.
-func (r *Reconciler) updateStatusInstalled(ctx context.Context, addon *butlerv1alpha1.TenantAddon) (ctrl.Result, error) {
-	addon.Status.Phase = butlerv1alpha1.TenantAddonPhaseInstalled
-	addon.Status.InstalledVersion = addon.Spec.Version
-	addon.Status.Message = ""
-	// TODO: Update conditions and HelmRelease status
-
-	if err := r.Status().Update(ctx, addon); err != nil {
-		return ctrl.Result{}, err
-	}
-	// Check health periodically
-	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(),
+		&butlerv1alpha1.AddonDefinition{},
+		"metadata.name",
+		func(o client.Object) []string {
+			return []string{o.GetName()}
+		}); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&butlerv1alpha1.TenantAddon{}).
 		Named("tenantaddon").

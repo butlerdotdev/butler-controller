@@ -36,7 +36,9 @@ import (
 	"github.com/butlerdotdev/butler-controller/internal/controller/butlerconfig"
 	"github.com/butlerdotdev/butler-controller/internal/controller/kamajisecret"
 	"github.com/butlerdotdev/butler-controller/internal/controller/kamajistatus"
+	"github.com/butlerdotdev/butler-controller/internal/controller/managementaddon"
 	"github.com/butlerdotdev/butler-controller/internal/controller/team"
+	"github.com/butlerdotdev/butler-controller/internal/controller/tenantaddon"
 	"github.com/butlerdotdev/butler-controller/internal/controller/tenantcluster"
 )
 
@@ -53,7 +55,6 @@ func init() {
 
 	// Register Butler API types
 	utilruntime.Must(butlerv1alpha1.AddToScheme(scheme))
-
 }
 
 func main() {
@@ -93,6 +94,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Read kubeconfig bytes for ManagementAddon controller's Helm operations.
+	// Uses KUBECONFIG env var - same source controller-runtime uses.
+	// When running in-cluster, this will be empty and the controller will
+	// build an in-cluster kubeconfig from the service account.
+	var kubeconfigBytes []byte
+	if kubeconfigPath := os.Getenv("KUBECONFIG"); kubeconfigPath != "" {
+		var readErr error
+		kubeconfigBytes, readErr = os.ReadFile(kubeconfigPath)
+		if readErr != nil {
+			setupLog.Error(readErr, "failed to read kubeconfig file", "path", kubeconfigPath)
+			os.Exit(1)
+		}
+		setupLog.Info("loaded kubeconfig for management addon operations", "path", kubeconfigPath)
+	}
+
 	// ButlerConfig controller. Validates platform configuration
 	if err = (&butlerconfig.Reconciler{
 		Client: mgr.GetClient(),
@@ -121,9 +137,32 @@ func main() {
 		os.Exit(1)
 	}
 
+	// TenantAddon controller. Installs optional addons via TenantAddon CRs
+	if err = (&tenantaddon.Reconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Installer: addons.NewInstaller(),
+		APIReader: mgr.GetAPIReader(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "TenantAddon")
+		os.Exit(1)
+	}
+
+	// ManagementAddon controller. Installs addons on the management cluster
+	if err = (&managementaddon.Reconciler{
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		Installer:  addons.NewInstaller(),
+		APIReader:  mgr.GetAPIReader(),
+		Kubeconfig: kubeconfigBytes,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ManagementAddon")
+		os.Exit(1)
+	}
+
 	// Kamaji integration controllers
 	if enableKamajiControllers {
-		// KamajiSecret controlle. Translates kubeconfig format
+		// KamajiSecret controller. Translates kubeconfig format
 		if err = (&kamajisecret.Reconciler{
 			Client: mgr.GetClient(),
 			Scheme: mgr.GetScheme(),
@@ -155,7 +194,7 @@ func main() {
 	}
 
 	setupLog.Info("starting manager",
-		"controllers", []string{"ButlerConfig", "Team", "TenantCluster", "KamajiSecret", "KamajiStatus"})
+		"controllers", []string{"ButlerConfig", "Team", "TenantCluster", "TenantAddon", "ManagementAddon", "KamajiSecret", "KamajiStatus"})
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")

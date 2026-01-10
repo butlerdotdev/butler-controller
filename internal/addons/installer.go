@@ -43,6 +43,18 @@ type Installer struct {
 	helmPath    string
 }
 
+// ChartInstallOptions contains options for installing a Helm chart.
+type ChartInstallOptions struct {
+	RepoName    string            // e.g., "butler-velero"
+	RepoURL     string            // e.g., "https://vmware-tanzu.github.io/helm-charts"
+	ChartName   string            // e.g., "velero"
+	ReleaseName string            // e.g., "velero"
+	Namespace   string            // e.g., "velero"
+	Version     string            // e.g., "7.2.1"
+	Values      map[string]string // Optional helm --set values
+	Timeout     string            // Optional, defaults to "10m"
+}
+
 // NewInstaller creates a new tenant addon installer.
 func NewInstaller() *Installer {
 	return &Installer{
@@ -379,5 +391,85 @@ func (i *Installer) InstallTraefik(ctx context.Context, kubeconfig []byte, versi
 	}
 
 	logger.Info("Traefik installed successfully")
+	return nil
+}
+
+// InstallChart installs or upgrades a Helm chart.
+// This is the generic method used by TenantAddon controller.
+func (i *Installer) InstallChart(ctx context.Context, kubeconfig []byte, opts ChartInstallOptions) error {
+	logger := log.FromContext(ctx)
+
+	kubeconfigPath, cleanup, err := i.writeKubeconfig(kubeconfig)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	logger.Info("installing chart",
+		"chart", opts.ChartName,
+		"release", opts.ReleaseName,
+		"namespace", opts.Namespace,
+		"version", opts.Version)
+
+	// Ensure namespace exists with privileged PSA
+	if err := i.ensurePrivilegedNamespace(ctx, kubeconfigPath, opts.Namespace); err != nil {
+		return fmt.Errorf("failed to prepare namespace %s: %w", opts.Namespace, err)
+	}
+
+	// Add helm repo
+	if err := i.runHelm(ctx, kubeconfigPath, "repo", "add", opts.RepoName, opts.RepoURL, "--force-update"); err != nil {
+		logger.V(1).Info("helm repo add failed (may already exist)", "error", err)
+	}
+
+	// Update repos
+	if err := i.runHelm(ctx, kubeconfigPath, "repo", "update"); err != nil {
+		logger.V(1).Info("helm repo update failed", "error", err)
+	}
+
+	// Build args
+	timeout := opts.Timeout
+	if timeout == "" {
+		timeout = "10m"
+	}
+
+	args := []string{
+		"upgrade", "--install", opts.ReleaseName, opts.RepoName + "/" + opts.ChartName,
+		"--namespace", opts.Namespace,
+		"--create-namespace",
+		"--version", opts.Version,
+		"--wait",
+		"--timeout", timeout,
+	}
+
+	// Add any custom values
+	for k, v := range opts.Values {
+		args = append(args, "--set", fmt.Sprintf("%s=%s", k, v))
+	}
+
+	if err := i.runHelm(ctx, kubeconfigPath, args...); err != nil {
+		return fmt.Errorf("failed to install chart %s: %w", opts.ChartName, err)
+	}
+
+	logger.Info("chart installed successfully", "release", opts.ReleaseName)
+	return nil
+}
+
+// UninstallChart uninstalls a Helm release.
+func (i *Installer) UninstallChart(ctx context.Context, kubeconfig []byte, releaseName, namespace string) error {
+	logger := log.FromContext(ctx)
+
+	kubeconfigPath, cleanup, err := i.writeKubeconfig(kubeconfig)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	logger.Info("uninstalling chart", "release", releaseName, "namespace", namespace)
+
+	if err := i.runHelm(ctx, kubeconfigPath, "uninstall", releaseName, "--namespace", namespace); err != nil {
+		return fmt.Errorf("failed to uninstall release %s: %w", releaseName, err)
+	}
+
+	logger.Info("chart uninstalled successfully", "release", releaseName)
 	return nil
 }

@@ -388,6 +388,11 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 	r.setCondition(tc, butlerv1alpha1.TenantClusterConditionAddonsReady,
 		metav1.ConditionTrue, "AddonsInstalled", "All addons installed successfully")
 
+	// Set kubeconfig secret reference for TenantAddon controller
+	tc.Status.KubeconfigSecretRef = &butlerv1alpha1.LocalObjectReference{
+		Name: fmt.Sprintf("%s-admin-kubeconfig", tc.Name),
+	}
+
 	tc.Status.Phase = butlerv1alpha1.TenantClusterPhaseReady
 	now := metav1.Now()
 	tc.Status.LastTransitionTime = &now

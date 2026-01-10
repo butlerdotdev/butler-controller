@@ -64,7 +64,7 @@ build: fmt vet ## Build manager binary.
 
 .PHONY: run
 run: fmt vet ## Run a controller from your host.
-	go run ./cmd/main.go
+	CGO_ENABLED=0 go run ./cmd/main.go
 
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
