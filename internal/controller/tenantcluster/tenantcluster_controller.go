@@ -157,6 +157,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return result, nil
 	}
 
+	// Sync MachineDeployment replicas for Ready clusters
+	// This handles scaling operations after initial provisioning
+	if err := r.reconcileMachineDeploymentReplicas(ctx, tc); err != nil {
+		logger.Error(err, "failed to reconcile MachineDeployment replicas")
+		// Don't fail the reconcile, just log - scaling is not critical path
+	}
+
 	tc.Status.ObservedGeneration = tc.Generation
 	if err := r.Status().Update(ctx, tc); err != nil {
 		return ctrl.Result{}, err
@@ -464,6 +471,8 @@ func (r *Reconciler) getProviderConfig(ctx context.Context, tc *butlerv1alpha1.T
 	return nil, fmt.Errorf("no ProviderConfig available in %s namespace", defaultProviderNamespace)
 }
 
+// checkInfrastructureStatus checks the status of the CAPI Cluster and MachineDeployment.
+// It updates the TenantCluster status with current worker node counts.
 func (r *Reconciler) checkInfrastructureStatus(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (infraReady, cpReady, workersReady bool, err error) {
 	logger := log.FromContext(ctx)
 
@@ -520,11 +529,97 @@ func (r *Reconciler) checkInfrastructureStatus(ctx context.Context, tc *butlerv1
 
 	logger.V(1).Info("MachineDeployment status", "replicas", replicas, "readyReplicas", readyReplicas)
 
+	// Update TenantCluster status with worker counts
+	desiredReplicas := int64(tc.Spec.Workers.Replicas)
+	if desiredReplicas < 1 {
+		desiredReplicas = 1
+	}
+	tc.Status.WorkerNodesReady = int32(readyReplicas)
+	tc.Status.WorkerNodesDesired = int32(desiredReplicas)
+
 	if replicas > 0 {
 		workersReady = true
 	}
 
 	return infraReady, cpReady, workersReady, nil
+}
+
+// reconcileMachineDeploymentReplicas syncs worker count from TenantCluster spec to MachineDeployment.
+// This is called on every reconcile to ensure spec.workers.replicas changes are propagated
+// to the underlying CAPI MachineDeployment, enabling cluster scaling operations.
+// It also updates the TenantCluster status with current worker counts.
+func (r *Reconciler) reconcileMachineDeploymentReplicas(ctx context.Context, tc *butlerv1alpha1.TenantCluster) error {
+	logger := log.FromContext(ctx)
+
+	// Only sync when cluster is Ready or Installing
+	// During Provisioning, initial creation handles replicas
+	if tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseReady &&
+		tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseInstalling {
+		return nil
+	}
+
+	// Need tenant namespace to find MachineDeployment
+	if tc.Status.TenantNamespace == "" {
+		return nil
+	}
+
+	// Get the MachineDeployment
+	mdName := fmt.Sprintf("%s-workers", tc.Name)
+	md := &unstructured.Unstructured{}
+	md.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   capi.ClusterAPIGroup,
+		Version: capi.ClusterAPIVersion,
+		Kind:    "MachineDeployment",
+	})
+
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: tc.Status.TenantNamespace,
+		Name:      mdName,
+	}, md); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Not created yet, will be handled by initial provisioning
+			return nil
+		}
+		return fmt.Errorf("failed to get MachineDeployment: %w", err)
+	}
+
+	// Get current spec replicas and desired replicas from TenantCluster
+	currentSpecReplicas, _, _ := unstructured.NestedInt64(md.Object, "spec", "replicas")
+	desiredReplicas := int64(tc.Spec.Workers.Replicas)
+
+	// Default to 1 if not specified (matches builder.go behavior)
+	if desiredReplicas < 1 {
+		desiredReplicas = 1
+	}
+
+	// Update TenantCluster status with worker counts from MachineDeployment
+	readyReplicas, _, _ := unstructured.NestedInt64(md.Object, "status", "readyReplicas")
+	tc.Status.WorkerNodesReady = int32(readyReplicas)
+	tc.Status.WorkerNodesDesired = int32(desiredReplicas)
+
+	// Check if MachineDeployment spec needs to be scaled
+	if currentSpecReplicas == desiredReplicas {
+		// Already in sync, nothing more to do
+		return nil
+	}
+
+	logger.Info("scaling MachineDeployment",
+		"name", mdName,
+		"from", currentSpecReplicas,
+		"to", desiredReplicas)
+
+	// Patch MachineDeployment replicas
+	patch := []byte(fmt.Sprintf(`{"spec":{"replicas":%d}}`, desiredReplicas))
+
+	if err := r.Patch(ctx, md, client.RawPatch(types.MergePatchType, patch)); err != nil {
+		return fmt.Errorf("failed to patch MachineDeployment replicas: %w", err)
+	}
+
+	logger.Info("MachineDeployment scaled successfully",
+		"name", mdName,
+		"replicas", desiredReplicas)
+
+	return nil
 }
 
 func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (bool, error) {

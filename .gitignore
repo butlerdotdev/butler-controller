@@ -6,6 +6,7 @@
 *.dylib
 bin/*
 Dockerfile.cross
+secrets/
 
 .DS_Store
 

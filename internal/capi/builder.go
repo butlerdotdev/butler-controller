@@ -59,6 +59,7 @@ type ResourceSet struct {
 	MachineDeployment       *unstructured.Unstructured
 	MachineTemplate         *unstructured.Unstructured
 	BootstrapConfigTemplate *unstructured.Unstructured
+	CredentialSecret        *unstructured.Unstructured
 }
 
 // Builder constructs CAPI resources for a TenantCluster.
@@ -66,6 +67,13 @@ type Builder struct {
 	tc             *butlerv1alpha1.TenantCluster
 	providerConfig *butlerv1alpha1.ProviderConfig
 	namespace      string
+	nutanixCreds   *NutanixCredentials
+}
+
+// NutanixCredentials holds Nutanix Prism Central credentials.
+type NutanixCredentials struct {
+	Username string
+	Password string
 }
 
 // NewBuilder creates a new CAPI resource builder.
@@ -77,12 +85,24 @@ func NewBuilder(tc *butlerv1alpha1.TenantCluster, pc *butlerv1alpha1.ProviderCon
 	}
 }
 
+// WithNutanixCredentials sets the Nutanix credentials for CAPX secret generation.
+// Must be called before Build() when using Nutanix provider.
+func (b *Builder) WithNutanixCredentials(username, password string) *Builder {
+	b.nutanixCreds = &NutanixCredentials{
+		Username: username,
+		Password: password,
+	}
+	return b
+}
+
 // Build constructs all CAPI resources for the tenant cluster.
 func (b *Builder) Build() (*ResourceSet, error) {
 	// Determine provider type and delegate to appropriate builder
 	switch b.providerConfig.Spec.Provider {
 	case butlerv1alpha1.ProviderTypeHarvester:
 		return b.buildHarvesterResources()
+	case butlerv1alpha1.ProviderTypeNutanix:
+		return b.buildNutanixResources()
 	default:
 		return nil, fmt.Errorf("unsupported provider type: %s", b.providerConfig.Spec.Provider)
 	}
@@ -309,6 +329,9 @@ func (b *Builder) buildKubevirtMachineTemplate(name string) *unstructured.Unstru
 	if imageName == "" {
 		imageName = "default/image-b8c6x"
 	}
+	if b.tc.Spec.Workers.MachineTemplate.OS.ImageRef != "" {
+		imageName = b.tc.Spec.Workers.MachineTemplate.OS.ImageRef
+	}
 
 	// Parse image ID for storage class name
 	_, imageID := parseImageNamespace(imageName)
@@ -444,6 +467,182 @@ func (b *Builder) buildKubevirtMachineTemplate(name string) *unstructured.Unstru
 
 	kvmt.Object["spec"] = spec
 	return kvmt
+}
+
+// buildNutanixResources constructs CAPI resources for Nutanix provider.
+// Uses CAPX (cluster-api-provider-nutanix) with Kamaji hosted control planes.
+func (b *Builder) buildNutanixResources() (*ResourceSet, error) {
+	// Validate Nutanix credentials are provided
+	if b.nutanixCreds == nil {
+		return nil, fmt.Errorf("Nutanix credentials not provided; call WithNutanixCredentials() before Build()")
+	}
+	if b.nutanixCreds.Username == "" || b.nutanixCreds.Password == "" {
+		return nil, fmt.Errorf("Nutanix username and password are required")
+	}
+
+	clusterName := b.tc.Name
+
+	// Build credential secret first (NutanixCluster references it)
+	credentialSecret := b.buildNutanixCredentialSecret(clusterName)
+
+	// Build infrastructure cluster (NutanixCluster)
+	infraCluster := b.buildNutanixCluster(clusterName)
+
+	// Build control plane (KamajiControlPlane - shared across providers)
+	controlPlane := b.buildKamajiControlPlane(clusterName)
+
+	// Build top-level Cluster
+	cluster := b.buildCluster(clusterName, infraCluster, controlPlane)
+
+	// Build machine template (NutanixMachineTemplate)
+	machineTemplate := b.buildNutanixMachineTemplate(clusterName)
+
+	// Build bootstrap config template (shared - Rocky Linux)
+	bootstrapTemplate := b.buildKubeadmConfigTemplate(clusterName)
+
+	// Build machine deployment (shared)
+	machineDeployment := b.buildMachineDeployment(clusterName, machineTemplate, bootstrapTemplate)
+
+	return &ResourceSet{
+		Cluster:                 cluster,
+		InfrastructureCluster:   infraCluster,
+		ControlPlane:            controlPlane,
+		MachineDeployment:       machineDeployment,
+		MachineTemplate:         machineTemplate,
+		BootstrapConfigTemplate: bootstrapTemplate,
+		CredentialSecret:        credentialSecret,
+	}, nil
+}
+
+// buildNutanixCluster constructs the NutanixCluster infrastructure resource.
+func (b *Builder) buildNutanixCluster(name string) *unstructured.Unstructured {
+	nxCluster := &unstructured.Unstructured{}
+	// CAPX uses v1beta1, not v1alpha1 like capk
+	nxCluster.SetAPIVersion(fmt.Sprintf("%s/v1beta1", InfrastructureAPIGroup))
+	nxCluster.SetKind("NutanixCluster")
+	nxCluster.SetName(name)
+	nxCluster.SetNamespace(b.namespace)
+	nxCluster.SetLabels(b.commonLabels())
+
+	nutanixSpec := b.providerConfig.Spec.Nutanix
+
+	// Parse endpoint to get address without scheme
+	address := nutanixSpec.Endpoint
+	address = strings.TrimPrefix(address, "https://")
+	address = strings.TrimPrefix(address, "http://")
+
+	// Get port, default to 9440
+	port := int64(9440)
+	if nutanixSpec.Port > 0 {
+		port = int64(nutanixSpec.Port)
+	}
+
+	// Credential secret name follows pattern: <cluster-name>-nutanix-creds
+	credSecretName := fmt.Sprintf("%s-nutanix-creds", name)
+
+	spec := map[string]interface{}{
+		// Control plane endpoint - will be patched by Kamaji when LoadBalancer gets IP
+		"controlPlaneEndpoint": map[string]interface{}{
+			"host": "",
+			"port": int64(6443),
+		},
+		// Prism Central configuration
+		"prismCentral": map[string]interface{}{
+			"address":  address,
+			"port":     port,
+			"insecure": nutanixSpec.Insecure,
+			"credentialRef": map[string]interface{}{
+				"kind":      "Secret",
+				"name":      credSecretName,
+				"namespace": b.namespace,
+			},
+		},
+	}
+
+	nxCluster.Object["spec"] = spec
+	return nxCluster
+}
+
+// buildNutanixMachineTemplate constructs the NutanixMachineTemplate resource.
+func (b *Builder) buildNutanixMachineTemplate(name string) *unstructured.Unstructured {
+	nxmt := &unstructured.Unstructured{}
+	// CAPX uses v1beta1
+	nxmt.SetAPIVersion(fmt.Sprintf("%s/v1beta1", InfrastructureAPIGroup))
+	nxmt.SetKind("NutanixMachineTemplate")
+	nxmt.SetName(fmt.Sprintf("%s-worker", name))
+	nxmt.SetNamespace(b.namespace)
+	nxmt.SetLabels(b.commonLabels())
+
+	nutanixSpec := b.providerConfig.Spec.Nutanix
+
+	// Get machine specs from TenantCluster
+	cpu, memoryStr, diskStr := b.getMachineSpecs()
+
+	// CAPX uses vcpuSockets * vcpusPerSocket for total vCPUs
+	vcpuSockets := cpu
+	vcpusPerSocket := int64(1)
+
+	// Determine image UUID - TenantCluster spec takes precedence over ProviderConfig
+	imageUUID := nutanixSpec.ImageUUID
+	if b.tc.Spec.Workers.MachineTemplate.OS.ImageRef != "" {
+		imageUUID = b.tc.Spec.Workers.MachineTemplate.OS.ImageRef
+	}
+
+	spec := map[string]interface{}{
+		"template": map[string]interface{}{
+			"spec": map[string]interface{}{
+				"bootType":       "legacy",
+				"vcpuSockets":    vcpuSockets,
+				"vcpusPerSocket": vcpusPerSocket,
+				"memorySize":     memoryStr,
+				"systemDiskSize": diskStr,
+				// Image reference by UUID
+				"image": map[string]interface{}{
+					"type": "uuid",
+					"uuid": imageUUID,
+				},
+				// Prism Element cluster reference by UUID
+				"cluster": map[string]interface{}{
+					"type": "uuid",
+					"uuid": nutanixSpec.ClusterUUID,
+				},
+				// Subnet reference by UUID
+				"subnet": []interface{}{
+					map[string]interface{}{
+						"type": "uuid",
+						"uuid": nutanixSpec.SubnetUUID,
+					},
+				},
+			},
+		},
+	}
+
+	nxmt.Object["spec"] = spec
+	return nxmt
+}
+
+// buildNutanixCredentialSecret constructs the Secret containing Nutanix credentials
+// in the format required by CAPX (JSON array with basic_auth type).
+func (b *Builder) buildNutanixCredentialSecret(name string) *unstructured.Unstructured {
+	secret := &unstructured.Unstructured{}
+	secret.SetAPIVersion("v1")
+	secret.SetKind("Secret")
+	secret.SetName(fmt.Sprintf("%s-nutanix-creds", name))
+	secret.SetNamespace(b.namespace)
+	secret.SetLabels(b.commonLabels())
+
+	// CAPX expects credentials in this specific JSON format
+	credentialsJSON := fmt.Sprintf(`[{"type":"basic_auth","data":{"prismCentral":{"username":"%s","password":"%s"}}}]`,
+		b.nutanixCreds.Username,
+		b.nutanixCreds.Password,
+	)
+
+	secret.Object["type"] = "Opaque"
+	secret.Object["stringData"] = map[string]interface{}{
+		"credentials": credentialsJSON,
+	}
+
+	return secret
 }
 
 // parseImageNamespace extracts namespace and image ID from namespace/name format.
@@ -739,6 +938,7 @@ func (rs *ResourceSet) SetOwnerReferences(ref metav1.OwnerReference) {
 		rs.MachineDeployment,
 		rs.MachineTemplate,
 		rs.BootstrapConfigTemplate,
+		rs.CredentialSecret,
 	}
 
 	for _, r := range resources {
@@ -749,9 +949,11 @@ func (rs *ResourceSet) SetOwnerReferences(ref metav1.OwnerReference) {
 }
 
 // AllResources returns all resources as a slice for iteration.
+// Order matters: credential secret must exist before NutanixCluster references it.
 func (rs *ResourceSet) AllResources() []*unstructured.Unstructured {
 	return []*unstructured.Unstructured{
-		rs.InfrastructureCluster,   // Create infrastructure first
+		rs.CredentialSecret,        // Create credentials first (CAPX needs this)
+		rs.InfrastructureCluster,   // Create infrastructure cluster
 		rs.BootstrapConfigTemplate, // Then bootstrap config
 		rs.MachineTemplate,         // Then machine template
 		rs.ControlPlane,            // Then control plane
