@@ -318,10 +318,23 @@ func (b *Builder) buildKubevirtMachineTemplate(name string) *unstructured.Unstru
 		targetNS = "default"
 	}
 
+	// Check infrastructureOverride first (per-cluster override)
+	if b.tc.Spec.InfrastructureOverride != nil &&
+		b.tc.Spec.InfrastructureOverride.Harvester != nil &&
+		b.tc.Spec.InfrastructureOverride.Harvester.Namespace != "" {
+		targetNS = b.tc.Spec.InfrastructureOverride.Harvester.Namespace
+	}
 	// Network name for Multus - must be namespace/name format
 	networkName := harvesterSpec.NetworkName
 	if networkName == "" {
 		networkName = "default/vlan40-workloads"
+	}
+
+	// Check infrastructureOverride first
+	if b.tc.Spec.InfrastructureOverride != nil &&
+		b.tc.Spec.InfrastructureOverride.Harvester != nil &&
+		b.tc.Spec.InfrastructureOverride.Harvester.NetworkName != "" {
+		networkName = b.tc.Spec.InfrastructureOverride.Harvester.NetworkName
 	}
 
 	// Image name - Harvester image ID format namespace/name
@@ -329,7 +342,13 @@ func (b *Builder) buildKubevirtMachineTemplate(name string) *unstructured.Unstru
 	if imageName == "" {
 		imageName = "default/image-b8c6x"
 	}
-	if b.tc.Spec.Workers.MachineTemplate.OS.ImageRef != "" {
+	// Check infrastructureOverride first (per-cluster override takes precedence)
+	if b.tc.Spec.InfrastructureOverride != nil &&
+		b.tc.Spec.InfrastructureOverride.Harvester != nil &&
+		b.tc.Spec.InfrastructureOverride.Harvester.ImageName != "" {
+		imageName = b.tc.Spec.InfrastructureOverride.Harvester.ImageName
+	} else if b.tc.Spec.Workers.MachineTemplate.OS.ImageRef != "" {
+		// Fall back to OS.ImageRef
 		imageName = b.tc.Spec.Workers.MachineTemplate.OS.ImageRef
 	}
 
@@ -584,7 +603,11 @@ func (b *Builder) buildNutanixMachineTemplate(name string) *unstructured.Unstruc
 
 	// Determine image UUID - TenantCluster spec takes precedence over ProviderConfig
 	imageUUID := nutanixSpec.ImageUUID
-	if b.tc.Spec.Workers.MachineTemplate.OS.ImageRef != "" {
+	if b.tc.Spec.InfrastructureOverride != nil &&
+		b.tc.Spec.InfrastructureOverride.Nutanix != nil &&
+		b.tc.Spec.InfrastructureOverride.Nutanix.ImageUUID != "" {
+		imageUUID = b.tc.Spec.InfrastructureOverride.Nutanix.ImageUUID
+	} else if b.tc.Spec.Workers.MachineTemplate.OS.ImageRef != "" {
 		imageUUID = b.tc.Spec.Workers.MachineTemplate.OS.ImageRef
 	}
 
