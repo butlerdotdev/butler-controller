@@ -23,6 +23,7 @@ import (
 	"os"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -70,6 +71,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if !controllerutil.ContainsFinalizer(addon, finalizerName) {
 		controllerutil.AddFinalizer(addon, finalizerName)
 		if err := r.Update(ctx, addon); err != nil {
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, nil
@@ -147,6 +151,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	addon.Status.HelmRelease = &butlerv1alpha1.HelmReleaseStatus{
 		Name:      addon.Name,
 		Namespace: namespace,
+		Version:   version,
+		Revision:  1,
+		Status:    "deployed",
 	}
 
 	return r.updateStatus(ctx, addon, butlerv1alpha1.ManagementAddonPhaseInstalled, version, "Addon installed successfully")
@@ -160,11 +167,15 @@ func (r *Reconciler) handleDeletion(ctx context.Context, addon *butlerv1alpha1.M
 		return ctrl.Result{}, nil
 	}
 
-	// Update status to uninstalling
+	// Update status to uninstalling - ignore errors since object may be gone
 	addon.Status.Phase = butlerv1alpha1.ManagementAddonPhaseUninstalling
 	addon.Status.Message = "Uninstalling addon"
 	if err := r.Status().Update(ctx, addon); err != nil {
-		logger.V(1).Info("failed to update status during deletion", "error", err)
+		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+			logger.V(1).Info("status update skipped during deletion", "reason", err.Error())
+		} else {
+			logger.V(1).Info("failed to update status during deletion", "error", err)
+		}
 	}
 
 	// Get kubeconfig
@@ -185,20 +196,68 @@ func (r *Reconciler) handleDeletion(ctx context.Context, addon *butlerv1alpha1.M
 
 			// Uninstall Helm release from management cluster
 			if err := r.Installer.UninstallChart(ctx, kubeconfig, addon.Name, namespace); err != nil {
-				logger.Error(err, "helm uninstall failed, proceeding with finalizer removal")
+				// Only log if it's not a "release not found" error
+				if !isReleaseNotFoundError(err) {
+					logger.Error(err, "helm uninstall failed, proceeding with finalizer removal")
+				} else {
+					logger.V(1).Info("helm release already removed", "release", addon.Name)
+				}
 			} else {
 				logger.Info("addon uninstalled successfully", "release", addon.Name)
 			}
 		}
 	}
 
-	// Remove finalizer
-	controllerutil.RemoveFinalizer(addon, finalizerName)
-	if err := r.Update(ctx, addon); err != nil {
+	// Re-fetch to get latest version before removing finalizer
+	latest := &butlerv1alpha1.ManagementAddon{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(addon), latest); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Already deleted, nothing to do
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{}, err
 	}
 
+	// Remove finalizer from latest version
+	if controllerutil.ContainsFinalizer(latest, finalizerName) {
+		controllerutil.RemoveFinalizer(latest, finalizerName)
+		if err := r.Update(ctx, latest); err != nil {
+			if apierrors.IsNotFound(err) {
+				// Object gone, we're done
+				return ctrl.Result{}, nil
+			}
+			if apierrors.IsConflict(err) {
+				// Conflict, requeue to retry
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, err
+		}
+	}
+
 	return ctrl.Result{}, nil
+}
+
+// isReleaseNotFoundError checks if the error is a "release not found" error
+func isReleaseNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return contains(errStr, "release: not found") || contains(errStr, "not found")
+}
+
+// contains checks if s contains substr (simple helper to avoid strings import)
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
+}
+
+func containsHelper(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }
 
 // getAddonDefinition retrieves the AddonDefinition for this addon
@@ -295,6 +354,14 @@ func (r *Reconciler) updateStatus(ctx context.Context, addon *butlerv1alpha1.Man
 	}
 
 	if err := r.Status().Update(ctx, addon); err != nil {
+		if apierrors.IsConflict(err) {
+			// Conflict, requeue to retry with fresh object
+			return ctrl.Result{Requeue: true}, nil
+		}
+		if apierrors.IsNotFound(err) {
+			// Object deleted, nothing to do
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{}, err
 	}
 
