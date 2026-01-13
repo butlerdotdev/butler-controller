@@ -312,6 +312,8 @@ func (r *Reconciler) reconcileRBAC(ctx context.Context, team *butlerv1alpha1.Tea
 }
 
 // ensureRoleBinding creates or updates a RoleBinding for a user or group.
+// NOTE: RoleBinding.roleRef is immutable. If the role changes, we must delete
+// and recreate the RoleBinding.
 func (r *Reconciler) ensureRoleBinding(
 	ctx context.Context,
 	team *butlerv1alpha1.Team,
@@ -328,49 +330,112 @@ func (r *Reconciler) ensureRoleBinding(
 		clusterRole = clusterRoleAdmin
 	}
 
+	// Check if RoleBinding already exists
+	existing := &rbacv1.RoleBinding{}
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: team.Name}, existing)
+	if err == nil {
+		// RoleBinding exists - check if roleRef needs to change
+		if existing.RoleRef.Name != clusterRole {
+			// roleRef is immutable, we must delete and recreate
+			logger.Info("RoleBinding roleRef changed, deleting for recreation",
+				"name", name, "oldRole", existing.RoleRef.Name, "newRole", clusterRole)
+			if err := r.Delete(ctx, existing); err != nil && !apierrors.IsNotFound(err) {
+				logger.Error(err, "failed to delete RoleBinding for role change", "name", name)
+				return err
+			}
+			// Fall through to create new RoleBinding
+		} else {
+			// roleRef is the same, just update labels/subjects if needed
+			return r.updateRoleBinding(ctx, team, existing, subjectKind, subjectName)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		// Unexpected error
+		logger.Error(err, "failed to get RoleBinding", "name", name)
+		return err
+	}
+
+	// Create new RoleBinding
 	rb := &rbacv1.RoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: team.Name,
+			Labels: map[string]string{
+				butlerv1alpha1.LabelTeam:      team.Name,
+				butlerv1alpha1.LabelManagedBy: "butler",
+			},
 		},
-	}
-
-	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, rb, func() error {
-		// Set labels
-		if rb.Labels == nil {
-			rb.Labels = make(map[string]string)
-		}
-		rb.Labels[butlerv1alpha1.LabelTeam] = team.Name
-		rb.Labels[butlerv1alpha1.LabelManagedBy] = "butler"
-
-		// Set subjects
-		rb.Subjects = []rbacv1.Subject{
+		Subjects: []rbacv1.Subject{
 			{
 				Kind:     subjectKind,
 				Name:     subjectName,
 				APIGroup: rbacv1.GroupName,
 			},
-		}
-
-		// Set role reference
-		rb.RoleRef = rbacv1.RoleRef{
+		},
+		RoleRef: rbacv1.RoleRef{
 			APIGroup: rbacv1.GroupName,
 			Kind:     "ClusterRole",
 			Name:     clusterRole,
+		},
+	}
+
+	if err := r.Create(ctx, rb); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			// Race condition - RoleBinding was recreated between our delete and create
+			// This is fine, requeue and it will be reconciled
+			logger.V(1).Info("RoleBinding already exists after delete, will reconcile", "name", name)
+			return nil
 		}
-
-		return nil
-	})
-
-	if err != nil {
-		logger.Error(err, "failed to reconcile RoleBinding",
-			"name", name, "subject", subjectName, "role", role)
+		logger.Error(err, "failed to create RoleBinding", "name", name, "subject", subjectName, "role", role)
 		return err
 	}
 
-	if op != controllerutil.OperationResultNone {
-		logger.V(1).Info("RoleBinding reconciled",
-			"name", name, "subject", subjectName, "role", role, "operation", op)
+	logger.V(1).Info("RoleBinding reconciled", "name", name, "subject", subjectName, "role", role, "operation", "created")
+	return nil
+}
+
+// updateRoleBinding updates an existing RoleBinding's labels and subjects (but not roleRef).
+func (r *Reconciler) updateRoleBinding(
+	ctx context.Context,
+	team *butlerv1alpha1.Team,
+	rb *rbacv1.RoleBinding,
+	subjectKind string,
+	subjectName string,
+) error {
+	logger := log.FromContext(ctx)
+
+	// Check if update is needed
+	needsUpdate := false
+
+	// Check labels
+	if rb.Labels == nil {
+		rb.Labels = make(map[string]string)
+	}
+	if rb.Labels[butlerv1alpha1.LabelTeam] != team.Name {
+		rb.Labels[butlerv1alpha1.LabelTeam] = team.Name
+		needsUpdate = true
+	}
+	if rb.Labels[butlerv1alpha1.LabelManagedBy] != "butler" {
+		rb.Labels[butlerv1alpha1.LabelManagedBy] = "butler"
+		needsUpdate = true
+	}
+
+	// Check subjects
+	expectedSubject := rbacv1.Subject{
+		Kind:     subjectKind,
+		Name:     subjectName,
+		APIGroup: rbacv1.GroupName,
+	}
+	if len(rb.Subjects) != 1 || rb.Subjects[0] != expectedSubject {
+		rb.Subjects = []rbacv1.Subject{expectedSubject}
+		needsUpdate = true
+	}
+
+	if needsUpdate {
+		if err := r.Update(ctx, rb); err != nil {
+			logger.Error(err, "failed to update RoleBinding", "name", rb.Name)
+			return err
+		}
+		logger.V(1).Info("RoleBinding reconciled", "name", rb.Name, "subject", subjectName, "operation", "updated")
 	}
 
 	return nil
