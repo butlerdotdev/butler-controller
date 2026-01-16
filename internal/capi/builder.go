@@ -66,6 +66,7 @@ type ResourceSet struct {
 type Builder struct {
 	tc             *butlerv1alpha1.TenantCluster
 	providerConfig *butlerv1alpha1.ProviderConfig
+	butlerConfig   *butlerv1alpha1.ButlerConfig
 	namespace      string
 	nutanixCreds   *NutanixCredentials
 }
@@ -83,6 +84,13 @@ func NewBuilder(tc *butlerv1alpha1.TenantCluster, pc *butlerv1alpha1.ProviderCon
 		providerConfig: pc,
 		namespace:      namespace,
 	}
+}
+
+// WithButlerConfig sets the ButlerConfig for Gateway API support.
+// Required when using Gateway exposure mode.
+func (b *Builder) WithButlerConfig(bc *butlerv1alpha1.ButlerConfig) *Builder {
+	b.butlerConfig = bc
+	return b
 }
 
 // WithNutanixCredentials sets the Nutanix credentials for CAPX secret generation.
@@ -251,11 +259,8 @@ func (b *Builder) buildKamajiControlPlane(name string) *unstructured.Unstructure
 		dataStoreName = b.tc.Spec.ControlPlane.DataStoreRef.Name
 	}
 
-	// Get service type
-	serviceType := "LoadBalancer"
-	if b.tc.Spec.ControlPlane.ServiceType != "" {
-		serviceType = b.tc.Spec.ControlPlane.ServiceType
-	}
+	// Resolve effective exposure mode and service type
+	exposureMode, serviceType, gatewayHostname := b.resolveControlPlaneExposure()
 
 	// See: https://kamaji.clastix.io/cluster-api/kamaji-control-plane-provider/
 	spec := map[string]interface{}{
@@ -287,17 +292,109 @@ func (b *Builder) buildKamajiControlPlane(name string) *unstructured.Unstructure
 		},
 	}
 
-	// Add certSANs if specified
-	if len(b.tc.Spec.ControlPlane.CertSANs) > 0 {
-		certSANs := make([]interface{}, len(b.tc.Spec.ControlPlane.CertSANs))
-		for i, san := range b.tc.Spec.ControlPlane.CertSANs {
-			certSANs[i] = san
+	// Build certSANs list - start with user-specified SANs
+	var certSANs []interface{}
+	for _, san := range b.tc.Spec.ControlPlane.CertSANs {
+		certSANs = append(certSANs, san)
+	}
+
+	// Handle Gateway mode configuration
+	// See: https://kamaji.clastix.io/guides/gateway-api-support/
+	if exposureMode == butlerv1alpha1.ControlPlaneExposureModeGateway && gatewayHostname != "" {
+		// Add hostname to certSANs if not already present
+		hostnamePresent := false
+		for _, san := range certSANs {
+			if san == gatewayHostname {
+				hostnamePresent = true
+				break
+			}
 		}
+		if !hostnamePresent {
+			certSANs = append(certSANs, gatewayHostname)
+		}
+
+		// Build Gateway configuration for Kamaji
+		// Kamaji automatically creates TLSRoutes for API server (6443) and Konnectivity (8132)
+		// Do NOT set port or sectionName - Kamaji handles this automatically
+		gatewayConfig := map[string]interface{}{
+			"hostname": gatewayHostname,
+			"parentRefs": []interface{}{
+				map[string]interface{}{
+					"name":      b.butlerConfig.GetGatewayName(),
+					"namespace": b.butlerConfig.GetGatewayNamespace(),
+				},
+			},
+		}
+
+		// Set controlPlane.gateway configuration
+		spec["controlPlane"] = map[string]interface{}{
+			"gateway": gatewayConfig,
+		}
+	}
+
+	// Add certSANs to network config if any exist
+	if len(certSANs) > 0 {
 		spec["network"].(map[string]interface{})["certSANs"] = certSANs
 	}
 
 	kcp.Object["spec"] = spec
 	return kcp
+}
+
+// resolveControlPlaneExposure determines the effective exposure mode, service type, and gateway hostname.
+// Returns (exposureMode, serviceType, gatewayHostname).
+// The resolution order is:
+// 1. TenantCluster.spec.controlPlane.exposureMode (explicit per-cluster)
+// 2. ButlerConfig.spec.controlPlane.defaultExposureMode (platform default)
+// 3. LoadBalancer (backward compatibility default)
+func (b *Builder) resolveControlPlaneExposure() (butlerv1alpha1.ControlPlaneExposureMode, string, string) {
+	var exposureMode butlerv1alpha1.ControlPlaneExposureMode
+	var serviceType string
+	var gatewayHostname string
+
+	// 1. Check TenantCluster spec for explicit exposure mode
+	if b.tc.Spec.ControlPlane.ExposureMode != "" {
+		exposureMode = b.tc.Spec.ControlPlane.ExposureMode
+	} else if b.butlerConfig != nil {
+		// 2. Fall back to ButlerConfig default
+		exposureMode = b.butlerConfig.GetDefaultExposureMode()
+	}
+
+	// 3. If still empty, default to LoadBalancer for backward compatibility
+	if exposureMode == "" {
+		exposureMode = butlerv1alpha1.ControlPlaneExposureModeLoadBalancer
+	}
+
+	// Determine service type and gateway hostname based on exposure mode
+	switch exposureMode {
+	case butlerv1alpha1.ControlPlaneExposureModeGateway:
+		// Gateway mode requires ClusterIP - Kamaji routes via TLSRoute
+		serviceType = "ClusterIP"
+
+		// Resolve hostname: explicit override > auto-generated
+		if b.tc.Spec.ControlPlane.Gateway != nil && b.tc.Spec.ControlPlane.Gateway.Hostname != "" {
+			gatewayHostname = b.tc.Spec.ControlPlane.Gateway.Hostname
+		} else if b.butlerConfig != nil && b.butlerConfig.IsGatewayConfigured() {
+			// Auto-generate hostname: {cluster-name}.{domain}
+			gatewayHostname = b.tc.GenerateGatewayHostname(b.butlerConfig.GetGatewayDomain())
+		}
+
+	case butlerv1alpha1.ControlPlaneExposureModeNodePort:
+		serviceType = "NodePort"
+
+	case butlerv1alpha1.ControlPlaneExposureModeLoadBalancer:
+		fallthrough
+	default:
+		serviceType = "LoadBalancer"
+	}
+
+	// Honor deprecated ServiceType field for backward compatibility
+	// Only if no explicit ExposureMode was set and ServiceType is specified
+	if b.tc.Spec.ControlPlane.ExposureMode == "" && b.tc.Spec.ControlPlane.ServiceType != "" {
+		serviceType = b.tc.Spec.ControlPlane.ServiceType
+	}
+
+	return exposureMode, serviceType, gatewayHostname
 }
 
 // buildKubevirtMachineTemplate constructs the KubevirtMachineTemplate resource.

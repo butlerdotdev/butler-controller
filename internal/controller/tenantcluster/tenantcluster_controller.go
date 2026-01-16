@@ -59,6 +59,7 @@ const (
 	ReasonProviderConfigNotFound = "ProviderConfigNotFound"
 	ReasonCAPIResourceError      = "CAPIResourceError"
 	ReasonReady                  = "Ready"
+	ReasonGatewayNotConfigured   = "GatewayNotConfigured"
 )
 
 type Reconciler struct {
@@ -85,6 +86,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=harvesterclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=harvestermachinetemplates,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kamaji.clastix.io,resources=tenantcontrolplanes,verbs=get;list;watch
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -145,7 +147,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 	}
 
-	result, err := r.reconcileInfrastructure(ctx, tc)
+	result, err := r.reconcileInfrastructure(ctx, tc, butlerConfig)
 	if err != nil {
 		logger.Error(err, "failed to reconcile infrastructure")
 		return r.setFailedStatus(ctx, tc, ReasonCAPIResourceError, err.Error())
@@ -158,10 +160,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	// Sync MachineDeployment replicas for Ready clusters
-	// This handles scaling operations after initial provisioning
 	if err := r.reconcileMachineDeploymentReplicas(ctx, tc); err != nil {
 		logger.Error(err, "failed to reconcile MachineDeployment replicas")
-		// Don't fail the reconcile, just log - scaling is not critical path
 	}
 
 	tc.Status.ObservedGeneration = tc.Generation
@@ -172,10 +172,27 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	return ctrl.Result{RequeueAfter: r.calculateRequeueInterval(tc)}, nil
 }
 
-func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (ctrl.Result, error) {
+// validateControlPlaneExposure validates Gateway mode prerequisites.
+func (r *Reconciler) validateControlPlaneExposure(tc *butlerv1alpha1.TenantCluster, config *butlerv1alpha1.ButlerConfig) error {
+	// Determine effective exposure mode
+	exposureMode := tc.Spec.ControlPlane.ExposureMode
+	if exposureMode == "" && config != nil {
+		exposureMode = config.GetDefaultExposureMode()
+	}
+
+	// Gateway mode requires ButlerConfig gateway configuration
+	if exposureMode == butlerv1alpha1.ControlPlaneExposureModeGateway {
+		if config == nil || !config.IsGatewayConfigured() {
+			return fmt.Errorf("Gateway exposure mode requires ButlerConfig.spec.controlPlane.gateway to be configured")
+		}
+	}
+
+	return nil
+}
+
+func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Already ready, nothing to do
 	if tc.Status.Phase == butlerv1alpha1.TenantClusterPhaseReady {
 		return ctrl.Result{}, nil
 	}
@@ -189,7 +206,9 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 		return ctrl.Result{}, err
 	}
 
-	builder := capi.NewBuilder(tc, providerConfig, tc.Status.TenantNamespace)
+	builder := capi.NewBuilder(tc, providerConfig, tc.Status.TenantNamespace).
+		WithButlerConfig(butlerConfig)
+
 	resourceSet, err := builder.Build()
 	if err != nil {
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionInfrastructureReady,
@@ -255,19 +274,21 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 	if controlPlaneReady {
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionControlPlaneReady,
 			metav1.ConditionTrue, ReasonControlPlaneReady, "Control plane is ready")
+
+		// Populate control plane status when ready
+		if err := r.populateControlPlaneStatus(ctx, tc, butlerConfig); err != nil {
+			logger.Error(err, "failed to populate control plane status")
+		}
 	} else {
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionControlPlaneReady,
 			metav1.ConditionFalse, ReasonInfraProvisioning, "Control plane is provisioning")
 	}
 
 	if workersReady {
-
-		// Skip installation if already ready
 		if tc.Status.Phase == butlerv1alpha1.TenantClusterPhaseReady {
 			return ctrl.Result{}, nil
 		}
 
-		// Check if control plane is accessible by trying to get kubeconfig
 		_, err := r.getTenantKubeconfig(ctx, tc)
 		if err == nil {
 			logger.Info("control plane accessible and workers provisioned, proceeding to addon installation")
@@ -286,9 +307,93 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 	return ctrl.Result{}, nil
 }
 
+// populateControlPlaneStatus populates tc.Status.ControlPlane based on exposure mode.
+func (r *Reconciler) populateControlPlaneStatus(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) error {
+	if tc.Status.ControlPlane == nil {
+		tc.Status.ControlPlane = &butlerv1alpha1.ControlPlaneStatus{}
+	}
+
+	// Determine effective exposure mode
+	exposureMode := tc.Spec.ControlPlane.ExposureMode
+	if exposureMode == "" && butlerConfig != nil {
+		exposureMode = butlerConfig.GetDefaultExposureMode()
+	}
+	if exposureMode == "" {
+		exposureMode = butlerv1alpha1.ControlPlaneExposureModeLoadBalancer
+	}
+
+	tc.Status.ControlPlane.ExposureMode = exposureMode
+
+	switch exposureMode {
+	case butlerv1alpha1.ControlPlaneExposureModeGateway:
+		// Gateway mode: hostname-based access
+		hostname := tc.GetGatewayHostname()
+		if hostname == "" && butlerConfig != nil && butlerConfig.IsGatewayConfigured() {
+			hostname = tc.GenerateGatewayHostname(butlerConfig.GetGatewayDomain())
+		}
+		tc.Status.ControlPlane.Hostname = hostname
+		tc.Status.ControlPlane.Endpoint = fmt.Sprintf("https://%s:6443", hostname)
+		tc.Status.ControlPlane.Ready = true
+		tc.Status.ControlPlane.Message = "Control plane exposed via Gateway API"
+
+		// Also set deprecated field for backward compatibility
+		tc.Status.ControlPlaneEndpoint = tc.Status.ControlPlane.Endpoint
+
+	case butlerv1alpha1.ControlPlaneExposureModeLoadBalancer:
+		// LoadBalancer mode: extract IP from TenantControlPlane status
+		ip, err := r.getLoadBalancerIP(ctx, tc)
+		if err != nil {
+			tc.Status.ControlPlane.Ready = false
+			tc.Status.ControlPlane.Message = "Waiting for LoadBalancer IP"
+			return nil
+		}
+		tc.Status.ControlPlane.LoadBalancerIP = ip
+		tc.Status.ControlPlane.Endpoint = fmt.Sprintf("https://%s:6443", ip)
+		tc.Status.ControlPlane.Ready = true
+		tc.Status.ControlPlane.Message = "Control plane exposed via LoadBalancer"
+
+		// Also set deprecated field for backward compatibility
+		tc.Status.ControlPlaneEndpoint = tc.Status.ControlPlane.Endpoint
+
+	case butlerv1alpha1.ControlPlaneExposureModeNodePort:
+		tc.Status.ControlPlane.Ready = true
+		tc.Status.ControlPlane.Message = "Control plane exposed via NodePort"
+	}
+
+	return nil
+}
+
+// getLoadBalancerIP extracts the LoadBalancer IP from the TenantControlPlane status.
+func (r *Reconciler) getLoadBalancerIP(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (string, error) {
+	tcp := &unstructured.Unstructured{}
+	tcp.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "kamaji.clastix.io",
+		Version: "v1alpha1",
+		Kind:    "TenantControlPlane",
+	})
+
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      tc.Name,
+		Namespace: tc.Status.TenantNamespace,
+	}, tcp); err != nil {
+		return "", fmt.Errorf("failed to get TenantControlPlane: %w", err)
+	}
+
+	ingress, found, _ := unstructured.NestedSlice(tcp.Object, "status", "kubernetesResources", "service", "loadBalancer", "ingress")
+	if !found || len(ingress) == 0 {
+		return "", fmt.Errorf("no LoadBalancer ingress found")
+	}
+
+	if ingressEntry, ok := ingress[0].(map[string]interface{}); ok {
+		if ip, found, _ := unstructured.NestedString(ingressEntry, "ip"); found && ip != "" {
+			return ip, nil
+		}
+	}
+
+	return "", fmt.Errorf("LoadBalancer IP not yet assigned")
+}
+
 // reconcileAddons installs required addons for a functional tenant cluster.
-// These are infrastructure requirements, not optional features.
-// Addons are installed monotonically - they are added but never removed via spec changes.
 func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -313,7 +418,6 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 		ciliumVersion = tc.Spec.Addons.CNI.Version
 	}
 	logger.Info("installing Cilium CNI", "version", ciliumVersion)
-	// Extract API server endpoint from kubeconfig
 	apiServerHost, apiServerPort := extractAPIServerEndpoint(kubeconfigData)
 	if err := r.Installer.InstallCilium(ctx, kubeconfigData, ciliumVersion, apiServerHost, apiServerPort); err != nil {
 		logger.Error(err, "failed to install Cilium")
@@ -330,16 +434,23 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 	if tc.Spec.Addons.CertManager != nil && tc.Spec.Addons.CertManager.Version != "" {
 		certManagerVersion = tc.Spec.Addons.CertManager.Version
 	}
-	logger.Info("installing cert-manager", "version", certManagerVersion)
-	if err := r.Installer.InstallCertManager(ctx, kubeconfigData, certManagerVersion); err != nil {
-		logger.Error(err, "failed to install cert-manager")
-	} else {
-		addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
-			Name: "cert-manager", Version: certManagerVersion, Status: "Healthy", ManagedBy: "butler",
-		})
+	// Only install if enabled (default true) or explicitly requested
+	installCertManager := true
+	if tc.Spec.Addons.CertManager != nil && !tc.Spec.Addons.CertManager.Enabled {
+		installCertManager = false
+	}
+	if installCertManager {
+		logger.Info("installing cert-manager", "version", certManagerVersion)
+		if err := r.Installer.InstallCertManager(ctx, kubeconfigData, certManagerVersion); err != nil {
+			logger.Error(err, "failed to install cert-manager")
+		} else {
+			addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
+				Name: "cert-manager", Version: certManagerVersion, Status: "Healthy", ManagedBy: "butler",
+			})
+		}
 	}
 
-	// 3. Longhorn - storage
+	// 3. Storage (Longhorn)
 	longhornVersion := addons.DefaultLonghornVersion
 	if tc.Spec.Addons.Storage != nil && tc.Spec.Addons.Storage.Version != "" {
 		longhornVersion = tc.Spec.Addons.Storage.Version
@@ -358,11 +469,9 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 	if tc.Spec.Addons.LoadBalancer != nil && tc.Spec.Addons.LoadBalancer.Version != "" {
 		metallbVersion = tc.Spec.Addons.LoadBalancer.Version
 	}
-	var poolStart, poolEnd string
-	if tc.Spec.Networking.LoadBalancerPool != nil {
-		poolStart = tc.Spec.Networking.LoadBalancerPool.Start
-		poolEnd = tc.Spec.Networking.LoadBalancerPool.End
-	}
+
+	// Get address pool (checks Addons.LoadBalancer.AddressPool first, falls back to Networking.LoadBalancerPool)
+	poolStart, poolEnd := tc.GetLoadBalancerPool()
 	logger.Info("installing MetalLB", "version", metallbVersion, "poolStart", poolStart, "poolEnd", poolEnd)
 	if err := r.Installer.InstallMetalLB(ctx, kubeconfigData, metallbVersion, poolStart, poolEnd); err != nil {
 		logger.Error(err, "failed to install MetalLB")
@@ -372,7 +481,7 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 		})
 	}
 
-	// 5. Traefik - Ingress
+	// 5. Ingress (Traefik)
 	traefikVersion := addons.DefaultTraefikVersion
 	if tc.Spec.Addons.Ingress != nil && tc.Spec.Addons.Ingress.Version != "" {
 		traefikVersion = tc.Spec.Addons.Ingress.Version
@@ -395,7 +504,6 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 	r.setCondition(tc, butlerv1alpha1.TenantClusterConditionAddonsReady,
 		metav1.ConditionTrue, "AddonsInstalled", "All addons installed successfully")
 
-	// Set kubeconfig secret reference for TenantAddon controller
 	tc.Status.KubeconfigSecretRef = &butlerv1alpha1.LocalObjectReference{
 		Name: fmt.Sprintf("%s-admin-kubeconfig", tc.Name),
 	}
@@ -471,8 +579,6 @@ func (r *Reconciler) getProviderConfig(ctx context.Context, tc *butlerv1alpha1.T
 	return nil, fmt.Errorf("no ProviderConfig available in %s namespace", defaultProviderNamespace)
 }
 
-// checkInfrastructureStatus checks the status of the CAPI Cluster and MachineDeployment.
-// It updates the TenantCluster status with current worker node counts.
 func (r *Reconciler) checkInfrastructureStatus(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (infraReady, cpReady, workersReady bool, err error) {
 	logger := log.FromContext(ctx)
 
@@ -529,7 +635,6 @@ func (r *Reconciler) checkInfrastructureStatus(ctx context.Context, tc *butlerv1
 
 	logger.V(1).Info("MachineDeployment status", "replicas", replicas, "readyReplicas", readyReplicas)
 
-	// Update TenantCluster status with worker counts
 	desiredReplicas := int64(tc.Spec.Workers.Replicas)
 	if desiredReplicas < 1 {
 		desiredReplicas = 1
@@ -544,26 +649,18 @@ func (r *Reconciler) checkInfrastructureStatus(ctx context.Context, tc *butlerv1
 	return infraReady, cpReady, workersReady, nil
 }
 
-// reconcileMachineDeploymentReplicas syncs worker count from TenantCluster spec to MachineDeployment.
-// This is called on every reconcile to ensure spec.workers.replicas changes are propagated
-// to the underlying CAPI MachineDeployment, enabling cluster scaling operations.
-// It also updates the TenantCluster status with current worker counts.
 func (r *Reconciler) reconcileMachineDeploymentReplicas(ctx context.Context, tc *butlerv1alpha1.TenantCluster) error {
 	logger := log.FromContext(ctx)
 
-	// Only sync when cluster is Ready or Installing
-	// During Provisioning, initial creation handles replicas
 	if tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseReady &&
 		tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseInstalling {
 		return nil
 	}
 
-	// Need tenant namespace to find MachineDeployment
 	if tc.Status.TenantNamespace == "" {
 		return nil
 	}
 
-	// Get the MachineDeployment
 	mdName := fmt.Sprintf("%s-workers", tc.Name)
 	md := &unstructured.Unstructured{}
 	md.SetGroupVersionKind(schema.GroupVersionKind{
@@ -577,29 +674,23 @@ func (r *Reconciler) reconcileMachineDeploymentReplicas(ctx context.Context, tc 
 		Name:      mdName,
 	}, md); err != nil {
 		if apierrors.IsNotFound(err) {
-			// Not created yet, will be handled by initial provisioning
 			return nil
 		}
 		return fmt.Errorf("failed to get MachineDeployment: %w", err)
 	}
 
-	// Get current spec replicas and desired replicas from TenantCluster
 	currentSpecReplicas, _, _ := unstructured.NestedInt64(md.Object, "spec", "replicas")
 	desiredReplicas := int64(tc.Spec.Workers.Replicas)
 
-	// Default to 1 if not specified (matches builder.go behavior)
 	if desiredReplicas < 1 {
 		desiredReplicas = 1
 	}
 
-	// Update TenantCluster status with worker counts from MachineDeployment
 	readyReplicas, _, _ := unstructured.NestedInt64(md.Object, "status", "readyReplicas")
 	tc.Status.WorkerNodesReady = int32(readyReplicas)
 	tc.Status.WorkerNodesDesired = int32(desiredReplicas)
 
-	// Check if MachineDeployment spec needs to be scaled
 	if currentSpecReplicas == desiredReplicas {
-		// Already in sync, nothing more to do
 		return nil
 	}
 
@@ -608,7 +699,6 @@ func (r *Reconciler) reconcileMachineDeploymentReplicas(ctx context.Context, tc 
 		"from", currentSpecReplicas,
 		"to", desiredReplicas)
 
-	// Patch MachineDeployment replicas
 	patch := []byte(fmt.Sprintf(`{"spec":{"replicas":%d}}`, desiredReplicas))
 
 	if err := r.Patch(ctx, md, client.RawPatch(types.MergePatchType, patch)); err != nil {
@@ -793,6 +883,11 @@ func (r *Reconciler) validateTenantCluster(ctx context.Context, tc *butlerv1alph
 	mode := config.Spec.MultiTenancy.Mode
 
 	logger.V(1).Info("validating TenantCluster", "mode", mode)
+
+	// Validate control plane exposure mode prerequisites
+	if err := r.validateControlPlaneExposure(tc, config); err != nil {
+		return err
+	}
 
 	switch mode {
 	case butlerv1alpha1.MultiTenancyModeEnforced:
@@ -1092,7 +1187,6 @@ func generateTenantNamespace(tc *butlerv1alpha1.TenantCluster) string {
 }
 
 func extractAPIServerEndpoint(kubeconfig []byte) (string, string) {
-	// Parse kubeconfig to get server URL
 	var kc struct {
 		Clusters []struct {
 			Cluster struct {
@@ -1101,10 +1195,9 @@ func extractAPIServerEndpoint(kubeconfig []byte) (string, string) {
 		} `yaml:"clusters"`
 	}
 	if err := yaml.Unmarshal(kubeconfig, &kc); err != nil || len(kc.Clusters) == 0 {
-		return "kubernetes.default.svc.cluster.local", "443" // fallback
+		return "kubernetes.default.svc.cluster.local", "443"
 	}
 
-	// Parse URL like https://10.40.0.111:6443
 	server := kc.Clusters[0].Cluster.Server
 	server = strings.TrimPrefix(server, "https://")
 	server = strings.TrimPrefix(server, "http://")
