@@ -442,10 +442,10 @@ var _ = Describe("TenantCluster Controller", func() {
 					Access: butlerv1alpha1.TeamAccess{
 						Users: []butlerv1alpha1.TeamUser{
 							{Name: "alice@example.com", Role: butlerv1alpha1.TeamRoleAdmin},
-							{Name: "bob@example.com", Role: butlerv1alpha1.TeamRoleMember},
+							{Name: "bob@example.com", Role: butlerv1alpha1.TeamRoleOperator},
 						},
 						Groups: []butlerv1alpha1.TeamGroup{
-							{Name: "developers", Role: butlerv1alpha1.TeamRoleMember},
+							{Name: "developers", Role: butlerv1alpha1.TeamRoleOperator},
 						},
 					},
 				},
