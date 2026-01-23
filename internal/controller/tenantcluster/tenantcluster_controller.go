@@ -240,7 +240,7 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 		logger.Error(err, "failed to handle Kamaji compatibility")
 	}
 	if patched {
-		logger.Info("patched KamajiControlPlane status for Harvester compatibility")
+		logger.Info("patched StewardControlPlane status for Harvester compatibility")
 		return ctrl.Result{Requeue: true}, nil
 	}
 
@@ -629,7 +629,7 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 	kcp.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   capi.ControlPlaneAPIGroup,
 		Version: capi.ControlPlaneAPIVersion,
-		Kind:    "KamajiControlPlane",
+		Kind:    "StewardControlPlane",
 	})
 	if err := r.Get(ctx, types.NamespacedName{
 		Name:      tc.Name,
@@ -648,7 +648,7 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 
 	tcp := &unstructured.Unstructured{}
 	tcp.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "kamaji.clastix.io",
+		Group:   "steward.butlerlabs.dev",
 		Version: "v1alpha1",
 		Kind:    "TenantControlPlane",
 	})
@@ -728,7 +728,7 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 		return false, nil
 	}
 
-	logger.Info("detected Kamaji unsupported infrastructure provider error, patching KamajiControlPlane status")
+	logger.Info("detected Kamaji unsupported infrastructure provider error, patching StewardControlPlane status")
 
 	deploymentStatus, deployFound, _ := unstructured.NestedMap(tcp.Object, "status", "kubernetesResources", "deployment")
 	if !deployFound {
@@ -742,7 +742,7 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 		return false, nil
 	}
 
-	logger.Info("TenantControlPlane is ready, patching KamajiControlPlane status", "readyReplicas", readyReplicas)
+	logger.Info("TenantControlPlane is ready, patching StewardControlPlane status", "readyReplicas", readyReplicas)
 
 	if err := unstructured.SetNestedField(kcp.Object, true, "status", "initialized"); err != nil {
 		return false, fmt.Errorf("failed to set initialized: %w", err)
@@ -764,7 +764,7 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 	}
 
 	if err := r.Status().Update(ctx, kcp); err != nil {
-		return false, fmt.Errorf("failed to update KamajiControlPlane status: %w", err)
+		return false, fmt.Errorf("failed to update StewardControlPlane status: %w", err)
 	}
 
 	return true, nil

@@ -39,8 +39,8 @@ import (
 )
 
 const (
-	// KamajiAdminKubeconfigLabel is the label that identifies Kamaji admin kubeconfig secrets.
-	KamajiAdminKubeconfigLabel = "kamaji.clastix.io/component"
+	// StewardAdminKubeconfigLabel is the label that identifies Kamaji admin kubeconfig secrets.
+	StewardAdminKubeconfigLabel = "steward.butlerlabs.dev/component"
 	KamajiAdminKubeconfigValue = "admin-kubeconfig"
 
 	// KamajiSourceKey is the key Kamaji uses for the kubeconfig.
@@ -79,7 +79,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	// Skip if not a Kamaji admin kubeconfig secret
-	if kamajiSecret.Labels[KamajiAdminKubeconfigLabel] != KamajiAdminKubeconfigValue {
+	if kamajiSecret.Labels[StewardAdminKubeconfigLabel] != KamajiAdminKubeconfigValue {
 		return ctrl.Result{}, nil
 	}
 
@@ -158,7 +158,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Only watch secrets with the Kamaji admin-kubeconfig label
 	labelPredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		labels := obj.GetLabels()
-		return labels[KamajiAdminKubeconfigLabel] == KamajiAdminKubeconfigValue
+		return labels[StewardAdminKubeconfigLabel] == KamajiAdminKubeconfigValue
 	})
 
 	return ctrl.NewControllerManagedBy(mgr).

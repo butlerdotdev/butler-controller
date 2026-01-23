@@ -116,8 +116,8 @@ func (b *Builder) buildHarvesterResources() (*ResourceSet, error) {
 	// Build infrastructure cluster (KubevirtCluster)
 	infraCluster := b.buildKubevirtCluster(clusterName)
 
-	// Build control plane (KamajiControlPlane - unchanged)
-	controlPlane := b.buildKamajiControlPlane(clusterName)
+	// Build control plane (StewardControlPlane - unchanged)
+	controlPlane := b.buildStewardControlPlane(clusterName)
 
 	// Build top-level Cluster
 	cluster := b.buildCluster(clusterName, infraCluster, controlPlane)
@@ -230,11 +230,11 @@ func (b *Builder) buildKubevirtCluster(name string) *unstructured.Unstructured {
 	return kvCluster
 }
 
-// buildKamajiControlPlane constructs the KamajiControlPlane resource.
-func (b *Builder) buildKamajiControlPlane(name string) *unstructured.Unstructured {
+// buildStewardControlPlane constructs the StewardControlPlane resource.
+func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructured {
 	kcp := &unstructured.Unstructured{}
 	kcp.SetAPIVersion(fmt.Sprintf("%s/%s", ControlPlaneAPIGroup, ControlPlaneAPIVersion))
-	kcp.SetKind("KamajiControlPlane")
+	kcp.SetKind("StewardControlPlane")
 	kcp.SetName(name)
 	kcp.SetNamespace(b.namespace)
 	kcp.SetLabels(b.commonLabels())
@@ -257,7 +257,7 @@ func (b *Builder) buildKamajiControlPlane(name string) *unstructured.Unstructure
 		serviceType = b.tc.Spec.ControlPlane.ServiceType
 	}
 
-	// See: https://kamaji.clastix.io/cluster-api/kamaji-control-plane-provider/
+	// See: https://steward.butlerlabs.dev/cluster-api/kamaji-control-plane-provider/
 	spec := map[string]interface{}{
 		"version":       b.tc.Spec.KubernetesVersion,
 		"replicas":      replicas,
@@ -507,8 +507,8 @@ func (b *Builder) buildNutanixResources() (*ResourceSet, error) {
 	// Build infrastructure cluster (NutanixCluster)
 	infraCluster := b.buildNutanixCluster(clusterName)
 
-	// Build control plane (KamajiControlPlane - shared across providers)
-	controlPlane := b.buildKamajiControlPlane(clusterName)
+	// Build control plane (StewardControlPlane - shared across providers)
+	controlPlane := b.buildStewardControlPlane(clusterName)
 
 	// Build top-level Cluster
 	cluster := b.buildCluster(clusterName, infraCluster, controlPlane)
