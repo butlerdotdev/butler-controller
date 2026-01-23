@@ -528,13 +528,13 @@ func (r *Reconciler) countTenantClusters(ctx context.Context, namespace string) 
 }
 
 // calculateResourceUsage calculates the total resource usage for all TenantClusters.
-func (r *Reconciler) calculateResourceUsage(ctx context.Context, namespace string) (*butlerv1alpha1.ResourceUsage, error) {
+func (r *Reconciler) calculateResourceUsage(ctx context.Context, namespace string) (*butlerv1alpha1.TeamResourceUsage, error) {
 	clusterList := &butlerv1alpha1.TenantClusterList{}
 	if err := r.List(ctx, clusterList, client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
 
-	usage := &butlerv1alpha1.ResourceUsage{
+	usage := &butlerv1alpha1.TeamResourceUsage{
 		Clusters: int32(len(clusterList.Items)),
 	}
 
@@ -543,7 +543,7 @@ func (r *Reconciler) calculateResourceUsage(ctx context.Context, namespace strin
 		totalWorkers += cluster.Spec.Workers.Replicas
 		// TODO: Calculate CPU and Memory from MachineTemplate when needed
 	}
-	usage.Workers = totalWorkers
+	usage.TotalNodes = totalWorkers
 
 	return usage, nil
 }

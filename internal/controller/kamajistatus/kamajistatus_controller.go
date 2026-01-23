@@ -15,14 +15,14 @@ limitations under the License.
 */
 
 // Package kamajistatus provides a controller that synchronizes Kamaji TenantControlPlane
-// status to KamajiControlPlane for CAPI compatibility.
+// status to StewardControlPlane for CAPI compatibility.
 //
 // Problem: The Kamaji CAPI provider sometimes fails to properly synchronize status
-// from the Kamaji TenantControlPlane to the KamajiControlPlane resource, causing
+// from the Kamaji TenantControlPlane to the StewardControlPlane resource, causing
 // CAPI to not recognize the control plane as ready.
 //
 // Solution: Watch TenantControlPlane resources and patch the corresponding
-// KamajiControlPlane status when the TCP is ready.
+// StewardControlPlane status when the TCP is ready.
 package kamajistatus
 
 import (
@@ -41,26 +41,26 @@ import (
 
 var (
 	TenantControlPlaneGVK = schema.GroupVersionKind{
-		Group:   "kamaji.clastix.io",
+		Group:   "steward.butlerlabs.dev",
 		Version: "v1alpha1",
 		Kind:    "TenantControlPlane",
 	}
 
-	KamajiControlPlaneGVK = schema.GroupVersionKind{
+	StewardControlPlaneGVK = schema.GroupVersionKind{
 		Group:   "controlplane.cluster.x-k8s.io",
 		Version: "v1alpha1",
-		Kind:    "KamajiControlPlane",
+		Kind:    "StewardControlPlane",
 	}
 )
 
-// Reconciler watches Kamaji TenantControlPlane resources and syncs status to KamajiControlPlane.
+// Reconciler watches Kamaji TenantControlPlane resources and syncs status to StewardControlPlane.
 type Reconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=kamaji.clastix.io,resources=tenantcontrolplanes,verbs=get;list;watch
-// +kubebuilder:rbac:groups=kamaji.clastix.io,resources=tenantcontrolplanes/status,verbs=get
+// +kubebuilder:rbac:groups=steward.butlerlabs.dev,resources=tenantcontrolplanes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=steward.butlerlabs.dev,resources=tenantcontrolplanes/status,verbs=get
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes/status,verbs=get;update;patch
 
@@ -91,34 +91,34 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	// Find the corresponding KamajiControlPlane
+	// Find the corresponding StewardControlPlane
 	// The KCP typically has the same name as the TCP
 	kcp := &unstructured.Unstructured{}
-	kcp.SetGroupVersionKind(KamajiControlPlaneGVK)
+	kcp.SetGroupVersionKind(StewardControlPlaneGVK)
 
 	if err := r.Get(ctx, req.NamespacedName, kcp); err != nil {
 		if apierrors.IsNotFound(err) {
 			// KCP doesn't exist yet, that's fine
-			logger.V(1).Info("KamajiControlPlane not found", "name", req.Name, "namespace", req.Namespace)
+			logger.V(1).Info("StewardControlPlane not found", "name", req.Name, "namespace", req.Namespace)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
 	}
 
 	// Check if KCP status already reflects ready state
-	kcpReady, err := r.isKCPReady(kcp)
+	kcpReady, err := r.isSCPReady(kcp)
 	if err != nil {
 		logger.Error(err, "failed to check KCP status")
 		return ctrl.Result{}, err
 	}
 
 	if kcpReady {
-		logger.V(1).Info("KamajiControlPlane already shows ready", "name", req.Name)
+		logger.V(1).Info("StewardControlPlane already shows ready", "name", req.Name)
 		return ctrl.Result{}, nil
 	}
 
 	// Patch KCP status to reflect TCP ready state
-	logger.Info("patching KamajiControlPlane status to ready",
+	logger.Info("patching StewardControlPlane status to ready",
 		"name", req.Name,
 		"namespace", req.Namespace,
 		"version", version)
@@ -135,11 +135,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}`, version)))
 
 	if err := r.Status().Patch(ctx, kcp, patch); err != nil {
-		logger.Error(err, "failed to patch KamajiControlPlane status")
+		logger.Error(err, "failed to patch StewardControlPlane status")
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("KamajiControlPlane status patched successfully",
+	logger.Info("StewardControlPlane status patched successfully",
 		"name", req.Name,
 		"namespace", req.Namespace)
 
@@ -186,8 +186,8 @@ func (r *Reconciler) isTCPReady(tcp *unstructured.Unstructured) (bool, string, e
 	return found && kubeStatus == "Ready", version, nil
 }
 
-// isKCPReady checks if a KamajiControlPlane is already showing ready status.
-func (r *Reconciler) isKCPReady(kcp *unstructured.Unstructured) (bool, error) {
+// isSCPReady checks if a StewardControlPlane is already showing ready status.
+func (r *Reconciler) isSCPReady(kcp *unstructured.Unstructured) (bool, error) {
 	readyReplicas, found, err := unstructured.NestedInt64(kcp.Object, "status", "readyReplicas")
 	if err != nil {
 		return false, err

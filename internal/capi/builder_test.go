@@ -115,8 +115,8 @@ func TestBuildCluster(t *testing.T) {
 	spec := cluster.Object["spec"].(map[string]interface{})
 
 	cpRef := spec["controlPlaneRef"].(map[string]interface{})
-	if cpRef["kind"] != "KamajiControlPlane" {
-		t.Errorf("expected controlPlaneRef.kind 'KamajiControlPlane', got '%s'", cpRef["kind"])
+	if cpRef["kind"] != "StewardControlPlane" {
+		t.Errorf("expected controlPlaneRef.kind 'StewardControlPlane', got '%s'", cpRef["kind"])
 	}
 
 	infraRef := spec["infrastructureRef"].(map[string]interface{})
@@ -171,7 +171,7 @@ func TestBuildHarvesterCluster(t *testing.T) {
 	}
 }
 
-func TestBuildKamajiControlPlane(t *testing.T) {
+func TestBuildStewardControlPlane(t *testing.T) {
 	tc := newTestTenantCluster("test-cluster", "default")
 	tc.Spec.KubernetesVersion = "v1.30.2"
 	pc := newTestProviderConfig("harvester")
@@ -188,8 +188,8 @@ func TestBuildKamajiControlPlane(t *testing.T) {
 	if kcp.GetAPIVersion() != "controlplane.cluster.x-k8s.io/v1alpha1" {
 		t.Errorf("expected apiVersion 'controlplane.cluster.x-k8s.io/v1alpha1', got '%s'", kcp.GetAPIVersion())
 	}
-	if kcp.GetKind() != "KamajiControlPlane" {
-		t.Errorf("expected kind 'KamajiControlPlane', got '%s'", kcp.GetKind())
+	if kcp.GetKind() != "StewardControlPlane" {
+		t.Errorf("expected kind 'StewardControlPlane', got '%s'", kcp.GetKind())
 	}
 
 	// Check spec
@@ -477,7 +477,7 @@ func TestAllResources(t *testing.T) {
 		"HarvesterCluster",
 		"KubeadmConfigTemplate",
 		"HarvesterMachineTemplate",
-		"KamajiControlPlane",
+		"StewardControlPlane",
 		"MachineDeployment",
 		"Cluster",
 	}
