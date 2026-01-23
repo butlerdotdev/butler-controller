@@ -109,7 +109,7 @@ var _ = Describe("Team Controller", func() {
 							},
 							{
 								Name: "member@example.com",
-								Role: butlerv1alpha1.TeamRoleMember,
+								Role: butlerv1alpha1.TeamRoleOperator,
 							},
 						},
 					},
@@ -176,7 +176,7 @@ var _ = Describe("Team Controller", func() {
 							},
 							{
 								Name: "CN=APP-K8S-Users,OU=Groups,DC=corp",
-								Role: butlerv1alpha1.TeamRoleMember,
+								Role: butlerv1alpha1.TeamRoleOperator,
 							},
 						},
 					},
@@ -454,7 +454,7 @@ var _ = Describe("Team Controller", func() {
 						Users: []butlerv1alpha1.TeamUser{
 							{
 								Name: "original@example.com",
-								Role: butlerv1alpha1.TeamRoleMember,
+								Role: butlerv1alpha1.TeamRoleOperator,
 							},
 						},
 					},
