@@ -66,6 +66,7 @@ type ResourceSet struct {
 type Builder struct {
 	tc             *butlerv1alpha1.TenantCluster
 	providerConfig *butlerv1alpha1.ProviderConfig
+	butlerConfig   *butlerv1alpha1.ButlerConfig
 	namespace      string
 	nutanixCreds   *NutanixCredentials
 }
@@ -92,6 +93,13 @@ func (b *Builder) WithNutanixCredentials(username, password string) *Builder {
 		Username: username,
 		Password: password,
 	}
+	return b
+}
+
+// WithButlerConfig sets the ButlerConfig for platform-level settings.
+// This enables reading ControlPlaneExposure for tcp-proxy auto-enablement.
+func (b *Builder) WithButlerConfig(bc *butlerv1alpha1.ButlerConfig) *Builder {
+	b.butlerConfig = bc
 	return b
 }
 
@@ -251,10 +259,74 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 		dataStoreName = b.tc.Spec.ControlPlane.DataStoreRef.Name
 	}
 
-	// Get service type
+	// Determine exposure mode and service type from ButlerConfig (platform-level)
+	// Default to LoadBalancer if ButlerConfig not provided
+	exposureMode := butlerv1alpha1.ControlPlaneExposureModeLoadBalancer
+	var exposureHostname string
+	var gatewayRef string
+	var ingressClassName string
+
+	if b.butlerConfig != nil {
+		exposureMode = b.butlerConfig.GetControlPlaneExposureMode()
+		exposureHostname = b.butlerConfig.GetControlPlaneExposureHostname()
+		gatewayRef = b.butlerConfig.GetControlPlaneExposureGatewayRef()
+		ingressClassName = b.butlerConfig.GetControlPlaneExposureIngressClassName()
+	}
+
+	// Map exposure mode to service type
 	serviceType := "LoadBalancer"
+	if exposureMode == butlerv1alpha1.ControlPlaneExposureModeIngress ||
+		exposureMode == butlerv1alpha1.ControlPlaneExposureModeGateway {
+		serviceType = "ClusterIP"
+	}
+
+	// TenantCluster serviceType override (should be rare, but allowed)
 	if b.tc.Spec.ControlPlane.ServiceType != "" {
 		serviceType = b.tc.Spec.ControlPlane.ServiceType
+	}
+
+	// Build addons map - always include core addons
+	addons := map[string]interface{}{
+		"coreDNS":      map[string]interface{}{},
+		"kubeProxy":    map[string]interface{}{},
+		"konnectivity": map[string]interface{}{},
+	}
+
+	// AUTO-ENABLE tcp-proxy for non-LoadBalancer modes
+	// tcp-proxy rewrites kubernetes.default.svc EndpointSlice for in-cluster API access
+	if exposureMode == butlerv1alpha1.ControlPlaneExposureModeIngress ||
+		exposureMode == butlerv1alpha1.ControlPlaneExposureModeGateway {
+		addons["tcpProxy"] = map[string]interface{}{}
+	}
+
+	// Build network configuration
+	network := map[string]interface{}{
+		"serviceType": serviceType,
+	}
+
+	// Configure Ingress mode
+	if exposureMode == butlerv1alpha1.ControlPlaneExposureModeIngress && exposureHostname != "" {
+		tenantHostname := b.generateTenantHostname(exposureHostname)
+		ingressConfig := map[string]interface{}{
+			"hostname": tenantHostname,
+		}
+		if ingressClassName != "" {
+			ingressConfig["className"] = ingressClassName
+		}
+		network["ingress"] = ingressConfig
+	}
+
+	// Configure Gateway mode
+	if exposureMode == butlerv1alpha1.ControlPlaneExposureModeGateway && exposureHostname != "" {
+		tenantHostname := b.generateTenantHostname(exposureHostname)
+		gatewayConfig := map[string]interface{}{
+			"hostname": tenantHostname,
+		}
+		if gatewayRef != "" {
+			// Parse gatewayRef "namespace/name" format
+			gatewayConfig["parentRefs"] = b.buildGatewayParentRefs(gatewayRef)
+		}
+		network["gateway"] = gatewayConfig
 	}
 
 	// See: https://steward.butlerlabs.dev/cluster-api/kamaji-control-plane-provider/
@@ -262,14 +334,7 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 		"version":       b.tc.Spec.KubernetesVersion,
 		"replicas":      replicas,
 		"dataStoreName": dataStoreName,
-
-		// Addons - Kamaji manages these automatically
-		// konnectivity is enabled by default, version matched automatically
-		"addons": map[string]interface{}{
-			"coreDNS":      map[string]interface{}{},
-			"kubeProxy":    map[string]interface{}{},
-			"konnectivity": map[string]interface{}{},
-		},
+		"addons":        addons,
 
 		// Kubelet configuration for Rocky Linux / systemd
 		"kubelet": map[string]interface{}{
@@ -282,9 +347,7 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 		},
 
 		// Network configuration
-		"network": map[string]interface{}{
-			"serviceType": serviceType,
-		},
+		"network": network,
 	}
 
 	// Add certSANs if specified
@@ -298,6 +361,29 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 
 	kcp.Object["spec"] = spec
 	return kcp
+}
+
+// generateTenantHostname creates a tenant-specific hostname from a wildcard pattern.
+// Pattern "*.k8s.example.com" becomes "clustername.namespace.k8s.example.com"
+func (b *Builder) generateTenantHostname(pattern string) string {
+	base := strings.TrimPrefix(pattern, "*.")
+	return fmt.Sprintf("%s.%s.%s", b.tc.Name, b.namespace, base)
+}
+
+// buildGatewayParentRefs constructs Gateway API parentRefs from a "namespace/name" reference.
+func (b *Builder) buildGatewayParentRefs(gatewayRef string) []interface{} {
+	parts := strings.Split(gatewayRef, "/")
+	if len(parts) != 2 {
+		return nil
+	}
+	return []interface{}{
+		map[string]interface{}{
+			"group":     "gateway.networking.k8s.io",
+			"kind":      "Gateway",
+			"namespace": parts[0],
+			"name":      parts[1],
+		},
+	}
 }
 
 // buildKubevirtMachineTemplate constructs the KubevirtMachineTemplate resource.

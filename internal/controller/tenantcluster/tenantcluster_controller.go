@@ -145,7 +145,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 	}
 
-	result, err := r.reconcileInfrastructure(ctx, tc)
+	result, err := r.reconcileInfrastructure(ctx, tc, butlerConfig)
 	if err != nil {
 		logger.Error(err, "failed to reconcile infrastructure")
 		return r.setFailedStatus(ctx, tc, ReasonCAPIResourceError, err.Error())
@@ -172,7 +172,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	return ctrl.Result{RequeueAfter: r.calculateRequeueInterval(tc)}, nil
 }
 
-func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (ctrl.Result, error) {
+func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	// Already ready, nothing to do
@@ -189,7 +189,11 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 		return ctrl.Result{}, err
 	}
 
-	builder := capi.NewBuilder(tc, providerConfig, tc.Status.TenantNamespace)
+	// Build CAPI resources with ButlerConfig for platform-level settings
+	// ButlerConfig provides ControlPlaneExposure settings (LoadBalancer/Ingress/Gateway mode)
+	// which enables auto-enabling tcp-proxy for non-LoadBalancer modes
+	builder := capi.NewBuilder(tc, providerConfig, tc.Status.TenantNamespace).
+		WithButlerConfig(butlerConfig)
 	resourceSet, err := builder.Build()
 	if err != nil {
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionInfrastructureReady,
