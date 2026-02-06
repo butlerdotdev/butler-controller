@@ -265,12 +265,14 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 	var exposureHostname string
 	var gatewayRef string
 	var ingressClassName string
+	var controllerType string
 
 	if b.butlerConfig != nil {
 		exposureMode = b.butlerConfig.GetControlPlaneExposureMode()
 		exposureHostname = b.butlerConfig.GetControlPlaneExposureHostname()
 		gatewayRef = b.butlerConfig.GetControlPlaneExposureGatewayRef()
 		ingressClassName = b.butlerConfig.GetControlPlaneExposureIngressClassName()
+		controllerType = b.butlerConfig.GetControlPlaneExposureControllerType()
 	}
 
 	// Map exposure mode to service type
@@ -312,6 +314,9 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 		}
 		if ingressClassName != "" {
 			ingressConfig["className"] = ingressClassName
+		}
+		if controllerType != "" {
+			ingressConfig["controllerType"] = controllerType
 		}
 		network["ingress"] = ingressConfig
 	}
