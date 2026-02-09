@@ -306,7 +306,24 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 	// tcp-proxy rewrites kubernetes.default.svc EndpointSlice for in-cluster API access
 	if exposureMode == butlerv1alpha1.ControlPlaneExposureModeIngress ||
 		exposureMode == butlerv1alpha1.ControlPlaneExposureModeGateway {
-		addons["tcpProxy"] = map[string]interface{}{}
+		tcpProxyConfig := map[string]interface{}{}
+
+		// Add hostAliases for DNS resolution before CoreDNS is ready
+		// tcp-proxy uses hostNetwork and needs to resolve the API server hostname
+		if b.ingressIP != "" && exposureHostname != "" {
+			tenantHostname := b.generateTenantHostname(exposureHostname)
+			// Konnectivity uses a parallel hostname by replacing ".k8s." with ".konnectivity."
+			konnectivityHostname := strings.Replace(tenantHostname, ".k8s.", ".konnectivity.", 1)
+
+			tcpProxyConfig["hostAliases"] = []interface{}{
+				map[string]interface{}{
+					"ip":        b.ingressIP,
+					"hostnames": []interface{}{tenantHostname, konnectivityHostname},
+				},
+			}
+		}
+
+		addons["tcpProxy"] = tcpProxyConfig
 	}
 
 	// Build network configuration
@@ -865,8 +882,9 @@ func (b *Builder) buildRockyLinuxBootstrapCommands(k8sMinorVersion string) []int
 
 	// For Ingress/Gateway modes, add /etc/hosts entry first (before any k8s commands)
 	// This allows the worker to resolve the control plane hostname via the Ingress IP
+	// Note: We use /tmp/ because it always exists, unlike /etc/hosts.d/ which cloud-init may not create
 	if b.needsIngressHostsEntry() {
-		commands = append(commands, "cat /etc/hosts.d/ingress >> /etc/hosts")
+		commands = append(commands, "cat /tmp/ingress-hosts >> /etc/hosts")
 	}
 
 	// Kernel modules for container networking
@@ -937,13 +955,17 @@ net.ipv4.ip_forward                 = 1
 		},
 	}
 
-	// For Ingress/Gateway modes, add /etc/hosts entry to resolve control plane hostname
+	// For Ingress/Gateway modes, add /etc/hosts entries to resolve control plane hostnames
+	// Both the API server hostname and konnectivity hostname need to resolve to the Ingress IP
+	// Note: We use /tmp/ because it always exists - cloud-init may not create /etc/hosts.d/
 	if b.needsIngressHostsEntry() {
 		hostname := b.generateTenantHostname(b.butlerConfig.GetControlPlaneExposureHostname())
+		// Konnectivity uses a parallel hostname by replacing ".k8s." with ".konnectivity."
+		konnectivityHostname := strings.Replace(hostname, ".k8s.", ".konnectivity.", 1)
 		files = append(files, map[string]interface{}{
-			"path":        "/etc/hosts.d/ingress",
+			"path":        "/tmp/ingress-hosts",
 			"permissions": "0644",
-			"content":     fmt.Sprintf("%s %s\n", b.ingressIP, hostname),
+			"content":     fmt.Sprintf("%s %s\n%s %s\n", b.ingressIP, hostname, b.ingressIP, konnectivityHostname),
 		})
 	}
 

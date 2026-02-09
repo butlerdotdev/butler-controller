@@ -19,8 +19,10 @@ package addons
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
+	"strings"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -124,8 +126,36 @@ func (i *Installer) ensurePrivilegedNamespace(ctx context.Context, kubeconfigPat
 	return nil
 }
 
+// CiliumConfig contains the configuration for installing Cilium.
+type CiliumConfig struct {
+	// Version is the Cilium version to install.
+	Version string
+	// APIServerHost is the hostname or IP of the API server.
+	APIServerHost string
+	// APIServerPort is the port of the API server.
+	APIServerPort string
+	// IngressIP is the IP address of the Ingress controller (for hostAlias).
+	// Only used when using Ingress mode with a hostname.
+	IngressIP string
+}
+
 // InstallCilium installs Cilium CNI configured for hosted control planes.
-func (i *Installer) InstallCilium(ctx context.Context, kubeconfig []byte, version string, apiServerHost string, apiServerPort string) error {
+//
+// For Ingress/Gateway mode (hostname-based API access):
+// Uses "Template-Patch-Apply" pattern to solve the DNS bootstrap problem.
+// CoreDNS needs CNI (Cilium) to run, but Cilium pods need DNS to resolve
+// the API server hostname. We solve this by:
+// 1. Using `helm template` to render manifests (no cluster contact)
+// 2. Patching hostAliases directly into the rendered manifests
+// 3. Applying with `kubectl apply` - pods start with hostAliases from the beginning
+// 4. Waiting for rollout completion
+//
+// This ensures pods NEVER attempt to resolve the hostname without hostAliases,
+// avoiding progressDeadlineSeconds failures.
+//
+// For LoadBalancer mode: Cilium connects directly to the LoadBalancer IP,
+// no hostname resolution needed, so we use standard `helm upgrade --install --wait`.
+func (i *Installer) InstallCilium(ctx context.Context, kubeconfig []byte, cfg CiliumConfig) error {
 	logger := log.FromContext(ctx)
 
 	kubeconfigPath, cleanup, err := i.writeKubeconfig(kubeconfig)
@@ -134,13 +164,24 @@ func (i *Installer) InstallCilium(ctx context.Context, kubeconfig []byte, versio
 	}
 	defer cleanup()
 
+	version := cfg.Version
 	if version == "" {
 		version = DefaultCiliumVersion
 	}
 
-	logger.Info("installing Cilium for tenant cluster", "version", version)
+	// Determine if we need hostAlias (Ingress/Gateway mode with hostname)
+	needsHostAlias := cfg.IngressIP != "" && !isIPAddress(cfg.APIServerHost)
 
-	i.ensurePrivilegedNamespace(ctx, kubeconfigPath, "kube-system")
+	logger.Info("installing Cilium for tenant cluster",
+		"version", version,
+		"apiServerHost", cfg.APIServerHost,
+		"apiServerPort", cfg.APIServerPort,
+		"ingressIP", cfg.IngressIP,
+		"needsHostAlias", needsHostAlias)
+
+	if err := i.ensurePrivilegedNamespace(ctx, kubeconfigPath, "kube-system"); err != nil {
+		return fmt.Errorf("failed to ensure kube-system namespace: %w", err)
+	}
 
 	if err := i.runHelm(ctx, kubeconfigPath, "repo", "add", "cilium", "https://helm.cilium.io/"); err != nil {
 		logger.V(1).Info("helm repo add failed (may already exist)", "error", err)
@@ -149,8 +190,7 @@ func (i *Installer) InstallCilium(ctx context.Context, kubeconfig []byte, versio
 		logger.V(1).Info("helm repo update failed", "error", err)
 	}
 
-	args := []string{
-		"upgrade", "--install", "cilium", "cilium/cilium",
+	baseArgs := []string{
 		"--version", version,
 		"--namespace", "kube-system",
 		"--set", "ipam.mode=kubernetes",
@@ -159,21 +199,161 @@ func (i *Installer) InstallCilium(ctx context.Context, kubeconfig []byte, versio
 		"--set", "securityContext.capabilities.cleanCiliumState={NET_ADMIN,SYS_ADMIN,SYS_RESOURCE}",
 		"--set", "cgroup.autoMount.enabled=false",
 		"--set", "cgroup.hostRoot=/sys/fs/cgroup",
-		"--set", "k8sServiceHost=kubernetes.default.svc.cluster.local",
-		"--set", "k8sServicePort=443",
 		"--set", "hubble.relay.enabled=true",
 		"--set", "hubble.ui.enabled=true",
-		"--set", fmt.Sprintf("k8sServiceHost=%s", apiServerHost),
-		"--set", fmt.Sprintf("k8sServicePort=%s", apiServerPort),
-		"--wait",
-		"--timeout", "10m",
+		"--set", fmt.Sprintf("k8sServiceHost=%s", cfg.APIServerHost),
+		"--set", fmt.Sprintf("k8sServicePort=%s", cfg.APIServerPort),
 	}
 
-	if err := i.runHelm(ctx, kubeconfigPath, args...); err != nil {
-		return fmt.Errorf("failed to install Cilium: %w", err)
+	if needsHostAlias {
+		// Ingress/Gateway mode: Template-Patch-Apply pattern
+		logger.Info("using Template-Patch-Apply pattern for Ingress/Gateway mode")
+
+		if err := i.installCiliumWithHostAlias(ctx, kubeconfigPath, baseArgs, cfg.APIServerHost, cfg.IngressIP); err != nil {
+			return fmt.Errorf("failed to install Cilium with hostAlias: %w", err)
+		}
+	} else {
+		// LoadBalancer mode: Standard helm install with --wait
+		args := append([]string{"upgrade", "--install", "cilium", "cilium/cilium"}, baseArgs...)
+		args = append(args, "--wait", "--timeout", "10m")
+
+		if err := i.runHelm(ctx, kubeconfigPath, args...); err != nil {
+			return fmt.Errorf("failed to install Cilium: %w", err)
+		}
 	}
 
 	logger.Info("Cilium installed successfully")
+	return nil
+}
+
+// installCiliumWithHostAlias uses helm template + kubectl apply to install Cilium
+// with hostAliases pre-configured. This ensures pods start with hostAliases from
+// the very first attempt, avoiding DNS resolution failures.
+func (i *Installer) installCiliumWithHostAlias(ctx context.Context, kubeconfigPath string, helmArgs []string, hostname, ip string) error {
+	logger := log.FromContext(ctx)
+
+	// Step 1: Render manifests with helm template
+	logger.Info("rendering Cilium manifests with helm template")
+	templateArgs := append([]string{"template", "cilium", "cilium/cilium"}, helmArgs...)
+
+	cmd := exec.CommandContext(ctx, i.helmPath, templateArgs...)
+	manifestBytes, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return fmt.Errorf("helm template failed: %w, stderr: %s", err, string(exitErr.Stderr))
+		}
+		return fmt.Errorf("helm template failed: %w", err)
+	}
+
+	// Step 2: Patch manifests to add hostAliases
+	logger.Info("patching manifests with hostAliases", "hostname", hostname, "ip", ip)
+	patchedManifests := i.patchManifestsWithHostAlias(string(manifestBytes), hostname, ip)
+
+	// Step 3: Write patched manifests to temp file
+	manifestFile, err := os.CreateTemp("", "cilium-manifests-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp manifest file: %w", err)
+	}
+	defer os.Remove(manifestFile.Name())
+
+	if _, err := manifestFile.WriteString(patchedManifests); err != nil {
+		manifestFile.Close()
+		return fmt.Errorf("failed to write manifests: %w", err)
+	}
+	manifestFile.Close()
+
+	// Step 4: Apply manifests with kubectl apply
+	logger.Info("applying Cilium manifests with kubectl apply")
+	if err := i.runKubectl(ctx, kubeconfigPath,
+		"apply", "-f", manifestFile.Name(), "--server-side", "--force-conflicts",
+	); err != nil {
+		return fmt.Errorf("failed to apply Cilium manifests: %w", err)
+	}
+
+	// Step 5: Wait for rollout
+	logger.Info("waiting for Cilium rollout")
+	if err := i.waitForCiliumReady(ctx, kubeconfigPath); err != nil {
+		return fmt.Errorf("Cilium rollout failed: %w", err)
+	}
+
+	return nil
+}
+
+// patchManifestsWithHostAlias injects hostAliases into DaemonSet and Deployment specs.
+// This is a simple string-based patch that adds hostAliases to pod specs.
+func (i *Installer) patchManifestsWithHostAlias(manifests, hostname, ip string) string {
+	// The hostAliases block to inject (indented for pod spec)
+	hostAliasesBlock := fmt.Sprintf(`      hostAliases:
+      - hostnames:
+        - %s
+        ip: %s
+`, hostname, ip)
+
+	// Pattern to find the serviceAccountName line in pod specs and inject hostAliases before it
+	// This works because serviceAccountName is typically in the pod spec alongside hostAliases
+	result := manifests
+
+	// Patch all Cilium-related service accounts that might need API server access
+	// Note: helm template outputs quoted service account names like "cilium"
+	serviceAccounts := []string{
+		"cilium",          // Main Cilium agent DaemonSet
+		"cilium-envoy",    // Cilium Envoy DaemonSet
+		"cilium-operator", // Cilium Operator Deployment
+		"hubble-relay",    // Hubble Relay Deployment
+		"hubble-ui",       // Hubble UI Deployment
+	}
+
+	for _, sa := range serviceAccounts {
+		// Try quoted format first (helm template output)
+		result = strings.Replace(result,
+			fmt.Sprintf("      serviceAccountName: \"%s\"\n", sa),
+			hostAliasesBlock+fmt.Sprintf("      serviceAccountName: \"%s\"\n", sa),
+			-1)
+		// Also try unquoted format (for compatibility)
+		result = strings.Replace(result,
+			fmt.Sprintf("      serviceAccountName: %s\n", sa),
+			hostAliasesBlock+fmt.Sprintf("      serviceAccountName: %s\n", sa),
+			-1)
+	}
+
+	return result
+}
+
+// isIPAddress returns true if the given string is an IP address.
+func isIPAddress(s string) bool {
+	return net.ParseIP(s) != nil
+}
+
+// waitForCiliumReady waits for Cilium DaemonSet and Operator Deployment to be ready.
+// For operator: waits until at least 1 pod is Ready (handles single-node clusters where
+// only 1 of 2 replicas can be scheduled due to pod anti-affinity).
+// For agent: uses DaemonSet rollout status which works correctly for node-scoped resources.
+func (i *Installer) waitForCiliumReady(ctx context.Context, kubeconfigPath string) error {
+	logger := log.FromContext(ctx)
+
+	// Wait for DaemonSet rollout (this works correctly for DaemonSets)
+	logger.Info("waiting for Cilium agent DaemonSet")
+	if err := i.runKubectl(ctx, kubeconfigPath,
+		"rollout", "status", "daemonset/cilium",
+		"-n", "kube-system",
+		"--timeout=10m",
+	); err != nil {
+		return fmt.Errorf("Cilium DaemonSet rollout failed: %w", err)
+	}
+
+	// For the operator, wait until deployment has Available=True condition
+	// This checks MinimumReplicasAvailable which is what we care about
+	// (not Progressing which may have stale ProgressDeadlineExceeded)
+	logger.Info("waiting for Cilium Operator to be Available")
+	if err := i.runKubectl(ctx, kubeconfigPath,
+		"wait", "--for=condition=Available", "deployment/cilium-operator",
+		"-n", "kube-system",
+		"--timeout=5m",
+	); err != nil {
+		return fmt.Errorf("Cilium Operator not available: %w", err)
+	}
+
+	logger.Info("Cilium is Ready")
 	return nil
 }
 
