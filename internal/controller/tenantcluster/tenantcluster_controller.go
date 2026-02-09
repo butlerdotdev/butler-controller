@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -194,6 +195,43 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 	// which enables auto-enabling tcp-proxy for non-LoadBalancer modes
 	builder := capi.NewBuilder(tc, providerConfig, tc.Status.TenantNamespace).
 		WithButlerConfig(butlerConfig)
+
+	// For Ingress/Gateway modes, get the Ingress controller IP for worker /etc/hosts
+	// CRITICAL: If Ingress/Gateway mode is enabled but the Ingress controller doesn't have
+	// an external IP yet, we MUST wait. Otherwise, KubeadmConfigTemplate will be created
+	// without the /etc/hosts entry, and workers won't be able to resolve the API server hostname.
+	if butlerConfig != nil {
+		mode := butlerConfig.GetControlPlaneExposureMode()
+		hostname := butlerConfig.GetControlPlaneExposureHostname()
+		logger.V(1).Info("ButlerConfig exposure settings",
+			"mode", mode,
+			"hostname", hostname)
+		if mode == butlerv1alpha1.ControlPlaneExposureModeIngress ||
+			mode == butlerv1alpha1.ControlPlaneExposureModeGateway {
+			ingressIP, err := r.getIngressControllerIP(ctx, butlerConfig)
+			if err != nil {
+				logger.Error(err, "failed to get Ingress controller IP")
+				r.setCondition(tc, butlerv1alpha1.TenantClusterConditionInfrastructureReady,
+					metav1.ConditionFalse, ReasonInfraProvisioning, "Waiting for Ingress controller")
+				if err := r.Status().Update(ctx, tc); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			}
+			if ingressIP == "" {
+				logger.Info("Ingress/Gateway mode requires Ingress controller external IP, waiting")
+				r.setCondition(tc, butlerv1alpha1.TenantClusterConditionInfrastructureReady,
+					metav1.ConditionFalse, ReasonInfraProvisioning, "Waiting for Ingress controller external IP")
+				if err := r.Status().Update(ctx, tc); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			}
+			logger.Info("Ingress mode detected, setting ingressIP on builder", "ingressIP", ingressIP)
+			builder.WithIngressIP(ingressIP)
+		}
+	}
+
 	resourceSet, err := builder.Build()
 	if err != nil {
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionInfrastructureReady,
@@ -239,7 +277,7 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 		logger.Error(err, "failed to check infrastructure status")
 	}
 
-	patched, err := r.handleKamajiHarvesterCompatibility(ctx, tc)
+	patched, err := r.handleKamajiHarvesterCompatibility(ctx, tc, butlerConfig)
 	if err != nil {
 		logger.Error(err, "failed to handle Kamaji compatibility")
 	}
@@ -259,29 +297,33 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 	if controlPlaneReady {
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionControlPlaneReady,
 			metav1.ConditionTrue, ReasonControlPlaneReady, "Control plane is ready")
-	} else {
-		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionControlPlaneReady,
-			metav1.ConditionFalse, ReasonInfraProvisioning, "Control plane is provisioning")
-	}
 
-	if workersReady {
-
+		// Install addons as soon as control plane is accessible
+		// Don't wait for workers - Cilium has tolerations for not-ready nodes
 		// Skip installation if already ready
 		if tc.Status.Phase == butlerv1alpha1.TenantClusterPhaseReady {
 			return ctrl.Result{}, nil
 		}
 
 		// Check if control plane is accessible by trying to get kubeconfig
-		_, err := r.getTenantKubeconfig(ctx, tc)
+		_, err := r.getTenantKubeconfig(ctx, tc, butlerConfig)
 		if err == nil {
-			logger.Info("control plane accessible and workers provisioned, proceeding to addon installation")
-			return r.reconcileAddons(ctx, tc)
+			logger.Info("control plane accessible, proceeding to addon installation")
+			return r.reconcileAddons(ctx, tc, butlerConfig)
 		}
 		logger.V(1).Info("waiting for control plane kubeconfig", "error", err)
+	} else {
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionControlPlaneReady,
+			metav1.ConditionFalse, ReasonInfraProvisioning, "Control plane is provisioning")
 	}
 
-	r.setCondition(tc, butlerv1alpha1.TenantClusterConditionWorkersReady,
-		metav1.ConditionFalse, ReasonWorkersProvisioning, "Workers are provisioning")
+	if workersReady {
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionWorkersReady,
+			metav1.ConditionTrue, ReasonWorkersReady, "Workers are ready")
+	} else {
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionWorkersReady,
+			metav1.ConditionFalse, ReasonWorkersProvisioning, "Workers are provisioning")
+	}
 
 	if !infraReady || !controlPlaneReady || !workersReady {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -293,7 +335,7 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 // reconcileAddons installs required addons for a functional tenant cluster.
 // These are infrastructure requirements, not optional features.
 // Addons are installed monotonically - they are added but never removed via spec changes.
-func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (ctrl.Result, error) {
+func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	if tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseInstalling {
@@ -303,7 +345,7 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 		}
 	}
 
-	kubeconfigData, err := r.getTenantKubeconfig(ctx, tc)
+	kubeconfigData, err := r.getTenantKubeconfig(ctx, tc, butlerConfig)
 	if err != nil {
 		logger.Error(err, "failed to get tenant kubeconfig")
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -316,10 +358,48 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 	if tc.Spec.Addons.CNI != nil && tc.Spec.Addons.CNI.Version != "" {
 		ciliumVersion = tc.Spec.Addons.CNI.Version
 	}
-	logger.Info("installing Cilium CNI", "version", ciliumVersion)
-	// Extract API server endpoint from kubeconfig
+
+	// Extract API server endpoint from kubeconfig (used for default/LoadBalancer mode)
 	apiServerHost, apiServerPort := extractAPIServerEndpoint(kubeconfigData)
-	if err := r.Installer.InstallCilium(ctx, kubeconfigData, ciliumVersion, apiServerHost, apiServerPort); err != nil {
+
+	// Determine if we need hostAlias for Ingress/Gateway mode
+	// When using Ingress mode with TLS passthrough, Cilium must connect to the
+	// hostname (not IP) so SNI is sent for routing. But CoreDNS needs CNI to start,
+	// creating a chicken-and-egg problem. We solve this with hostAlias.
+	var ingressIP string
+	if butlerConfig != nil {
+		mode := butlerConfig.GetControlPlaneExposureMode()
+		if mode == butlerv1alpha1.ControlPlaneExposureModeIngress ||
+			mode == butlerv1alpha1.ControlPlaneExposureModeGateway {
+			// Get the Ingress controller IP to add as hostAlias
+			ip, err := r.getIngressControllerIP(ctx, butlerConfig)
+			if err != nil {
+				logger.Error(err, "failed to get ingress controller IP")
+			}
+			ingressIP = ip
+
+			// For Ingress/Gateway mode, we need the EXTERNAL hostname (from admin.conf)
+			// not the internal .svc endpoint (from admin.svc). The external hostname
+			// is needed for proper SNI routing in TLS passthrough.
+			externalKubeconfig, err := r.getExternalKubeconfig(ctx, tc)
+			if err == nil && externalKubeconfig != nil {
+				apiServerHost, apiServerPort = extractAPIServerEndpoint(externalKubeconfig)
+			}
+			logger.Info("Ingress mode detected", "ingressIP", ingressIP, "externalHost", apiServerHost)
+		}
+	}
+
+	ciliumCfg := addons.CiliumConfig{
+		Version:       ciliumVersion,
+		APIServerHost: apiServerHost,
+		APIServerPort: apiServerPort,
+		IngressIP:     ingressIP,
+	}
+
+	logger.Info("installing Cilium CNI", "version", ciliumVersion,
+		"apiServerHost", apiServerHost, "ingressIP", ingressIP)
+
+	if err := r.Installer.InstallCilium(ctx, kubeconfigData, ciliumCfg); err != nil {
 		logger.Error(err, "failed to install Cilium")
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionAddonsReady,
 			metav1.ConditionFalse, "CNIInstallFailed", err.Error())
@@ -416,7 +496,7 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 	return ctrl.Result{}, nil
 }
 
-func (r *Reconciler) getTenantKubeconfig(ctx context.Context, tc *butlerv1alpha1.TenantCluster) ([]byte, error) {
+func (r *Reconciler) getTenantKubeconfig(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) ([]byte, error) {
 	secretName := fmt.Sprintf("%s-admin-kubeconfig", tc.Name)
 
 	secret := &corev1.Secret{}
@@ -427,6 +507,44 @@ func (r *Reconciler) getTenantKubeconfig(ctx context.Context, tc *butlerv1alpha1
 		return nil, fmt.Errorf("failed to get kubeconfig secret: %w", err)
 	}
 
+	// Determine which kubeconfig key to use based on control plane exposure mode
+	// For Ingress/Gateway modes, use admin.svc (internal service endpoint) since the external
+	// hostname isn't resolvable from within the management cluster
+	kubeconfigKey := "admin.conf"
+	if butlerConfig != nil {
+		mode := butlerConfig.GetControlPlaneExposureMode()
+		if mode == butlerv1alpha1.ControlPlaneExposureModeIngress ||
+			mode == butlerv1alpha1.ControlPlaneExposureModeGateway {
+			kubeconfigKey = "admin.svc"
+		}
+	}
+
+	kubeconfigData, ok := secret.Data[kubeconfigKey]
+	if !ok {
+		// Fallback to admin.conf if preferred key doesn't exist
+		kubeconfigData, ok = secret.Data["admin.conf"]
+		if !ok {
+			return nil, fmt.Errorf("kubeconfig secret missing %s and admin.conf keys", kubeconfigKey)
+		}
+	}
+
+	return kubeconfigData, nil
+}
+
+// getExternalKubeconfig returns the kubeconfig with the external hostname (admin.conf).
+// This is used for Cilium configuration in Ingress/Gateway mode to ensure proper SNI is sent.
+func (r *Reconciler) getExternalKubeconfig(ctx context.Context, tc *butlerv1alpha1.TenantCluster) ([]byte, error) {
+	secretName := fmt.Sprintf("%s-admin-kubeconfig", tc.Name)
+
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      secretName,
+		Namespace: tc.Status.TenantNamespace,
+	}, secret); err != nil {
+		return nil, fmt.Errorf("failed to get kubeconfig secret: %w", err)
+	}
+
+	// admin.conf contains the external hostname for Ingress/Gateway mode
 	kubeconfigData, ok := secret.Data["admin.conf"]
 	if !ok {
 		return nil, fmt.Errorf("kubeconfig secret missing admin.conf key")
@@ -541,7 +659,8 @@ func (r *Reconciler) checkInfrastructureStatus(ctx context.Context, tc *butlerv1
 	tc.Status.WorkerNodesReady = int32(readyReplicas)
 	tc.Status.WorkerNodesDesired = int32(desiredReplicas)
 
-	if replicas > 0 {
+	// Workers are ready when at least one replica is ready
+	if readyReplicas > 0 {
 		workersReady = true
 	}
 
@@ -626,7 +745,7 @@ func (r *Reconciler) reconcileMachineDeploymentReplicas(ctx context.Context, tc 
 	return nil
 }
 
-func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (bool, error) {
+func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) (bool, error) {
 	logger := log.FromContext(ctx)
 
 	kcp := &unstructured.Unstructured{}
@@ -666,18 +785,47 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 		return false, err
 	}
 
-	serviceStatus, found, _ := unstructured.NestedMap(tcp.Object, "status", "kubernetesResources", "service")
-	var loadBalancerIP string
-	if found {
-		ingress, found, _ := unstructured.NestedSlice(serviceStatus, "loadBalancer", "ingress")
-		if found && len(ingress) > 0 {
-			if ingressEntry, ok := ingress[0].(map[string]interface{}); ok {
-				loadBalancerIP, _, _ = unstructured.NestedString(ingressEntry, "ip")
+	// Determine the control plane endpoint based on exposure mode
+	var endpointHost string
+	var endpointPort int64
+
+	exposureMode := butlerv1alpha1.ControlPlaneExposureModeLoadBalancer
+	if butlerConfig != nil {
+		exposureMode = butlerConfig.GetControlPlaneExposureMode()
+	}
+
+	switch exposureMode {
+	case butlerv1alpha1.ControlPlaneExposureModeIngress, butlerv1alpha1.ControlPlaneExposureModeGateway:
+		// For Ingress/Gateway modes, use the generated hostname and port 443
+		if butlerConfig != nil {
+			hostnamePattern := butlerConfig.GetControlPlaneExposureHostname()
+			if hostnamePattern != "" {
+				// Generate tenant-specific hostname: "clustername.namespace.k8s.example.com" from "*.k8s.example.com"
+				base := strings.TrimPrefix(hostnamePattern, "*.")
+				endpointHost = fmt.Sprintf("%s.%s.%s", tc.Name, tc.Status.TenantNamespace, base)
+				endpointPort = 443
+				logger.V(1).Info("using Ingress/Gateway hostname for controlPlaneEndpoint",
+					"mode", exposureMode, "hostname", endpointHost)
+			}
+		}
+	default:
+		// LoadBalancer mode: get IP from service status, port 6443
+		serviceStatus, found, _ := unstructured.NestedMap(tcp.Object, "status", "kubernetesResources", "service")
+		if found {
+			ingress, found, _ := unstructured.NestedSlice(serviceStatus, "loadBalancer", "ingress")
+			if found && len(ingress) > 0 {
+				if ingressEntry, ok := ingress[0].(map[string]interface{}); ok {
+					endpointHost, _, _ = unstructured.NestedString(ingressEntry, "ip")
+					endpointPort = 6443
+					logger.V(1).Info("using LoadBalancer IP for controlPlaneEndpoint",
+						"ip", endpointHost)
+				}
 			}
 		}
 	}
 
-	if loadBalancerIP != "" {
+	// Patch Cluster controlPlaneEndpoint if we have a valid endpoint
+	if endpointHost != "" {
 		cluster := &unstructured.Unstructured{}
 		cluster.SetGroupVersionKind(schema.GroupVersionKind{
 			Group:   capi.ClusterAPIGroup,
@@ -689,17 +837,17 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 			Namespace: tc.Status.TenantNamespace,
 		}, cluster); err == nil {
 			currentHost, _, _ := unstructured.NestedString(cluster.Object, "spec", "controlPlaneEndpoint", "host")
-			if currentHost != loadBalancerIP {
-				logger.Info("patching Cluster controlPlaneEndpoint", "currentHost", currentHost, "newHost", loadBalancerIP)
+			if currentHost != endpointHost {
+				logger.Info("patching Cluster controlPlaneEndpoint", "currentHost", currentHost, "newHost", endpointHost, "port", endpointPort)
 
-				if err := unstructured.SetNestedField(cluster.Object, loadBalancerIP, "spec", "controlPlaneEndpoint", "host"); err != nil {
+				if err := unstructured.SetNestedField(cluster.Object, endpointHost, "spec", "controlPlaneEndpoint", "host"); err != nil {
 					logger.Error(err, "failed to set controlPlaneEndpoint.host")
-				} else if err := unstructured.SetNestedField(cluster.Object, int64(6443), "spec", "controlPlaneEndpoint", "port"); err != nil {
+				} else if err := unstructured.SetNestedField(cluster.Object, endpointPort, "spec", "controlPlaneEndpoint", "port"); err != nil {
 					logger.Error(err, "failed to set controlPlaneEndpoint.port")
 				} else if err := r.Update(ctx, cluster); err != nil {
 					logger.Error(err, "failed to update Cluster controlPlaneEndpoint")
 				} else {
-					logger.Info("successfully patched Cluster controlPlaneEndpoint", "host", loadBalancerIP)
+					logger.Info("successfully patched Cluster controlPlaneEndpoint", "host", endpointHost, "port", endpointPort)
 					return true, nil
 				}
 			}
@@ -1120,6 +1268,76 @@ func extractAPIServerEndpoint(kubeconfig []byte) (string, string) {
 	return parts[0], "6443"
 }
 
+// getIngressControllerIP returns the external IP of the Ingress controller service.
+// For Ingress/Gateway modes, worker VMs need this IP to resolve the API server hostname
+// before DNS is available (via /etc/hosts entry).
+func (r *Reconciler) getIngressControllerIP(ctx context.Context, butlerConfig *butlerv1alpha1.ButlerConfig) (string, error) {
+	logger := log.FromContext(ctx)
+
+	// Determine the controller type to find the right service
+	controllerType := "traefik" // default
+	if butlerConfig != nil && butlerConfig.Spec.ControlPlaneExposure != nil {
+		if ct := butlerConfig.Spec.ControlPlaneExposure.ControllerType; ct != "" {
+			controllerType = ct
+		}
+	}
+
+	// Map controller type to namespace and service name patterns
+	// Each ingress controller has different naming conventions
+	var namespace, serviceName string
+	switch controllerType {
+	case "traefik":
+		namespace = "traefik"
+		serviceName = "traefik"
+	case "nginx":
+		namespace = "ingress-nginx"
+		serviceName = "ingress-nginx-controller"
+	case "haproxy":
+		namespace = "haproxy-controller"
+		serviceName = "haproxy-kubernetes-ingress"
+	default:
+		// For generic or unknown types, try traefik as fallback
+		namespace = "traefik"
+		serviceName = "traefik"
+	}
+
+	// Look up the service
+	svc := &corev1.Service{}
+	if err := r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: namespace}, svc); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(1).Info("ingress controller service not found",
+				"namespace", namespace, "service", serviceName, "controllerType", controllerType)
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to get ingress controller service: %w", err)
+	}
+
+	// Extract external IP from LoadBalancer status
+	if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
+		logger.V(1).Info("ingress controller service is not LoadBalancer type",
+			"type", svc.Spec.Type, "namespace", namespace, "service", serviceName)
+		return "", nil
+	}
+
+	for _, ingress := range svc.Status.LoadBalancer.Ingress {
+		if ingress.IP != "" {
+			logger.V(1).Info("found ingress controller IP",
+				"ip", ingress.IP, "namespace", namespace, "service", serviceName)
+			return ingress.IP, nil
+		}
+		if ingress.Hostname != "" {
+			// Some cloud providers use hostname instead of IP
+			logger.V(1).Info("found ingress controller hostname (no IP)",
+				"hostname", ingress.Hostname, "namespace", namespace, "service", serviceName)
+			return ingress.Hostname, nil
+		}
+	}
+
+	logger.V(1).Info("ingress controller service has no external IP yet",
+		"namespace", namespace, "service", serviceName)
+	return "", nil
+}
+
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&butlerv1alpha1.TenantCluster{}).
@@ -1127,5 +1345,11 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Secret{}).
 		Owns(&rbacv1.RoleBinding{}).
 		Named("tenantcluster").
+		WithOptions(controller.Options{
+			// Allow multiple TenantClusters to be reconciled in parallel.
+			// This is critical for multi-tenant scenarios where creating
+			// multiple clusters simultaneously should not block each other.
+			MaxConcurrentReconciles: 5,
+		}).
 		Complete(r)
 }

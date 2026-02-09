@@ -69,6 +69,7 @@ type Builder struct {
 	butlerConfig   *butlerv1alpha1.ButlerConfig
 	namespace      string
 	nutanixCreds   *NutanixCredentials
+	ingressIP      string // External IP for Ingress/Gateway mode TLS passthrough
 }
 
 // NutanixCredentials holds Nutanix Prism Central credentials.
@@ -100,6 +101,13 @@ func (b *Builder) WithNutanixCredentials(username, password string) *Builder {
 // This enables reading ControlPlaneExposure for tcp-proxy auto-enablement.
 func (b *Builder) WithButlerConfig(bc *butlerv1alpha1.ButlerConfig) *Builder {
 	b.butlerConfig = bc
+	return b
+}
+
+// WithIngressIP sets the external Ingress IP for TLS passthrough.
+// This is used for Ingress/Gateway modes to configure worker /etc/hosts.
+func (b *Builder) WithIngressIP(ip string) *Builder {
+	b.ingressIP = ip
 	return b
 }
 
@@ -265,12 +273,14 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 	var exposureHostname string
 	var gatewayRef string
 	var ingressClassName string
+	var controllerType string
 
 	if b.butlerConfig != nil {
 		exposureMode = b.butlerConfig.GetControlPlaneExposureMode()
 		exposureHostname = b.butlerConfig.GetControlPlaneExposureHostname()
 		gatewayRef = b.butlerConfig.GetControlPlaneExposureGatewayRef()
 		ingressClassName = b.butlerConfig.GetControlPlaneExposureIngressClassName()
+		controllerType = b.butlerConfig.GetControlPlaneExposureControllerType()
 	}
 
 	// Map exposure mode to service type
@@ -296,7 +306,24 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 	// tcp-proxy rewrites kubernetes.default.svc EndpointSlice for in-cluster API access
 	if exposureMode == butlerv1alpha1.ControlPlaneExposureModeIngress ||
 		exposureMode == butlerv1alpha1.ControlPlaneExposureModeGateway {
-		addons["tcpProxy"] = map[string]interface{}{}
+		tcpProxyConfig := map[string]interface{}{}
+
+		// Add hostAliases for DNS resolution before CoreDNS is ready
+		// tcp-proxy uses hostNetwork and needs to resolve the API server hostname
+		if b.ingressIP != "" && exposureHostname != "" {
+			tenantHostname := b.generateTenantHostname(exposureHostname)
+			// Konnectivity uses a parallel hostname by replacing ".k8s." with ".konnectivity."
+			konnectivityHostname := strings.Replace(tenantHostname, ".k8s.", ".konnectivity.", 1)
+
+			tcpProxyConfig["hostAliases"] = []interface{}{
+				map[string]interface{}{
+					"ip":        b.ingressIP,
+					"hostnames": []interface{}{tenantHostname, konnectivityHostname},
+				},
+			}
+		}
+
+		addons["tcpProxy"] = tcpProxyConfig
 	}
 
 	// Build network configuration
@@ -312,6 +339,9 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 		}
 		if ingressClassName != "" {
 			ingressConfig["className"] = ingressClassName
+		}
+		if controllerType != "" {
+			ingressConfig["controllerType"] = controllerType
 		}
 		network["ingress"] = ingressConfig
 	}
@@ -848,8 +878,17 @@ func (b *Builder) buildKubeadmConfigTemplate(name string) *unstructured.Unstruct
 
 // buildRockyLinuxBootstrapCommands returns the preKubeadmCommands for Rocky Linux k8s node bootstrap.
 func (b *Builder) buildRockyLinuxBootstrapCommands(k8sMinorVersion string) []interface{} {
-	return []interface{}{
-		// Kernel modules for container networking
+	commands := []interface{}{}
+
+	// For Ingress/Gateway modes, add /etc/hosts entry first (before any k8s commands)
+	// This allows the worker to resolve the control plane hostname via the Ingress IP
+	// Note: We use /tmp/ because it always exists, unlike /etc/hosts.d/ which cloud-init may not create
+	if b.needsIngressHostsEntry() {
+		commands = append(commands, "cat /tmp/ingress-hosts >> /etc/hosts")
+	}
+
+	// Kernel modules for container networking
+	commands = append(commands,
 		"modprobe overlay",
 		"modprobe br_netfilter",
 
@@ -897,12 +936,14 @@ EOF`, k8sMinorVersion, k8sMinorVersion),
 
 		// Disable firewalld (CNI manages networking)
 		"systemctl disable --now firewalld || true",
-	}
+	)
+
+	return commands
 }
 
 // buildBootstrapFiles returns additional files to create during bootstrap.
 func (b *Builder) buildBootstrapFiles(k8sMinorVersion string) []interface{} {
-	return []interface{}{
+	files := []interface{}{
 		// Sysctl configuration for k8s networking
 		map[string]interface{}{
 			"path":        "/etc/sysctl.d/k8s.conf",
@@ -913,6 +954,33 @@ net.ipv4.ip_forward                 = 1
 `,
 		},
 	}
+
+	// For Ingress/Gateway modes, add /etc/hosts entries to resolve control plane hostnames
+	// Both the API server hostname and konnectivity hostname need to resolve to the Ingress IP
+	// Note: We use /tmp/ because it always exists - cloud-init may not create /etc/hosts.d/
+	if b.needsIngressHostsEntry() {
+		hostname := b.generateTenantHostname(b.butlerConfig.GetControlPlaneExposureHostname())
+		// Konnectivity uses a parallel hostname by replacing ".k8s." with ".konnectivity."
+		konnectivityHostname := strings.Replace(hostname, ".k8s.", ".konnectivity.", 1)
+		files = append(files, map[string]interface{}{
+			"path":        "/tmp/ingress-hosts",
+			"permissions": "0644",
+			"content":     fmt.Sprintf("%s %s\n%s %s\n", b.ingressIP, hostname, b.ingressIP, konnectivityHostname),
+		})
+	}
+
+	return files
+}
+
+// needsIngressHostsEntry returns true if the cluster uses Ingress/Gateway mode
+// and needs a hosts entry to resolve the control plane hostname.
+func (b *Builder) needsIngressHostsEntry() bool {
+	if b.butlerConfig == nil || b.ingressIP == "" {
+		return false
+	}
+	mode := b.butlerConfig.GetControlPlaneExposureMode()
+	return mode == butlerv1alpha1.ControlPlaneExposureModeIngress ||
+		mode == butlerv1alpha1.ControlPlaneExposureModeGateway
 }
 
 // buildMachineDeployment constructs the MachineDeployment resource.

@@ -12,7 +12,7 @@ RUN go mod download
 # Copy the Go source (relies on .dockerignore to filter)
 COPY . .
 # Build
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager ./cmd/main.go
 
 # Final image with tools
 FROM alpine:3.21
