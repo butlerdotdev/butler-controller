@@ -208,26 +208,26 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 			"hostname", hostname)
 		if mode == butlerv1alpha1.ControlPlaneExposureModeIngress ||
 			mode == butlerv1alpha1.ControlPlaneExposureModeGateway {
-			ingressIP, err := r.getIngressControllerIP(ctx, butlerConfig)
+			ingressIP, err := r.getExposureIP(ctx, butlerConfig)
 			if err != nil {
-				logger.Error(err, "failed to get Ingress controller IP")
+				logger.Error(err, "failed to get exposure IP")
 				r.setCondition(tc, butlerv1alpha1.TenantClusterConditionInfrastructureReady,
-					metav1.ConditionFalse, ReasonInfraProvisioning, "Waiting for Ingress controller")
+					metav1.ConditionFalse, ReasonInfraProvisioning, "Waiting for exposure endpoint")
 				if err := r.Status().Update(ctx, tc); err != nil {
 					return ctrl.Result{}, err
 				}
 				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 			}
 			if ingressIP == "" {
-				logger.Info("Ingress/Gateway mode requires Ingress controller external IP, waiting")
+				logger.Info("Ingress/Gateway mode requires external IP, waiting")
 				r.setCondition(tc, butlerv1alpha1.TenantClusterConditionInfrastructureReady,
-					metav1.ConditionFalse, ReasonInfraProvisioning, "Waiting for Ingress controller external IP")
+					metav1.ConditionFalse, ReasonInfraProvisioning, "Waiting for exposure endpoint external IP")
 				if err := r.Status().Update(ctx, tc); err != nil {
 					return ctrl.Result{}, err
 				}
 				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 			}
-			logger.Info("Ingress mode detected, setting ingressIP on builder", "ingressIP", ingressIP)
+			logger.Info("Ingress/Gateway mode detected, setting ingressIP on builder", "ingressIP", ingressIP)
 			builder.WithIngressIP(ingressIP)
 		}
 	}
@@ -371,10 +371,10 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 		mode := butlerConfig.GetControlPlaneExposureMode()
 		if mode == butlerv1alpha1.ControlPlaneExposureModeIngress ||
 			mode == butlerv1alpha1.ControlPlaneExposureModeGateway {
-			// Get the Ingress controller IP to add as hostAlias
-			ip, err := r.getIngressControllerIP(ctx, butlerConfig)
+			// Get the exposure IP (Gateway or Ingress controller) to add as hostAlias
+			ip, err := r.getExposureIP(ctx, butlerConfig)
 			if err != nil {
-				logger.Error(err, "failed to get ingress controller IP")
+				logger.Error(err, "failed to get exposure IP")
 			}
 			ingressIP = ip
 
@@ -1336,6 +1336,70 @@ func (r *Reconciler) getIngressControllerIP(ctx context.Context, butlerConfig *b
 	logger.V(1).Info("ingress controller service has no external IP yet",
 		"namespace", namespace, "service", serviceName)
 	return "", nil
+}
+
+// getGatewayIP retrieves the external IP from a Gateway resource status.
+// For Gateway API exposure mode, the external IP is on the Gateway resource
+// rather than an Ingress controller Service.
+func (r *Reconciler) getGatewayIP(ctx context.Context, butlerConfig *butlerv1alpha1.ButlerConfig) (string, error) {
+	logger := log.FromContext(ctx)
+
+	gatewayRef := butlerConfig.GetControlPlaneExposureGatewayRef()
+	if gatewayRef == "" {
+		return "", fmt.Errorf("Gateway mode requires gatewayRef in ButlerConfig")
+	}
+
+	parts := strings.Split(gatewayRef, "/")
+	if len(parts) != 2 {
+		return "", fmt.Errorf("invalid gatewayRef format: %s, expected namespace/name", gatewayRef)
+	}
+	namespace, name := parts[0], parts[1]
+
+	gw := &unstructured.Unstructured{}
+	gw.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "gateway.networking.k8s.io",
+		Version: "v1",
+		Kind:    "Gateway",
+	})
+
+	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, gw); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(1).Info("Gateway resource not found", "namespace", namespace, "name", name)
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to get Gateway %s/%s: %w", namespace, name, err)
+	}
+
+	addresses, found, err := unstructured.NestedSlice(gw.Object, "status", "addresses")
+	if err != nil || !found || len(addresses) == 0 {
+		logger.V(1).Info("Gateway has no addresses in status yet", "namespace", namespace, "name", name)
+		return "", nil
+	}
+
+	firstAddr, ok := addresses[0].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("invalid address format in Gateway %s/%s status", namespace, name)
+	}
+
+	ip, found, err := unstructured.NestedString(firstAddr, "value")
+	if err != nil || !found || ip == "" {
+		logger.V(1).Info("Gateway has no IP value in address", "namespace", namespace, "name", name)
+		return "", nil
+	}
+
+	logger.V(1).Info("found Gateway IP", "ip", ip, "namespace", namespace, "name", name)
+	return ip, nil
+}
+
+// getExposureIP returns the external IP for control plane exposure based on mode.
+// For Gateway mode, reads the Gateway resource status. For Ingress mode, reads the
+// Ingress controller Service status.
+func (r *Reconciler) getExposureIP(ctx context.Context, butlerConfig *butlerv1alpha1.ButlerConfig) (string, error) {
+	mode := butlerConfig.GetControlPlaneExposureMode()
+	if mode == butlerv1alpha1.ControlPlaneExposureModeGateway {
+		return r.getGatewayIP(ctx, butlerConfig)
+	}
+	return r.getIngressControllerIP(ctx, butlerConfig)
 }
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
