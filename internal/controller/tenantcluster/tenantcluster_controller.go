@@ -842,8 +842,9 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 			Namespace: tc.Status.TenantNamespace,
 		}, cluster); err == nil {
 			currentHost, _, _ := unstructured.NestedString(cluster.Object, "spec", "controlPlaneEndpoint", "host")
-			if currentHost != endpointHost {
-				logger.Info("patching Cluster controlPlaneEndpoint", "currentHost", currentHost, "newHost", endpointHost, "port", endpointPort)
+			currentPort, _, _ := unstructured.NestedInt64(cluster.Object, "spec", "controlPlaneEndpoint", "port")
+			if currentHost != endpointHost || currentPort != endpointPort {
+				logger.Info("patching Cluster controlPlaneEndpoint", "currentHost", currentHost, "newHost", endpointHost, "currentPort", currentPort, "newPort", endpointPort)
 
 				if err := unstructured.SetNestedField(cluster.Object, endpointHost, "spec", "controlPlaneEndpoint", "host"); err != nil {
 					logger.Error(err, "failed to set controlPlaneEndpoint.host")
