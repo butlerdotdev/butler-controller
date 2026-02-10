@@ -796,14 +796,19 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 
 	switch exposureMode {
 	case butlerv1alpha1.ControlPlaneExposureModeIngress, butlerv1alpha1.ControlPlaneExposureModeGateway:
-		// For Ingress/Gateway modes, use the generated hostname and port 443
+		// For Ingress/Gateway modes, use the generated hostname
+		// Ingress uses port 443 (HTTPS), Gateway uses port 6443 (kube-apiserver listener)
 		if butlerConfig != nil {
 			hostnamePattern := butlerConfig.GetControlPlaneExposureHostname()
 			if hostnamePattern != "" {
 				// Generate tenant-specific hostname: "clustername.namespace.k8s.example.com" from "*.k8s.example.com"
 				base := strings.TrimPrefix(hostnamePattern, "*.")
 				endpointHost = fmt.Sprintf("%s.%s.%s", tc.Name, tc.Status.TenantNamespace, base)
-				endpointPort = 443
+				if exposureMode == butlerv1alpha1.ControlPlaneExposureModeGateway {
+					endpointPort = 6443
+				} else {
+					endpointPort = 443
+				}
 				logger.V(1).Info("using Ingress/Gateway hostname for controlPlaneEndpoint",
 					"mode", exposureMode, "hostname", endpointHost)
 			}
