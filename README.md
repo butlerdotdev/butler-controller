@@ -1,5 +1,9 @@
 # butler-controller
 
+[![Release](https://img.shields.io/github/v/release/butlerdotdev/butler-controller)](https://github.com/butlerdotdev/butler-controller/releases)
+[![License](https://img.shields.io/github/license/butlerdotdev/butler-controller)](LICENSE)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/butlerdotdev/butler-controller)](go.mod)
+
 Kubernetes controller for managing tenant clusters on the Butler platform.
 
 ## Table of Contents
