@@ -141,8 +141,11 @@ func (b *Builder) buildHarvesterResources() (*ResourceSet, error) {
 	// Build machine template (KubevirtMachineTemplate)
 	machineTemplate := b.buildKubevirtMachineTemplate(clusterName)
 
-	// Build bootstrap config template
-	bootstrapTemplate := b.buildKubeadmConfigTemplate(clusterName)
+	// Build bootstrap config template (skip for Talos - uses dataSecretName instead)
+	var bootstrapTemplate *unstructured.Unstructured
+	if !b.isTalosCluster() {
+		bootstrapTemplate = b.buildKubeadmConfigTemplate(clusterName)
+	}
 
 	// Build machine deployment
 	machineDeployment := b.buildMachineDeployment(clusterName, machineTemplate, bootstrapTemplate)
@@ -302,6 +305,16 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 		"konnectivity": map[string]interface{}{},
 	}
 
+	// Enable workerBootstrap for Talos workers
+	if b.tc.Spec.Workers.MachineTemplate.OS.Type == butlerv1alpha1.OSTypeTalos {
+		addons["workerBootstrap"] = map[string]interface{}{
+			"provider": "talos",
+			"talos": map[string]interface{}{
+				"port": int64(50001),
+			},
+		}
+	}
+
 	// AUTO-ENABLE tcp-proxy for non-LoadBalancer modes
 	// tcp-proxy rewrites kubernetes.default.svc EndpointSlice for in-cluster API access
 	if exposureMode == butlerv1alpha1.ControlPlaneExposureModeIngress ||
@@ -366,9 +379,9 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 		"dataStoreName": dataStoreName,
 		"addons":        addons,
 
-		// Kubelet configuration for Rocky Linux / systemd
+		// Kubelet configuration - Talos uses cgroupfs, Rocky/Flatcar use systemd
 		"kubelet": map[string]interface{}{
-			"cgroupfs": "systemd",
+			"cgroupfs": b.kubeletCgroupDriver(),
 			"preferredAddressTypes": []interface{}{
 				"InternalIP",
 				"ExternalIP",
@@ -632,8 +645,11 @@ func (b *Builder) buildNutanixResources() (*ResourceSet, error) {
 	// Build machine template (NutanixMachineTemplate)
 	machineTemplate := b.buildNutanixMachineTemplate(clusterName)
 
-	// Build bootstrap config template (shared - Rocky Linux)
-	bootstrapTemplate := b.buildKubeadmConfigTemplate(clusterName)
+	// Build bootstrap config template (skip for Talos - uses dataSecretName instead)
+	var bootstrapTemplate *unstructured.Unstructured
+	if !b.isTalosCluster() {
+		bootstrapTemplate = b.buildKubeadmConfigTemplate(clusterName)
+	}
 
 	// Build machine deployment (shared)
 	machineDeployment := b.buildMachineDeployment(clusterName, machineTemplate, bootstrapTemplate)
@@ -972,6 +988,20 @@ net.ipv4.ip_forward                 = 1
 	return files
 }
 
+// kubeletCgroupDriver returns the cgroup driver for the OS type.
+// Talos uses cgroupfs; Rocky Linux and Flatcar use systemd.
+func (b *Builder) kubeletCgroupDriver() string {
+	if b.tc.Spec.Workers.MachineTemplate.OS.Type == butlerv1alpha1.OSTypeTalos {
+		return "cgroupfs"
+	}
+	return "systemd"
+}
+
+// isTalosCluster returns true if the TenantCluster uses Talos OS.
+func (b *Builder) isTalosCluster() bool {
+	return b.tc.Spec.Workers.MachineTemplate.OS.Type == butlerv1alpha1.OSTypeTalos
+}
+
 // needsIngressHostsEntry returns true if the cluster uses Ingress/Gateway mode
 // and needs a hosts entry to resolve the control plane hostname.
 func (b *Builder) needsIngressHostsEntry() bool {
@@ -997,6 +1027,25 @@ func (b *Builder) buildMachineDeployment(name string, machineTemplate, bootstrap
 		replicas = 1
 	}
 
+	// Build bootstrap config: use configRef for kubeadm, dataSecretName for Talos
+	var bootstrap map[string]interface{}
+	if bootstrapTemplate != nil {
+		bootstrap = map[string]interface{}{
+			"configRef": map[string]interface{}{
+				"apiVersion": bootstrapTemplate.GetAPIVersion(),
+				"kind":       bootstrapTemplate.GetKind(),
+				"name":       bootstrapTemplate.GetName(),
+				"namespace":  bootstrapTemplate.GetNamespace(),
+			},
+		}
+	} else {
+		// Talos: use dataSecretName — CAPI reads the Secret directly,
+		// waiting (requeueing) until the Secret is created by reconcileTalosBootstrap
+		bootstrap = map[string]interface{}{
+			"dataSecretName": fmt.Sprintf("%s-talos-bootstrap", name),
+		}
+	}
+
 	spec := map[string]interface{}{
 		"clusterName": name,
 		"replicas":    replicas,
@@ -1016,14 +1065,7 @@ func (b *Builder) buildMachineDeployment(name string, machineTemplate, bootstrap
 			"spec": map[string]interface{}{
 				"clusterName": name,
 				"version":     b.tc.Spec.KubernetesVersion,
-				"bootstrap": map[string]interface{}{
-					"configRef": map[string]interface{}{
-						"apiVersion": bootstrapTemplate.GetAPIVersion(),
-						"kind":       bootstrapTemplate.GetKind(),
-						"name":       bootstrapTemplate.GetName(),
-						"namespace":  bootstrapTemplate.GetNamespace(),
-					},
-				},
+				"bootstrap":   bootstrap,
 				"infrastructureRef": map[string]interface{}{
 					"apiVersion": machineTemplate.GetAPIVersion(),
 					"kind":       machineTemplate.GetKind(),
