@@ -1426,6 +1426,23 @@ func isTalosCluster(tc *butlerv1alpha1.TenantCluster) bool {
 	return tc.Spec.Workers.MachineTemplate.OS.Type == butlerv1alpha1.OSTypeTalos
 }
 
+// effectiveServiceType determines the actual Kubernetes Service type for the TCP.
+// Gateway/Ingress modes default to ClusterIP, LoadBalancer mode defaults to LoadBalancer.
+// The TC's spec.controlPlane.serviceType can override any default.
+func (r *Reconciler) effectiveServiceType(tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) string {
+	if tc.Spec.ControlPlane.ServiceType != "" {
+		return tc.Spec.ControlPlane.ServiceType
+	}
+	if butlerConfig != nil {
+		mode := butlerConfig.GetControlPlaneExposureMode()
+		if mode == butlerv1alpha1.ControlPlaneExposureModeIngress ||
+			mode == butlerv1alpha1.ControlPlaneExposureModeGateway {
+			return "ClusterIP"
+		}
+	}
+	return "LoadBalancer"
+}
+
 // reconcileTalosBootstrap generates the Talos machine config and creates the bootstrap
 // Secret that CAPI's dataSecretName mechanism reads. This is called after the TCP is
 // ready and the control plane is accessible.
@@ -1485,25 +1502,59 @@ func (r *Reconciler) reconcileTalosBootstrap(ctx context.Context, tc *butlerv1al
 		return fmt.Errorf("cluster CA Secret missing ca.crt")
 	}
 
-	// Get control plane endpoint from TCP status
-	tcp := &unstructured.Unstructured{}
-	tcp.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "steward.butlerlabs.dev",
-		Version: "v1alpha1",
-		Kind:    "TenantControlPlane",
-	})
-	if err := r.Get(ctx, types.NamespacedName{Name: tc.Name, Namespace: tenantNS}, tcp); err != nil {
-		return fmt.Errorf("failed to get TenantControlPlane: %w", err)
-	}
+	// Determine control plane endpoint based on service type.
+	// When using LoadBalancer, use the Service's external IP directly so that
+	// both the API server (port 6443) and trustd (port 50001) are reachable
+	// on the same address. Gateway mode TLS passthrough on multiple ports
+	// for the same hostname has known issues (cilium/cilium#42898).
+	var controlPlaneEndpoint string
 
-	tcpEndpoint, found, _ := unstructured.NestedString(tcp.Object, "status", "controlPlaneEndpoint")
-	if !found || tcpEndpoint == "" {
-		logger.Info("TCP controlPlaneEndpoint not set yet, waiting")
-		return nil
+	effectiveServiceType := r.effectiveServiceType(tc, butlerConfig)
+	if effectiveServiceType == "LoadBalancer" {
+		svc := &corev1.Service{}
+		if err := r.Get(ctx, types.NamespacedName{Name: tc.Name, Namespace: tenantNS}, svc); err != nil {
+			if apierrors.IsNotFound(err) {
+				logger.Info("TCP Service not found yet, waiting")
+				return nil
+			}
+			return fmt.Errorf("failed to get TCP Service: %w", err)
+		}
+		var lbIP string
+		for _, ingress := range svc.Status.LoadBalancer.Ingress {
+			if ingress.IP != "" {
+				lbIP = ingress.IP
+				break
+			}
+			if ingress.Hostname != "" {
+				lbIP = ingress.Hostname
+				break
+			}
+		}
+		if lbIP == "" {
+			logger.Info("TCP Service LoadBalancer IP not assigned yet, waiting")
+			return nil
+		}
+		controlPlaneEndpoint = fmt.Sprintf("https://%s:6443", lbIP)
+		logger.Info("using LoadBalancer IP for Talos control plane endpoint", "ip", lbIP)
+	} else {
+		// Gateway/Ingress mode — use the TCP status endpoint (hostname-based)
+		tcp := &unstructured.Unstructured{}
+		tcp.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "steward.butlerlabs.dev",
+			Version: "v1alpha1",
+			Kind:    "TenantControlPlane",
+		})
+		if err := r.Get(ctx, types.NamespacedName{Name: tc.Name, Namespace: tenantNS}, tcp); err != nil {
+			return fmt.Errorf("failed to get TenantControlPlane: %w", err)
+		}
+		tcpEndpoint, found, _ := unstructured.NestedString(tcp.Object, "status", "controlPlaneEndpoint")
+		if !found || tcpEndpoint == "" {
+			logger.Info("TCP controlPlaneEndpoint not set yet, waiting")
+			return nil
+		}
+		controlPlaneEndpoint = talos.EndpointFromTCPStatus(tcpEndpoint)
+		logger.Info("using Gateway endpoint for Talos control plane endpoint", "endpoint", controlPlaneEndpoint)
 	}
-
-	// TCP status endpoint is "host:port" — Talos needs "https://host:port"
-	controlPlaneEndpoint := talos.EndpointFromTCPStatus(tcpEndpoint)
 
 	// Get tenant admin kubeconfig to create bootstrap token in tenant API server
 	kubeconfigData, err := r.getTenantKubeconfig(ctx, tc, butlerConfig)
