@@ -32,6 +32,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -41,6 +43,7 @@ import (
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
 	"github.com/butlerdotdev/butler-controller/internal/addons"
 	"github.com/butlerdotdev/butler-controller/internal/capi"
+	"github.com/butlerdotdev/butler-controller/internal/talos"
 )
 
 const (
@@ -297,6 +300,16 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 	if controlPlaneReady {
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionControlPlaneReady,
 			metav1.ConditionTrue, ReasonControlPlaneReady, "Control plane is ready")
+
+		// For Talos clusters, generate bootstrap Secret after control plane is ready.
+		// This creates the Talos machine config and kubeadm bootstrap token needed
+		// for workers to join. CAPI's dataSecretName mechanism waits for this Secret.
+		if isTalosCluster(tc) {
+			if err := r.reconcileTalosBootstrap(ctx, tc, butlerConfig); err != nil {
+				logger.Error(err, "failed to reconcile Talos bootstrap")
+				// Don't fail — requeue and retry
+			}
+		}
 
 		// Install addons as soon as control plane is accessible
 		// Don't wait for workers - Cilium has tolerations for not-ready nodes
@@ -1406,6 +1419,256 @@ func (r *Reconciler) getExposureIP(ctx context.Context, butlerConfig *butlerv1al
 		return r.getGatewayIP(ctx, butlerConfig)
 	}
 	return r.getIngressControllerIP(ctx, butlerConfig)
+}
+
+// isTalosCluster returns true if the TenantCluster uses Talos OS for workers.
+func isTalosCluster(tc *butlerv1alpha1.TenantCluster) bool {
+	return talos.IsTalosCluster(tc)
+}
+
+// effectiveServiceType determines the actual Kubernetes Service type for the TCP.
+// Gateway/Ingress modes default to ClusterIP, LoadBalancer mode defaults to LoadBalancer.
+// The TC's spec.controlPlane.serviceType can override any default.
+func (r *Reconciler) effectiveServiceType(tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) string {
+	if tc.Spec.ControlPlane.ServiceType != "" {
+		return tc.Spec.ControlPlane.ServiceType
+	}
+	if butlerConfig != nil {
+		mode := butlerConfig.GetControlPlaneExposureMode()
+		if mode == butlerv1alpha1.ControlPlaneExposureModeIngress ||
+			mode == butlerv1alpha1.ControlPlaneExposureModeGateway {
+			return "ClusterIP"
+		}
+	}
+	return "LoadBalancer"
+}
+
+// reconcileTalosBootstrap generates the Talos machine config and creates the bootstrap
+// Secret that CAPI's dataSecretName mechanism reads. This is called after the TCP is
+// ready and the control plane is accessible.
+//
+// The Secret contains a Talos v1alpha1 worker machine config with:
+//   - machine.token: trustd token for apid auth with steward-trustd
+//   - cluster.token: kubeadm bootstrap token for kubelet TLS bootstrapping
+//   - machine.ca.crt: OS CA cert for trusting steward-trustd
+//   - cluster.ca.crt: K8s cluster CA for trusting the API server
+func (r *Reconciler) reconcileTalosBootstrap(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) error {
+	logger := log.FromContext(ctx)
+
+	secretName := fmt.Sprintf("%s-talos-bootstrap", tc.Name)
+	tenantNS := tc.Status.TenantNamespace
+
+	// Check if bootstrap Secret already exists
+	existing := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: tenantNS}, existing)
+	if err == nil {
+		logger.V(1).Info("Talos bootstrap Secret already exists", "name", secretName)
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to check for bootstrap Secret: %w", err)
+	}
+
+	// Read trustd credentials from the management cluster
+	trustdCredsName := fmt.Sprintf("%s-trustd-creds", tc.Name)
+	trustdCreds := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: trustdCredsName, Namespace: tenantNS}, trustdCreds); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Info("trustd credentials not ready yet, waiting", "name", trustdCredsName)
+			return nil
+		}
+		return fmt.Errorf("failed to get trustd credentials: %w", err)
+	}
+
+	machineToken := string(trustdCreds.Data["token"])
+	osCACert := string(trustdCreds.Data["os-ca.crt"])
+	if machineToken == "" || osCACert == "" {
+		return fmt.Errorf("trustd credentials missing token or os-ca.crt")
+	}
+
+	// Read cluster CA from the management cluster
+	caSecretName := fmt.Sprintf("%s-ca", tc.Name)
+	caSecret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: caSecretName, Namespace: tenantNS}, caSecret); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Info("cluster CA not ready yet, waiting", "name", caSecretName)
+			return nil
+		}
+		return fmt.Errorf("failed to get cluster CA: %w", err)
+	}
+
+	clusterCACert := string(caSecret.Data["ca.crt"])
+	if clusterCACert == "" {
+		return fmt.Errorf("cluster CA Secret missing ca.crt")
+	}
+
+	// Determine control plane endpoint based on service type.
+	// When using LoadBalancer, use the Service's external IP directly so that
+	// both the API server (port 6443) and trustd (port 50001) are reachable
+	// on the same address. Gateway mode TLS passthrough on multiple ports
+	// for the same hostname has known issues (cilium/cilium#42898).
+	var controlPlaneEndpoint string
+
+	effectiveServiceType := r.effectiveServiceType(tc, butlerConfig)
+	if effectiveServiceType == "LoadBalancer" {
+		svc := &corev1.Service{}
+		if err := r.Get(ctx, types.NamespacedName{Name: tc.Name, Namespace: tenantNS}, svc); err != nil {
+			if apierrors.IsNotFound(err) {
+				logger.Info("TCP Service not found yet, waiting")
+				return nil
+			}
+			return fmt.Errorf("failed to get TCP Service: %w", err)
+		}
+		var lbIP string
+		for _, ingress := range svc.Status.LoadBalancer.Ingress {
+			if ingress.IP != "" {
+				lbIP = ingress.IP
+				break
+			}
+			if ingress.Hostname != "" {
+				lbIP = ingress.Hostname
+				break
+			}
+		}
+		if lbIP == "" {
+			logger.Info("TCP Service LoadBalancer IP not assigned yet, waiting")
+			return nil
+		}
+		controlPlaneEndpoint = fmt.Sprintf("https://%s:6443", lbIP)
+		logger.Info("using LoadBalancer IP for Talos control plane endpoint", "ip", lbIP)
+	} else {
+		// Gateway/Ingress mode — use the TCP status endpoint (hostname-based)
+		tcp := &unstructured.Unstructured{}
+		tcp.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "steward.butlerlabs.dev",
+			Version: "v1alpha1",
+			Kind:    "TenantControlPlane",
+		})
+		if err := r.Get(ctx, types.NamespacedName{Name: tc.Name, Namespace: tenantNS}, tcp); err != nil {
+			return fmt.Errorf("failed to get TenantControlPlane: %w", err)
+		}
+		tcpEndpoint, found, _ := unstructured.NestedString(tcp.Object, "status", "controlPlaneEndpoint")
+		if !found || tcpEndpoint == "" {
+			logger.Info("TCP controlPlaneEndpoint not set yet, waiting")
+			return nil
+		}
+		controlPlaneEndpoint = talos.EndpointFromTCPStatus(tcpEndpoint)
+		logger.Info("using Gateway endpoint for Talos control plane endpoint", "endpoint", controlPlaneEndpoint)
+	}
+
+	// Get tenant admin kubeconfig to create bootstrap token in tenant API server
+	kubeconfigData, err := r.getTenantKubeconfig(ctx, tc, butlerConfig)
+	if err != nil {
+		logger.Info("tenant kubeconfig not available yet, waiting", "error", err)
+		return nil
+	}
+
+	// Create kubernetes client from kubeconfig
+	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigData)
+	if err != nil {
+		return fmt.Errorf("failed to create REST config from kubeconfig: %w", err)
+	}
+
+	tenantClient, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create tenant kubernetes client: %w", err)
+	}
+
+	// Reuse existing bootstrap token if one was created by a previous attempt,
+	// otherwise generate a new one. This ensures idempotency when the reconciler
+	// succeeds in creating the token but fails before creating the bootstrap Secret.
+	bootstrapToken, err := talos.FindExistingBootstrapToken(ctx, tenantClient)
+	if err != nil {
+		return fmt.Errorf("failed to check for existing bootstrap token: %w", err)
+	}
+
+	if bootstrapToken != "" {
+		logger.Info("reusing existing kubeadm bootstrap token in tenant API server")
+	} else {
+		bootstrapToken, err = talos.GenerateBootstrapToken()
+		if err != nil {
+			return fmt.Errorf("failed to generate bootstrap token: %w", err)
+		}
+
+		if err := talos.CreateBootstrapTokenSecret(ctx, tenantClient, bootstrapToken); err != nil {
+			return fmt.Errorf("failed to create bootstrap token in tenant: %w", err)
+		}
+
+		logger.Info("created kubeadm bootstrap token in tenant API server")
+	}
+
+	// Get networking CIDRs
+	podCIDR := "10.244.0.0/16"
+	serviceCIDR := "10.96.0.0/12"
+	if tc.Spec.Networking.PodCIDR != "" {
+		podCIDR = tc.Spec.Networking.PodCIDR
+	}
+	if tc.Spec.Networking.ServiceCIDR != "" {
+		serviceCIDR = tc.Spec.Networking.ServiceCIDR
+	}
+
+	// Get Talos-specific config
+	installDisk := "/dev/vda"
+	var installerImage string
+	if tc.Spec.Workers.MachineTemplate.OS.Talos != nil {
+		if tc.Spec.Workers.MachineTemplate.OS.Talos.InstallDisk != "" {
+			installDisk = tc.Spec.Workers.MachineTemplate.OS.Talos.InstallDisk
+		}
+		installerImage = tc.Spec.Workers.MachineTemplate.OS.Talos.InstallerImage
+	}
+
+	// Generate Talos machine config
+	input := talos.MachineConfigInput{
+		ClusterName:          tc.Name,
+		ControlPlaneEndpoint: controlPlaneEndpoint,
+		ClusterCACert:        clusterCACert,
+		MachineToken:         machineToken,
+		BootstrapToken:       bootstrapToken,
+		OSCACert:             osCACert,
+		PodCIDR:              podCIDR,
+		ServiceCIDR:          serviceCIDR,
+		InstallDisk:          installDisk,
+		InstallerImage:       installerImage,
+	}
+
+	machineConfigData, err := talos.GenerateWorkerConfig(input)
+	if err != nil {
+		return fmt.Errorf("failed to generate Talos machine config: %w", err)
+	}
+
+	// Create the bootstrap Secret in the tenant namespace on the management cluster.
+	// CAPI reads this via dataSecretName on the MachineDeployment.
+	bootstrapSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: tenantNS,
+			Labels: map[string]string{
+				butlerv1alpha1.LabelManagedBy: "butler",
+				butlerv1alpha1.LabelTenant:    tc.Name,
+			},
+		},
+		Data: map[string][]byte{
+			"value": machineConfigData,
+		},
+	}
+
+	if err := ctrl.SetControllerReference(tc, bootstrapSecret, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set owner reference on bootstrap Secret: %w", err)
+	}
+
+	if err := r.Create(ctx, bootstrapSecret); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to create Talos bootstrap Secret: %w", err)
+	}
+
+	logger.Info("created Talos bootstrap Secret",
+		"name", secretName,
+		"namespace", tenantNS,
+		"endpoint", controlPlaneEndpoint)
+
+	return nil
 }
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
