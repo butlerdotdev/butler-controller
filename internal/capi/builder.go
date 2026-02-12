@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
+	"github.com/butlerdotdev/butler-controller/internal/talos"
 )
 
 // API Group/Version constants for CAPI resources.
@@ -999,7 +1000,7 @@ func (b *Builder) kubeletCgroupDriver() string {
 
 // isTalosCluster returns true if the TenantCluster uses Talos OS.
 func (b *Builder) isTalosCluster() bool {
-	return b.tc.Spec.Workers.MachineTemplate.OS.Type == butlerv1alpha1.OSTypeTalos
+	return talos.IsTalosCluster(b.tc)
 }
 
 // needsIngressHostsEntry returns true if the cluster uses Ingress/Gateway mode

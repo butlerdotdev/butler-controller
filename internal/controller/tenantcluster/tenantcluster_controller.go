@@ -1423,7 +1423,7 @@ func (r *Reconciler) getExposureIP(ctx context.Context, butlerConfig *butlerv1al
 
 // isTalosCluster returns true if the TenantCluster uses Talos OS for workers.
 func isTalosCluster(tc *butlerv1alpha1.TenantCluster) bool {
-	return tc.Spec.Workers.MachineTemplate.OS.Type == butlerv1alpha1.OSTypeTalos
+	return talos.IsTalosCluster(tc)
 }
 
 // effectiveServiceType determines the actual Kubernetes Service type for the TCP.
@@ -1574,17 +1574,28 @@ func (r *Reconciler) reconcileTalosBootstrap(ctx context.Context, tc *butlerv1al
 		return fmt.Errorf("failed to create tenant kubernetes client: %w", err)
 	}
 
-	// Generate and create bootstrap token in tenant API server
-	bootstrapToken, err := talos.GenerateBootstrapToken()
+	// Reuse existing bootstrap token if one was created by a previous attempt,
+	// otherwise generate a new one. This ensures idempotency when the reconciler
+	// succeeds in creating the token but fails before creating the bootstrap Secret.
+	bootstrapToken, err := talos.FindExistingBootstrapToken(ctx, tenantClient)
 	if err != nil {
-		return fmt.Errorf("failed to generate bootstrap token: %w", err)
+		return fmt.Errorf("failed to check for existing bootstrap token: %w", err)
 	}
 
-	if err := talos.CreateBootstrapTokenSecret(ctx, tenantClient, bootstrapToken); err != nil {
-		return fmt.Errorf("failed to create bootstrap token in tenant: %w", err)
-	}
+	if bootstrapToken != "" {
+		logger.Info("reusing existing kubeadm bootstrap token in tenant API server")
+	} else {
+		bootstrapToken, err = talos.GenerateBootstrapToken()
+		if err != nil {
+			return fmt.Errorf("failed to generate bootstrap token: %w", err)
+		}
 
-	logger.Info("created kubeadm bootstrap token in tenant API server")
+		if err := talos.CreateBootstrapTokenSecret(ctx, tenantClient, bootstrapToken); err != nil {
+			return fmt.Errorf("failed to create bootstrap token in tenant: %w", err)
+		}
+
+		logger.Info("created kubeadm bootstrap token in tenant API server")
+	}
 
 	// Get networking CIDRs
 	podCIDR := "10.244.0.0/16"
@@ -1639,6 +1650,10 @@ func (r *Reconciler) reconcileTalosBootstrap(ctx context.Context, tc *butlerv1al
 		Data: map[string][]byte{
 			"value": machineConfigData,
 		},
+	}
+
+	if err := ctrl.SetControllerReference(tc, bootstrapSecret, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set owner reference on bootstrap Secret: %w", err)
 	}
 
 	if err := r.Create(ctx, bootstrapSecret); err != nil {

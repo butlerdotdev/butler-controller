@@ -22,8 +22,15 @@ import (
 	"net"
 	"strings"
 
-	"go.yaml.in/yaml/v3"
+	"gopkg.in/yaml.v3"
+
+	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
 )
+
+// IsTalosCluster returns true if the TenantCluster uses Talos OS for workers.
+func IsTalosCluster(tc *butlerv1alpha1.TenantCluster) bool {
+	return tc.Spec.Workers.MachineTemplate.OS.Type == butlerv1alpha1.OSTypeTalos
+}
 
 // MachineConfigInput contains all data needed to generate a Talos worker machine config.
 type MachineConfigInput struct {

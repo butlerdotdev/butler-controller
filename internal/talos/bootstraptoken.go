@@ -95,6 +95,32 @@ func CreateBootstrapTokenSecret(ctx context.Context, client kubernetes.Interface
 	return nil
 }
 
+// FindExistingBootstrapToken checks the tenant API server for an existing bootstrap
+// token Secret. Returns the token string if found, or empty string if none exists.
+// This enables idempotent reconciliation when the reconciler creates a token but
+// fails before creating the CAPI bootstrap Secret.
+func FindExistingBootstrapToken(ctx context.Context, client kubernetes.Interface) (string, error) {
+	secrets, err := client.CoreV1().Secrets("kube-system").List(ctx, metav1.ListOptions{
+		FieldSelector: "type=" + string(corev1.SecretTypeBootstrapToken),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to list bootstrap token secrets: %w", err)
+	}
+
+	for _, s := range secrets.Items {
+		if !strings.HasPrefix(s.Name, "bootstrap-token-") {
+			continue
+		}
+		tokenID := string(s.Data["token-id"])
+		tokenSecret := string(s.Data["token-secret"])
+		if tokenID != "" && tokenSecret != "" {
+			return tokenID + "." + tokenSecret, nil
+		}
+	}
+
+	return "", nil
+}
+
 func randomString(length int) (string, error) {
 	result := make([]byte, length)
 	max := big.NewInt(int64(len(bootstrapTokenChars)))
