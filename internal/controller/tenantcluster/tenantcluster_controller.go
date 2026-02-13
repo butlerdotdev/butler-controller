@@ -193,6 +193,21 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 		return ctrl.Result{}, err
 	}
 
+	// Validate provider scope access
+	if err := r.validateProviderAccess(ctx, tc, providerConfig); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Reconcile IPAM allocation (if provider has network.mode=ipam)
+	ipamReady, err := r.reconcileIPAllocation(ctx, tc, providerConfig)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !ipamReady {
+		logger.Info("waiting for IPAM allocation")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
 	// Build CAPI resources with ButlerConfig for platform-level settings
 	// ButlerConfig provides ControlPlaneExposure settings (LoadBalancer/Ingress/Gateway mode)
 	// which enables auto-enabling tcp-proxy for non-LoadBalancer modes
@@ -456,7 +471,18 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 		metallbVersion = tc.Spec.Addons.LoadBalancer.Version
 	}
 	var poolStart, poolEnd string
-	if tc.Spec.Networking.LoadBalancerPool != nil {
+	// Check IPAM allocation first, fall back to manual loadBalancerPool
+	if tc.Status.LBAllocationRef != nil {
+		lbAlloc := &butlerv1alpha1.IPAllocation{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      tc.Status.LBAllocationRef.Name,
+			Namespace: "butler-system",
+		}, lbAlloc); err == nil && lbAlloc.Status.Phase == butlerv1alpha1.IPAllocationPhaseAllocated {
+			poolStart = lbAlloc.Status.StartAddress
+			poolEnd = lbAlloc.Status.EndAddress
+		}
+	}
+	if poolStart == "" && tc.Spec.Networking.LoadBalancerPool != nil {
 		poolStart = tc.Spec.Networking.LoadBalancerPool.Start
 		poolEnd = tc.Spec.Networking.LoadBalancerPool.End
 	}
@@ -570,9 +596,13 @@ func (r *Reconciler) getProviderConfig(ctx context.Context, tc *butlerv1alpha1.T
 	const defaultProviderNamespace = "butler-system"
 
 	if tc.Spec.ProviderConfigRef != nil && tc.Spec.ProviderConfigRef.Name != "" {
+		ns := tc.Spec.ProviderConfigRef.Namespace
+		if ns == "" {
+			ns = defaultProviderNamespace
+		}
 		pc := &butlerv1alpha1.ProviderConfig{}
-		if err := r.Get(ctx, types.NamespacedName{Name: tc.Spec.ProviderConfigRef.Name, Namespace: defaultProviderNamespace}, pc); err != nil {
-			return nil, fmt.Errorf("failed to get ProviderConfig %s/%s: %w", defaultProviderNamespace, tc.Spec.ProviderConfigRef.Name, err)
+		if err := r.Get(ctx, types.NamespacedName{Name: tc.Spec.ProviderConfigRef.Name, Namespace: ns}, pc); err != nil {
+			return nil, fmt.Errorf("failed to get ProviderConfig %s/%s: %w", ns, tc.Spec.ProviderConfigRef.Name, err)
 		}
 		return pc, nil
 	}
@@ -1184,6 +1214,9 @@ func (r *Reconciler) handleDeletion(ctx context.Context, tc *butlerv1alpha1.Tena
 		}
 	}
 
+	// Clean up IPAllocations before deleting namespace
+	r.cleanupIPAllocations(ctx, tc)
+
 	if tc.Status.TenantNamespace != "" {
 		ns := &corev1.Namespace{}
 		err := r.Get(ctx, types.NamespacedName{Name: tc.Status.TenantNamespace}, ns)
@@ -1669,6 +1702,258 @@ func (r *Reconciler) reconcileTalosBootstrap(ctx context.Context, tc *butlerv1al
 		"endpoint", controlPlaneEndpoint)
 
 	return nil
+}
+
+// validateProviderAccess checks if the TenantCluster's team has access to the ProviderConfig.
+func (r *Reconciler) validateProviderAccess(ctx context.Context, tc *butlerv1alpha1.TenantCluster, pc *butlerv1alpha1.ProviderConfig) error {
+	// Platform-scoped providers are accessible to all teams
+	if pc.Spec.Scope == nil || pc.Spec.Scope.Type == "" || pc.Spec.Scope.Type == butlerv1alpha1.ProviderConfigScopePlatform {
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+			metav1.ConditionTrue, butlerv1alpha1.ReasonReady, "platform-scoped provider")
+		return r.validateProviderLimits(ctx, tc, pc)
+	}
+
+	// Team-scoped: verify the TC's team matches the PC's team
+	if pc.Spec.Scope.TeamRef == nil {
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+			metav1.ConditionFalse, butlerv1alpha1.ReasonProviderAccessDenied,
+			"provider is team-scoped but has no teamRef")
+		return fmt.Errorf("provider %s is team-scoped but has no teamRef", pc.Name)
+	}
+
+	if tc.Spec.TeamRef == nil {
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+			metav1.ConditionFalse, butlerv1alpha1.ReasonProviderAccessDenied,
+			"cluster has no teamRef but provider is team-scoped")
+		return fmt.Errorf("cluster has no teamRef but provider %s is team-scoped to %s",
+			pc.Name, pc.Spec.Scope.TeamRef.Name)
+	}
+
+	if tc.Spec.TeamRef.Name != pc.Spec.Scope.TeamRef.Name {
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+			metav1.ConditionFalse, butlerv1alpha1.ReasonProviderAccessDenied,
+			fmt.Sprintf("team %s does not have access to provider %s (scoped to %s)",
+				tc.Spec.TeamRef.Name, pc.Name, pc.Spec.Scope.TeamRef.Name))
+		return fmt.Errorf("team %s does not have access to provider %s (scoped to %s)",
+			tc.Spec.TeamRef.Name, pc.Name, pc.Spec.Scope.TeamRef.Name)
+	}
+
+	r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+		metav1.ConditionTrue, butlerv1alpha1.ReasonReady,
+		fmt.Sprintf("team %s has access to provider %s", tc.Spec.TeamRef.Name, pc.Name))
+
+	// Enforce provider limits (defense-in-depth when webhooks are disabled)
+	return r.validateProviderLimits(ctx, tc, pc)
+}
+
+// validateProviderLimits checks maxClustersPerTeam and maxNodesPerTeam limits from ProviderConfig.
+func (r *Reconciler) validateProviderLimits(ctx context.Context, tc *butlerv1alpha1.TenantCluster, pc *butlerv1alpha1.ProviderConfig) error {
+	if pc.Spec.Limits == nil {
+		return nil
+	}
+
+	if pc.Spec.Limits.MaxClustersPerTeam != nil {
+		maxClusters := *pc.Spec.Limits.MaxClustersPerTeam
+		var tcList butlerv1alpha1.TenantClusterList
+		if err := r.List(ctx, &tcList, client.InNamespace(tc.Namespace)); err != nil {
+			return fmt.Errorf("failed to list TenantClusters: %w", err)
+		}
+
+		var existingCount int32
+		for i := range tcList.Items {
+			if tcList.Items[i].Name != tc.Name {
+				existingCount++
+			}
+		}
+
+		if existingCount >= maxClusters {
+			msg := fmt.Sprintf("team namespace %q has %d cluster(s), provider %q limits to %d",
+				tc.Namespace, existingCount, pc.Name, maxClusters)
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+				metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
+			return fmt.Errorf("quota exceeded: %s", msg)
+		}
+	}
+
+	if pc.Spec.Limits.MaxNodesPerTeam != nil {
+		maxNodes := *pc.Spec.Limits.MaxNodesPerTeam
+		var tcList butlerv1alpha1.TenantClusterList
+		if err := r.List(ctx, &tcList, client.InNamespace(tc.Namespace)); err != nil {
+			return fmt.Errorf("failed to list TenantClusters: %w", err)
+		}
+
+		totalNodes := tc.Spec.Workers.Replicas
+		for i := range tcList.Items {
+			if tcList.Items[i].Name != tc.Name {
+				totalNodes += tcList.Items[i].Spec.Workers.Replicas
+			}
+		}
+
+		if totalNodes > maxNodes {
+			msg := fmt.Sprintf("total worker replicas (%d) exceeds provider %q per-team limit (%d)",
+				totalNodes, pc.Name, maxNodes)
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+				metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
+			return fmt.Errorf("quota exceeded: %s", msg)
+		}
+	}
+
+	return nil
+}
+
+// reconcileIPAllocation creates or checks LB IPAllocation for IPAM mode providers.
+// Returns true if IPAM is ready (allocated or not needed), false if waiting.
+func (r *Reconciler) reconcileIPAllocation(ctx context.Context, tc *butlerv1alpha1.TenantCluster, pc *butlerv1alpha1.ProviderConfig) (bool, error) {
+	logger := log.FromContext(ctx)
+
+	// Skip IPAM if not configured
+	if pc.Spec.Network == nil || pc.Spec.Network.Mode != "ipam" {
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionNetworkReady,
+			metav1.ConditionTrue, butlerv1alpha1.ReasonReady, "cloud networking mode")
+		return true, nil
+	}
+
+	if len(pc.Spec.Network.PoolRefs) == 0 {
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionNetworkReady,
+			metav1.ConditionFalse, butlerv1alpha1.ReasonNetworkNotReady,
+			"IPAM mode but no poolRefs configured on provider")
+		return false, fmt.Errorf("IPAM mode but no poolRefs configured on provider %s", pc.Name)
+	}
+
+	// Check if LB allocation already exists
+	if tc.Status.LBAllocationRef != nil {
+		alloc := &butlerv1alpha1.IPAllocation{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      tc.Status.LBAllocationRef.Name,
+			Namespace: "butler-system",
+		}, alloc); err != nil {
+			if apierrors.IsNotFound(err) {
+				// Allocation was deleted, clear ref and retry
+				tc.Status.LBAllocationRef = nil
+			} else {
+				return false, err
+			}
+		} else {
+			switch alloc.Status.Phase {
+			case butlerv1alpha1.IPAllocationPhaseAllocated:
+				r.setCondition(tc, butlerv1alpha1.TenantClusterConditionNetworkReady,
+					metav1.ConditionTrue, butlerv1alpha1.ReasonReady,
+					fmt.Sprintf("LB IPs allocated: %s", alloc.Status.CIDR))
+				return true, nil
+			case butlerv1alpha1.IPAllocationPhasePending:
+				r.setCondition(tc, butlerv1alpha1.TenantClusterConditionNetworkReady,
+					metav1.ConditionFalse, butlerv1alpha1.ReasonReconciling,
+					"waiting for LB IP allocation")
+				return false, nil
+			case butlerv1alpha1.IPAllocationPhaseFailed:
+				// Delete failed allocation and try next pool
+				logger.Info("LB allocation failed, cleaning up", "allocation", alloc.Name)
+				if err := r.Delete(ctx, alloc); err != nil && !apierrors.IsNotFound(err) {
+					return false, err
+				}
+				tc.Status.LBAllocationRef = nil
+			}
+		}
+	}
+
+	// Create new allocation — try pools in priority order
+	lbCount := r.getLBPoolSize(tc, pc)
+	allocName := fmt.Sprintf("%s-%s-lb", tc.Namespace, tc.Name)
+
+	for _, poolRef := range pc.Spec.Network.PoolRefs {
+		// Check pool capacity
+		pool := &butlerv1alpha1.NetworkPool{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      poolRef.Name,
+			Namespace: "butler-system",
+		}, pool); err != nil {
+			logger.V(1).Info("pool not found, trying next", "pool", poolRef.Name)
+			continue
+		}
+
+		if pool.Status.AvailableIPs < lbCount {
+			logger.V(1).Info("pool has insufficient capacity, trying next",
+				"pool", poolRef.Name, "available", pool.Status.AvailableIPs, "needed", lbCount)
+			continue
+		}
+
+		// Create IPAllocation
+		alloc := &butlerv1alpha1.IPAllocation{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      allocName,
+				Namespace: "butler-system",
+				Labels: map[string]string{
+					butlerv1alpha1.LabelNetworkPool: poolRef.Name,
+					butlerv1alpha1.LabelTeam:        tc.Namespace,
+					butlerv1alpha1.LabelTenant:      tc.Name,
+				},
+			},
+			Spec: butlerv1alpha1.IPAllocationSpec{
+				PoolRef:          butlerv1alpha1.LocalObjectReference{Name: poolRef.Name},
+				TenantClusterRef: butlerv1alpha1.NamespacedObjectReference{Name: tc.Name, Namespace: tc.Namespace},
+				Type:             butlerv1alpha1.IPAllocationTypeLoadBalancer,
+				Count:            &lbCount,
+			},
+		}
+
+		if err := r.Create(ctx, alloc); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				// Re-fetch and check status
+				existing := &butlerv1alpha1.IPAllocation{}
+				if getErr := r.Get(ctx, types.NamespacedName{Name: allocName, Namespace: "butler-system"}, existing); getErr == nil {
+					tc.Status.LBAllocationRef = &butlerv1alpha1.LocalObjectReference{Name: allocName}
+					return false, nil
+				}
+			}
+			return false, fmt.Errorf("failed to create IPAllocation: %w", err)
+		}
+
+		logger.Info("created LB IPAllocation", "allocation", allocName, "pool", poolRef.Name, "count", lbCount)
+		tc.Status.LBAllocationRef = &butlerv1alpha1.LocalObjectReference{Name: allocName}
+		return false, nil // Wait for allocation to be fulfilled
+	}
+
+	// All pools exhausted
+	r.setCondition(tc, butlerv1alpha1.TenantClusterConditionNetworkReady,
+		metav1.ConditionFalse, butlerv1alpha1.ReasonPoolExhausted,
+		"all configured pools are exhausted")
+	return false, nil
+}
+
+func (r *Reconciler) getLBPoolSize(tc *butlerv1alpha1.TenantCluster, pc *butlerv1alpha1.ProviderConfig) int32 {
+	// TC override takes priority
+	if tc.Spec.Networking.LBPoolSize != nil {
+		return *tc.Spec.Networking.LBPoolSize
+	}
+	// Then provider default
+	if pc.Spec.Network != nil && pc.Spec.Network.LoadBalancer != nil && pc.Spec.Network.LoadBalancer.DefaultPoolSize != nil {
+		return *pc.Spec.Network.LoadBalancer.DefaultPoolSize
+	}
+	return 8
+}
+
+// cleanupIPAllocations deletes IPAllocations referenced by the TenantCluster.
+func (r *Reconciler) cleanupIPAllocations(ctx context.Context, tc *butlerv1alpha1.TenantCluster) {
+	logger := log.FromContext(ctx)
+
+	refs := []*butlerv1alpha1.LocalObjectReference{tc.Status.IPAllocationRef, tc.Status.LBAllocationRef}
+	for _, ref := range refs {
+		if ref == nil {
+			continue
+		}
+		alloc := &butlerv1alpha1.IPAllocation{}
+		if err := r.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: "butler-system"}, alloc); err != nil {
+			if !apierrors.IsNotFound(err) {
+				logger.Error(err, "failed to get IPAllocation for cleanup", "name", ref.Name)
+			}
+			continue
+		}
+		if err := r.Delete(ctx, alloc); err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to delete IPAllocation", "name", ref.Name)
+		} else {
+			logger.Info("deleted IPAllocation during cleanup", "name", ref.Name)
+		}
+	}
 }
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {

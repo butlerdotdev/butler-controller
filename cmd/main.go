@@ -34,12 +34,16 @@ import (
 
 	"github.com/butlerdotdev/butler-controller/internal/addons"
 	"github.com/butlerdotdev/butler-controller/internal/controller/butlerconfig"
+	"github.com/butlerdotdev/butler-controller/internal/controller/ipallocation"
 	"github.com/butlerdotdev/butler-controller/internal/controller/kamajisecret"
 	"github.com/butlerdotdev/butler-controller/internal/controller/kamajistatus"
 	"github.com/butlerdotdev/butler-controller/internal/controller/managementaddon"
+	"github.com/butlerdotdev/butler-controller/internal/controller/networkpool"
+	"github.com/butlerdotdev/butler-controller/internal/controller/providerconfig"
 	"github.com/butlerdotdev/butler-controller/internal/controller/team"
 	"github.com/butlerdotdev/butler-controller/internal/controller/tenantaddon"
 	"github.com/butlerdotdev/butler-controller/internal/controller/tenantcluster"
+	"github.com/butlerdotdev/butler-controller/internal/webhook"
 )
 
 var (
@@ -62,6 +66,7 @@ func main() {
 	var probeAddr string
 	var enableLeaderElection bool
 	var enableKamajiControllers bool
+	var enableWebhooks bool
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -71,6 +76,9 @@ func main() {
 	flag.BoolVar(&enableKamajiControllers, "enable-kamaji-controllers", true,
 		"Enable Kamaji integration controllers (KamajiSecret, KamajiStatus). "+
 			"Disable if not using Kamaji for hosted control planes.")
+	flag.BoolVar(&enableWebhooks, "enable-webhooks", false,
+		"Enable admission webhooks for TenantCluster, NetworkPool, and ProviderConfig. "+
+			"Requires cert-manager for TLS certificate management.")
 
 	opts := zap.Options{
 		Development: true,
@@ -160,6 +168,54 @@ func main() {
 		os.Exit(1)
 	}
 
+	// NetworkPool controller. IPAM allocator — sole writer for IP allocations
+	if err = (&networkpool.Reconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("networkpool-controller"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "NetworkPool")
+		os.Exit(1)
+	}
+
+	// IPAllocation controller. Thin controller for lifecycle management
+	if err = (&ipallocation.Reconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "IPAllocation")
+		os.Exit(1)
+	}
+
+	// ProviderConfig controller. Health checks and capacity reporting
+	if err = (&providerconfig.Reconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("providerconfig-controller"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ProviderConfig")
+		os.Exit(1)
+	}
+
+	// Admission webhooks
+	if enableWebhooks {
+		if err = (&webhook.TenantClusterValidator{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "TenantCluster")
+			os.Exit(1)
+		}
+		if err = (&webhook.NetworkPoolValidator{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "NetworkPool")
+			os.Exit(1)
+		}
+		if err = (&webhook.ProviderConfigValidator{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "ProviderConfig")
+			os.Exit(1)
+		}
+		setupLog.Info("admission webhooks enabled")
+	} else {
+		setupLog.Info("admission webhooks disabled")
+	}
+
 	// Kamaji integration controllers
 	if enableKamajiControllers {
 		// KamajiSecret controller. Translates kubeconfig format
@@ -194,7 +250,7 @@ func main() {
 	}
 
 	setupLog.Info("starting manager",
-		"controllers", []string{"ButlerConfig", "Team", "TenantCluster", "TenantAddon", "ManagementAddon", "KamajiSecret", "KamajiStatus"})
+		"controllers", []string{"ButlerConfig", "Team", "TenantCluster", "TenantAddon", "ManagementAddon", "NetworkPool", "IPAllocation", "ProviderConfig", "KamajiSecret", "KamajiStatus"})
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
