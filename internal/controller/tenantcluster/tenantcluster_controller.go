@@ -169,15 +169,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		// Don't fail the reconcile, just log - scaling is not critical path
 	}
 
-	// For Talos clusters, reconcile bootstrap config, apply-config to workers, and
-	// create talosconfig Secret for CLI access. This runs outside reconcileInfrastructure
-	// so it executes for Ready clusters too — workers may still be in maintenance mode
-	// even after the cluster reaches Ready phase.
+	// For Talos clusters, run apply-config and talosconfig as a safety net for Ready
+	// clusters (e.g. new workers from scaling). The primary apply-config happens in
+	// reconcileInfrastructure before addon installation.
 	if isTalosCluster(tc) {
 		if err := r.reconcileTalosBootstrap(ctx, tc, butlerConfig); err != nil {
 			logger.Error(err, "failed to reconcile Talos bootstrap")
 		}
-		if err := r.reconcileTalosApplyConfig(ctx, tc); err != nil {
+		if _, err := r.reconcileTalosApplyConfig(ctx, tc); err != nil {
 			logger.Error(err, "failed to apply Talos config to workers")
 		}
 		if err := r.reconcileTalosconfig(ctx, tc); err != nil {
@@ -329,6 +328,14 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 			metav1.ConditionFalse, ReasonInfraProvisioning, "Infrastructure cluster is provisioning")
 	}
 
+	if workersReady {
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionWorkersReady,
+			metav1.ConditionTrue, ReasonWorkersReady, "Workers are ready")
+	} else {
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionWorkersReady,
+			metav1.ConditionFalse, ReasonWorkersProvisioning, "Workers are provisioning")
+	}
+
 	if controlPlaneReady {
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionControlPlaneReady,
 			metav1.ConditionTrue, ReasonControlPlaneReady, "Control plane is ready")
@@ -336,20 +343,25 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 		// For Talos clusters, create the bootstrap Secret and apply config to workers
 		// as soon as CP is ready. Bootstrap MUST happen here because CAPI Machines
 		// reference the Secret via dataSecretName and block until it exists.
-		// Apply-config also runs here so workers get configured during provisioning
-		// (before addon installation), not after the cluster reaches Ready phase.
+		// Config must be applied BEFORE addon installation — workers need to leave
+		// maintenance mode and join the cluster before Cilium and other addons can
+		// schedule pods on them.
 		if isTalosCluster(tc) {
 			if err := r.reconcileTalosBootstrap(ctx, tc, butlerConfig); err != nil {
 				logger.Error(err, "failed to reconcile Talos bootstrap")
 			}
-			if err := r.reconcileTalosApplyConfig(ctx, tc); err != nil {
+			allApplied, err := r.reconcileTalosApplyConfig(ctx, tc)
+			if err != nil {
 				logger.Error(err, "failed to apply Talos config to workers")
+			}
+			if !allApplied {
+				logger.Info("waiting for Talos config to be applied to all workers before installing addons")
+				return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 			}
 		}
 
-		// Install addons as soon as control plane is accessible
-		// Don't wait for workers - Cilium has tolerations for not-ready nodes
-		// Skip installation if already ready
+		// Install addons after workers have config applied (Talos) or as soon as
+		// control plane is accessible (non-Talos). Skip if already ready.
 		if tc.Status.Phase == butlerv1alpha1.TenantClusterPhaseReady {
 			return ctrl.Result{}, nil
 		}
@@ -364,14 +376,6 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 	} else {
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionControlPlaneReady,
 			metav1.ConditionFalse, ReasonInfraProvisioning, "Control plane is provisioning")
-	}
-
-	if workersReady {
-		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionWorkersReady,
-			metav1.ConditionTrue, ReasonWorkersReady, "Workers are ready")
-	} else {
-		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionWorkersReady,
-			metav1.ConditionFalse, ReasonWorkersProvisioning, "Workers are provisioning")
 	}
 
 	if !infraReady || !controlPlaneReady || !workersReady {
@@ -1478,12 +1482,15 @@ func (r *Reconciler) getExposureIP(ctx context.Context, butlerConfig *butlerv1al
 // reconcileTalosApplyConfig applies Talos machine configs to CAPI Machines in maintenance mode.
 // It discovers Machine IPs, checks whether config was already applied (via annotation),
 // and runs talosctl apply-config --insecure for each unconfigured Machine.
-func (r *Reconciler) reconcileTalosApplyConfig(ctx context.Context, tc *butlerv1alpha1.TenantCluster) error {
+// reconcileTalosApplyConfig applies Talos machine config to CAPI Machines via talosctl.
+// Returns (allApplied, error) where allApplied is true when all Machines with IPs
+// have their config applied (or are already configured).
+func (r *Reconciler) reconcileTalosApplyConfig(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (bool, error) {
 	logger := log.FromContext(ctx)
 
 	tenantNS := tc.Status.TenantNamespace
 	if tenantNS == "" {
-		return nil
+		return false, nil
 	}
 
 	// Read bootstrap Secret to get the machine config
@@ -1491,34 +1498,35 @@ func (r *Reconciler) reconcileTalosApplyConfig(ctx context.Context, tc *butlerv1
 	bootstrapSecret := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: tenantNS}, bootstrapSecret); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil // Bootstrap Secret not ready yet
+			return false, nil // Bootstrap Secret not ready yet
 		}
-		return fmt.Errorf("failed to get bootstrap Secret: %w", err)
+		return false, fmt.Errorf("failed to get bootstrap Secret: %w", err)
 	}
 
 	machineConfig := bootstrapSecret.Data["value"]
 	if len(machineConfig) == 0 {
-		return fmt.Errorf("bootstrap Secret %s has empty machine config", secretName)
+		return false, fmt.Errorf("bootstrap Secret %s has empty machine config", secretName)
 	}
 
 	// Get CAPI Machine addresses
 	machines, err := talos.GetMachineAddresses(ctx, r.Client, tc.Name, tenantNS)
 	if err != nil {
-		return fmt.Errorf("getting Machine addresses: %w", err)
+		return false, fmt.Errorf("getting Machine addresses: %w", err)
 	}
 	if len(machines) == 0 {
-		logger.V(1).Info("no CAPI Machines with addresses found yet")
-		return nil
+		logger.Info("waiting for CAPI Machines to get IP addresses")
+		return false, nil
 	}
 
 	// Apply config to each Machine that hasn't been configured yet
 	talosClient := talos.NewClient()
-	var failCount int
+	var failCount, pendingCount int
 	for _, machine := range machines {
 		if machine.Annotations != nil && machine.Annotations["butler.butlerlabs.dev/talos-config-applied"] == "true" {
 			continue
 		}
 
+		pendingCount++
 		logger.Info("applying Talos config to Machine", "machine", machine.Name, "ip", machine.IP)
 		if err := talosClient.ApplyConfig(ctx, machine.IP, machineConfig); err != nil {
 			// "certificate required" means the node left maintenance mode and already has config.
@@ -1537,13 +1545,15 @@ func (r *Reconciler) reconcileTalosApplyConfig(ctx context.Context, tc *butlerv1
 		if err := r.annotateMachine(ctx, machine.Name, tenantNS); err != nil {
 			logger.Error(err, "failed to annotate Machine after config apply", "machine", machine.Name)
 		}
+		pendingCount--
 	}
 
 	if failCount > 0 && failCount == len(machines) {
-		return fmt.Errorf("failed to apply Talos config to all %d Machines", failCount)
+		return false, fmt.Errorf("failed to apply Talos config to all %d Machines", failCount)
 	}
 
-	return nil
+	allApplied := pendingCount == 0 && failCount == 0
+	return allApplied, nil
 }
 
 // annotateMachine adds the talos-config-applied annotation to a CAPI Machine.

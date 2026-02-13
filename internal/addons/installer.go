@@ -563,7 +563,7 @@ func (i *Installer) InstallTraefik(ctx context.Context, kubeconfig []byte, versi
 		"--set", "ingressClass.isDefaultClass=true",
 		"--set", "service.type=LoadBalancer",
 		"--wait",
-		"--timeout", "5m",
+		"--timeout", "2m",
 	}
 
 	if err := i.runHelm(ctx, kubeconfigPath, args...); err != nil {
