@@ -17,15 +17,19 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o ma
 # Final image with tools
 FROM alpine:3.21
 
-# Install kubectl and helm
+# Install kubectl, helm, and talosctl
 ARG KUBECTL_VERSION=v1.31.2
 ARG HELM_VERSION=v3.17.0
+ARG TALOS_VERSION=v1.9.3
 RUN apk add --no-cache ca-certificates curl bash && \
     curl -Lo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" && \
     chmod +x /usr/local/bin/kubectl && \
     curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" | tar xz && \
     mv linux-amd64/helm /usr/local/bin/helm && \
-    rm -rf linux-amd64
+    rm -rf linux-amd64 && \
+    curl -fsSL "https://github.com/siderolabs/talos/releases/download/${TALOS_VERSION}/talosctl-linux-amd64" \
+      -o /usr/local/bin/talosctl && \
+    chmod +x /usr/local/bin/talosctl
 
 # Create non-root user with writable home directory
 RUN adduser -D -u 65532 -h /home/nonroot nonroot && \
