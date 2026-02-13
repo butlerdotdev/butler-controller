@@ -1876,9 +1876,9 @@ func (r *Reconciler) reconcileTalosBootstrap(ctx context.Context, tc *butlerv1al
 		},
 	}
 
-	if err := ctrl.SetControllerReference(tc, bootstrapSecret, r.Scheme); err != nil {
-		return fmt.Errorf("failed to set owner reference on bootstrap Secret: %w", err)
-	}
+	// Skip owner reference — TC is in butler-tenants namespace but bootstrap Secret
+	// is in the tenant namespace. Cross-namespace owner refs are disallowed.
+	// Labels track ownership instead.
 
 	if err := r.Create(ctx, bootstrapSecret); err != nil {
 		if apierrors.IsAlreadyExists(err) {
