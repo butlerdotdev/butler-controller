@@ -1621,9 +1621,8 @@ func (r *Reconciler) reconcileTalosconfig(ctx context.Context, tc *butlerv1alpha
 		},
 	}
 
-	if err := ctrl.SetControllerReference(tc, secret, r.Scheme); err != nil {
-		return fmt.Errorf("setting owner reference: %w", err)
-	}
+	// Skip owner reference — TC is in a different namespace than the Secret.
+	// Labels track ownership instead.
 
 	if err := r.Create(ctx, secret); err != nil {
 		if apierrors.IsAlreadyExists(err) {
