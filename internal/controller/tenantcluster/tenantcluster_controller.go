@@ -169,6 +169,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		// Don't fail the reconcile, just log - scaling is not critical path
 	}
 
+	// For Talos clusters, reconcile bootstrap config and apply-config to workers.
+	// This runs outside reconcileInfrastructure so it executes for Ready clusters too —
+	// workers may still be in maintenance mode even after the cluster reaches Ready phase.
+	if isTalosCluster(tc) {
+		if err := r.reconcileTalosBootstrap(ctx, tc, butlerConfig); err != nil {
+			logger.Error(err, "failed to reconcile Talos bootstrap")
+		}
+		if err := r.reconcileTalosApplyConfig(ctx, tc); err != nil {
+			logger.Error(err, "failed to apply Talos config to workers")
+		}
+	}
+
 	tc.Status.ObservedGeneration = tc.Generation
 	if err := r.Status().Update(ctx, tc); err != nil {
 		return ctrl.Result{}, err
@@ -316,19 +328,6 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 	if controlPlaneReady {
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionControlPlaneReady,
 			metav1.ConditionTrue, ReasonControlPlaneReady, "Control plane is ready")
-
-		// For Talos clusters, generate bootstrap Secret after control plane is ready.
-		// This creates the Talos machine config and kubeadm bootstrap token needed
-		// for workers to join. CAPI's dataSecretName mechanism waits for this Secret.
-		if isTalosCluster(tc) {
-			if err := r.reconcileTalosBootstrap(ctx, tc, butlerConfig); err != nil {
-				logger.Error(err, "failed to reconcile Talos bootstrap")
-				// Don't fail — requeue and retry
-			}
-			if err := r.reconcileTalosApplyConfig(ctx, tc); err != nil {
-				logger.Error(err, "failed to apply Talos config to workers")
-			}
-		}
 
 		// Install addons as soon as control plane is accessible
 		// Don't wait for workers - Cilium has tolerations for not-ready nodes
