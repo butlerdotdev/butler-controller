@@ -333,12 +333,17 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionControlPlaneReady,
 			metav1.ConditionTrue, ReasonControlPlaneReady, "Control plane is ready")
 
-		// For Talos clusters, create the bootstrap Secret as soon as CP is ready.
-		// This MUST happen inside reconcileInfrastructure because CAPI Machines
-		// reference this Secret via dataSecretName and will block until it exists.
+		// For Talos clusters, create the bootstrap Secret and apply config to workers
+		// as soon as CP is ready. Bootstrap MUST happen here because CAPI Machines
+		// reference the Secret via dataSecretName and block until it exists.
+		// Apply-config also runs here so workers get configured during provisioning
+		// (before addon installation), not after the cluster reaches Ready phase.
 		if isTalosCluster(tc) {
 			if err := r.reconcileTalosBootstrap(ctx, tc, butlerConfig); err != nil {
 				logger.Error(err, "failed to reconcile Talos bootstrap")
+			}
+			if err := r.reconcileTalosApplyConfig(ctx, tc); err != nil {
+				logger.Error(err, "failed to apply Talos config to workers")
 			}
 		}
 
