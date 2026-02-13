@@ -333,6 +333,15 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionControlPlaneReady,
 			metav1.ConditionTrue, ReasonControlPlaneReady, "Control plane is ready")
 
+		// For Talos clusters, create the bootstrap Secret as soon as CP is ready.
+		// This MUST happen inside reconcileInfrastructure because CAPI Machines
+		// reference this Secret via dataSecretName and will block until it exists.
+		if isTalosCluster(tc) {
+			if err := r.reconcileTalosBootstrap(ctx, tc, butlerConfig); err != nil {
+				logger.Error(err, "failed to reconcile Talos bootstrap")
+			}
+		}
+
 		// Install addons as soon as control plane is accessible
 		// Don't wait for workers - Cilium has tolerations for not-ready nodes
 		// Skip installation if already ready
