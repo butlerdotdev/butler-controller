@@ -169,15 +169,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		// Don't fail the reconcile, just log - scaling is not critical path
 	}
 
-	// For Talos clusters, reconcile bootstrap config and apply-config to workers.
-	// This runs outside reconcileInfrastructure so it executes for Ready clusters too —
-	// workers may still be in maintenance mode even after the cluster reaches Ready phase.
+	// For Talos clusters, reconcile bootstrap config, apply-config to workers, and
+	// create talosconfig Secret for CLI access. This runs outside reconcileInfrastructure
+	// so it executes for Ready clusters too — workers may still be in maintenance mode
+	// even after the cluster reaches Ready phase.
 	if isTalosCluster(tc) {
 		if err := r.reconcileTalosBootstrap(ctx, tc, butlerConfig); err != nil {
 			logger.Error(err, "failed to reconcile Talos bootstrap")
 		}
 		if err := r.reconcileTalosApplyConfig(ctx, tc); err != nil {
 			logger.Error(err, "failed to apply Talos config to workers")
+		}
+		if err := r.reconcileTalosconfig(ctx, tc); err != nil {
+			logger.Error(err, "failed to create talosconfig Secret")
 		}
 	}
 
@@ -1503,9 +1507,16 @@ func (r *Reconciler) reconcileTalosApplyConfig(ctx context.Context, tc *butlerv1
 
 		logger.Info("applying Talos config to Machine", "machine", machine.Name, "ip", machine.IP)
 		if err := talosClient.ApplyConfig(ctx, machine.IP, machineConfig); err != nil {
-			logger.Error(err, "failed to apply Talos config", "machine", machine.Name, "ip", machine.IP)
-			failCount++
-			continue
+			// "certificate required" means the node left maintenance mode and already has config.
+			// Treat as success and annotate.
+			if strings.Contains(err.Error(), "certificate required") {
+				logger.Info("node already configured (requires TLS client cert), marking as applied",
+					"machine", machine.Name, "ip", machine.IP)
+			} else {
+				logger.Error(err, "failed to apply Talos config", "machine", machine.Name, "ip", machine.IP)
+				failCount++
+				continue
+			}
 		}
 
 		// Annotate the Machine to mark config as applied
@@ -1516,11 +1527,6 @@ func (r *Reconciler) reconcileTalosApplyConfig(ctx context.Context, tc *butlerv1
 
 	if failCount > 0 && failCount == len(machines) {
 		return fmt.Errorf("failed to apply Talos config to all %d Machines", failCount)
-	}
-
-	// Create talosconfig Secret for CLI access
-	if err := r.reconcileTalosconfig(ctx, tc); err != nil {
-		logger.Error(err, "failed to create talosconfig Secret")
 	}
 
 	return nil
