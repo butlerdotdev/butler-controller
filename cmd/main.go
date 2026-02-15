@@ -43,6 +43,7 @@ import (
 	"github.com/butlerdotdev/butler-controller/internal/controller/team"
 	"github.com/butlerdotdev/butler-controller/internal/controller/tenantaddon"
 	"github.com/butlerdotdev/butler-controller/internal/controller/tenantcluster"
+	"github.com/butlerdotdev/butler-controller/internal/controller/workspace"
 	"github.com/butlerdotdev/butler-controller/internal/webhook"
 )
 
@@ -197,6 +198,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Workspace controller. Manages cloud development environments in tenant clusters
+	if err = (&workspace.Reconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Workspace")
+		os.Exit(1)
+	}
+
 	// Admission webhooks
 	if enableWebhooks {
 		if err = (&webhook.TenantClusterValidator{}).SetupWebhookWithManager(mgr); err != nil {
@@ -250,7 +260,7 @@ func main() {
 	}
 
 	setupLog.Info("starting manager",
-		"controllers", []string{"ButlerConfig", "Team", "TenantCluster", "TenantAddon", "ManagementAddon", "NetworkPool", "IPAllocation", "ProviderConfig", "KamajiSecret", "KamajiStatus"})
+		"controllers", []string{"ButlerConfig", "Team", "TenantCluster", "TenantAddon", "ManagementAddon", "NetworkPool", "IPAllocation", "ProviderConfig", "Workspace", "KamajiSecret", "KamajiStatus"})
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
