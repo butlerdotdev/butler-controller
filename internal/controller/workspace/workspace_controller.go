@@ -23,6 +23,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -218,8 +219,8 @@ func (r *Reconciler) reconcileCreatePhase(ctx context.Context, ws *butlerv1alpha
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
 	}
 
-	// Copy Git credentials if specified
-	if ws.Spec.Repository != nil && ws.Spec.Repository.SecretRef != nil {
+	// Copy Git credentials if any repository has a secretRef
+	if hasGitCredentials(ws) {
 		if err := r.copyGitCredentials(ctx, tenantClient, ws); err != nil {
 			logger.Error(err, "failed to copy git credentials")
 			return ctrl.Result{RequeueAfter: requeueShort}, nil
@@ -643,7 +644,7 @@ func (r *Reconciler) handleDeletion(ctx context.Context, ws *butlerv1alpha1.Work
 	}
 
 	// Delete copied Git credentials
-	if ws.Spec.Repository != nil && ws.Spec.Repository.SecretRef != nil {
+	if hasGitCredentials(ws) {
 		gitSecretName := fmt.Sprintf("ws-%s-git-credentials", ws.Name)
 		if err := tenantClient.CoreV1().Secrets(workspacesNamespace).Delete(ctx, gitSecretName, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
 			logger.Error(err, "failed to delete git credentials secret")
@@ -836,12 +837,32 @@ func (r *Reconciler) ensureSSHKeysSecret(ctx context.Context, tenantClient kuber
 
 func (r *Reconciler) copyGitCredentials(ctx context.Context, tenantClient kubernetes.Interface,
 	ws *butlerv1alpha1.Workspace) error {
-	srcSecret := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      ws.Spec.Repository.SecretRef.Name,
-		Namespace: ws.Namespace,
-	}, srcSecret); err != nil {
-		return fmt.Errorf("failed to get git credentials secret %q: %w", ws.Spec.Repository.SecretRef.Name, err)
+	// Collect all secret refs from repositories
+	repos := resolveRepositories(ws)
+	mergedData := make(map[string][]byte)
+	var secretType corev1.SecretType
+
+	for _, repo := range repos {
+		if repo.SecretRef == nil {
+			continue
+		}
+		srcSecret := &corev1.Secret{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      repo.SecretRef.Name,
+			Namespace: ws.Namespace,
+		}, srcSecret); err != nil {
+			return fmt.Errorf("failed to get git credentials secret %q: %w", repo.SecretRef.Name, err)
+		}
+		for k, v := range srcSecret.Data {
+			mergedData[k] = v
+		}
+		if secretType == "" {
+			secretType = srcSecret.Type
+		}
+	}
+
+	if len(mergedData) == 0 {
+		return nil
 	}
 
 	dstSecret := &corev1.Secret{
@@ -852,8 +873,8 @@ func (r *Reconciler) copyGitCredentials(ctx context.Context, tenantClient kubern
 				butlerv1alpha1.LabelManagedBy: "butler",
 			},
 		},
-		Data: srcSecret.Data,
-		Type: srcSecret.Type,
+		Data: mergedData,
+		Type: secretType,
 	}
 
 	_, err := tenantClient.CoreV1().Secrets(workspacesNamespace).Create(ctx, dstSecret, metav1.CreateOptions{})
@@ -865,10 +886,15 @@ func (r *Reconciler) copyGitCredentials(ctx context.Context, tenantClient kubern
 
 func (r *Reconciler) ensurePVC(ctx context.Context, tenantClient kubernetes.Interface,
 	ws *butlerv1alpha1.Workspace, pvcName string) error {
-	storageSize := resource.MustParse("50Gi")
+	storageSize := resource.MustParse("10Gi")
 	if ws.Spec.StorageSize != nil {
 		storageSize = *ws.Spec.StorageSize
 	}
+
+	// Ensure a workspace-friendly StorageClass exists with 1 replica
+	// so workspace PVCs work on single-node tenant clusters.
+	scName := "longhorn-workspace"
+	r.ensureWorkspaceStorageClass(ctx, tenantClient, scName)
 
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
@@ -881,7 +907,8 @@ func (r *Reconciler) ensurePVC(ctx context.Context, tenantClient kubernetes.Inte
 			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			StorageClassName: &scName,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceStorage: storageSize,
@@ -896,6 +923,32 @@ func (r *Reconciler) ensurePVC(ctx context.Context, tenantClient kubernetes.Inte
 	}
 	return err
 }
+
+func (r *Reconciler) ensureWorkspaceStorageClass(ctx context.Context, tenantClient kubernetes.Interface, name string) {
+	_, err := tenantClient.StorageV1().StorageClasses().Get(ctx, name, metav1.GetOptions{})
+	if err == nil {
+		return // already exists
+	}
+	reclaimPolicy := corev1.PersistentVolumeReclaimDelete
+	sc := &storagev1.StorageClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+			Labels: map[string]string{
+				butlerv1alpha1.LabelManagedBy: "butler",
+			},
+		},
+		Provisioner:   "driver.longhorn.io",
+		ReclaimPolicy: &reclaimPolicy,
+		Parameters: map[string]string{
+			"numberOfReplicas": "1",
+			"staleReplicaTimeout": "30",
+		},
+		AllowVolumeExpansion: boolPtr(true),
+	}
+	tenantClient.StorageV1().StorageClasses().Create(ctx, sc, metav1.CreateOptions{})
+}
+
+func boolPtr(b bool) *bool { return &b }
 
 func (r *Reconciler) resolveEnvFrom(ctx context.Context, tenantClient kubernetes.Interface,
 	ws *butlerv1alpha1.Workspace) ([]corev1.EnvVar, error) {
@@ -971,32 +1024,38 @@ func (r *Reconciler) ensurePod(ctx context.Context, tenantClient kubernetes.Inte
 
 	sshSecretName := fmt.Sprintf("ws-%s-ssh-keys", ws.Name)
 
+	// Collect repositories from both spec.repository (single, legacy) and spec.repositories (multi).
+	repos := resolveRepositories(ws)
+
 	// Build init containers
 	var initContainers []corev1.Container
-	if ws.Spec.Repository != nil {
-		cloneCmd := fmt.Sprintf("git clone --branch %s %s /workspace/src", ws.Spec.Repository.Branch, ws.Spec.Repository.URL)
-		if ws.Spec.Repository.SecretRef != nil {
-			cloneCmd = fmt.Sprintf("GIT_SSH_COMMAND='ssh -i /git-credentials/ssh-privatekey -o StrictHostKeyChecking=no' %s", cloneCmd)
-			initContainers = append(initContainers, corev1.Container{
-				Name:    "git-clone",
-				Image:   ws.Spec.Image,
-				Command: []string{"/bin/sh", "-c", cloneCmd},
-				VolumeMounts: []corev1.VolumeMount{
-					{Name: "workspace", MountPath: "/workspace"},
-					{Name: "git-credentials", MountPath: "/git-credentials", ReadOnly: true},
-				},
-			})
-			// Add git-credentials volume to volumes list (handled below)
-		} else {
-			initContainers = append(initContainers, corev1.Container{
-				Name:    "git-clone",
-				Image:   ws.Spec.Image,
-				Command: []string{"/bin/sh", "-c", cloneCmd},
-				VolumeMounts: []corev1.VolumeMount{
-					{Name: "workspace", MountPath: "/workspace"},
-				},
+	if len(repos) > 0 {
+		hasGitCredentials := false
+		for _, repo := range repos {
+			if repo.SecretRef != nil {
+				hasGitCredentials = true
+				break
+			}
+		}
+
+		// Build a shell script that clones all repos and generates .code-workspace file
+		cloneScript := buildCloneScript(repos)
+
+		volumeMounts := []corev1.VolumeMount{
+			{Name: "workspace", MountPath: "/workspace"},
+		}
+		if hasGitCredentials {
+			volumeMounts = append(volumeMounts, corev1.VolumeMount{
+				Name: "git-credentials", MountPath: "/git-credentials", ReadOnly: true,
 			})
 		}
+
+		initContainers = append(initContainers, corev1.Container{
+			Name:         "git-clone",
+			Image:        ws.Spec.Image,
+			Command:      []string{"/bin/sh", "-c", cloneScript},
+			VolumeMounts: volumeMounts,
+		})
 	}
 
 	if ws.Spec.Dotfiles != nil {
@@ -1048,8 +1107,8 @@ func (r *Reconciler) ensurePod(ctx context.Context, tenantClient kubernetes.Inte
 		},
 	}
 
-	// Add git credentials volume if needed
-	if ws.Spec.Repository != nil && ws.Spec.Repository.SecretRef != nil {
+	// Add git credentials volume if any repo has a secretRef
+	if hasGitCredentials(ws) {
 		gitSecretName := fmt.Sprintf("ws-%s-git-credentials", ws.Name)
 		volumes = append(volumes, corev1.Volume{
 			Name: "git-credentials",
@@ -1078,6 +1137,8 @@ func (r *Reconciler) ensurePod(ctx context.Context, tenantClient kubernetes.Inte
 				{
 					Name:  "workspace",
 					Image: ws.Spec.Image,
+					Command: []string{"/bin/sh", "-c"},
+					Args:    []string{buildEntrypointScript(ws)},
 					Ports: []corev1.ContainerPort{
 						{
 							Name:          "ssh",
@@ -1088,8 +1149,8 @@ func (r *Reconciler) ensurePod(ctx context.Context, tenantClient kubernetes.Inte
 					Env: envVars,
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
-							corev1.ResourceCPU:    resource.MustParse(cpuStr),
-							corev1.ResourceMemory: resource.MustParse(memStr),
+							corev1.ResourceCPU:    resource.MustParse("250m"),
+							corev1.ResourceMemory: resource.MustParse("512Mi"),
 						},
 						Limits: corev1.ResourceList{
 							corev1.ResourceCPU:    resource.MustParse(cpuStr),
@@ -1098,16 +1159,14 @@ func (r *Reconciler) ensurePod(ctx context.Context, tenantClient kubernetes.Inte
 					},
 					VolumeMounts: []corev1.VolumeMount{
 						{Name: "workspace", MountPath: "/workspace"},
-						{Name: "ssh-keys", MountPath: "/home/dev/.ssh", ReadOnly: true},
+						{Name: "ssh-keys", MountPath: "/tmp/ssh-keys", ReadOnly: true},
 					},
 				},
 			},
 			Volumes:       volumes,
 			RestartPolicy: corev1.RestartPolicyAlways,
 			SecurityContext: &corev1.PodSecurityContext{
-				RunAsUser:  int64Ptr(1000),
-				RunAsGroup: int64Ptr(1000),
-				FSGroup:    int64Ptr(1000),
+				FSGroup: int64Ptr(1000),
 			},
 		},
 	}
@@ -1163,4 +1222,227 @@ func int32Ptr(i int32) *int32 {
 
 func int64Ptr(i int64) *int64 {
 	return &i
+}
+
+// resolveRepositories merges spec.repository (single, legacy) and spec.repositories (multi)
+// into a single list. If both are set, the single repo is prepended.
+func resolveRepositories(ws *butlerv1alpha1.Workspace) []butlerv1alpha1.WorkspaceRepository {
+	var repos []butlerv1alpha1.WorkspaceRepository
+	if ws.Spec.Repository != nil {
+		repos = append(repos, *ws.Spec.Repository)
+	}
+	repos = append(repos, ws.Spec.Repositories...)
+	return repos
+}
+
+// hasGitCredentials returns true if any repository in the workspace has a secretRef.
+func hasGitCredentials(ws *butlerv1alpha1.Workspace) bool {
+	for _, repo := range resolveRepositories(ws) {
+		if repo.SecretRef != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// repoNameFromURL extracts a directory name from a git URL.
+// "https://github.com/butlerdotdev/butler-api" → "butler-api"
+// "https://github.com/butlerdotdev/butler-api.git" → "butler-api"
+func repoNameFromURL(url string) string {
+	// Strip trailing .git
+	url = strings.TrimSuffix(url, ".git")
+	// Strip trailing slash
+	url = strings.TrimSuffix(url, "/")
+	// Get last path segment
+	idx := strings.LastIndex(url, "/")
+	if idx >= 0 && idx < len(url)-1 {
+		return url[idx+1:]
+	}
+	return url
+}
+
+// buildCloneScript generates a shell script that:
+// 1. Installs git if missing
+// 2. Clones each repository to its target directory
+// 3. Generates a .code-workspace file if multiple repos exist
+func buildCloneScript(repos []butlerv1alpha1.WorkspaceRepository) string {
+	var sb strings.Builder
+
+	// Install git if missing
+	sb.WriteString(`set -e
+if ! command -v git >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1
+  elif command -v apk >/dev/null 2>&1; then apk add --no-cache git >/dev/null 2>&1; fi
+fi
+`)
+
+	isMulti := len(repos) > 1
+
+	// Clone each repo
+	for _, repo := range repos {
+		name := repo.Name
+		if name == "" {
+			name = repoNameFromURL(repo.URL)
+		}
+		branch := repo.Branch
+		if branch == "" {
+			branch = "main"
+		}
+
+		var targetDir string
+		if isMulti {
+			// Multi-repo: each gets its own directory under /workspace/
+			targetDir = fmt.Sprintf("/workspace/%s", name)
+		} else {
+			// Single repo: clone to /workspace/src/ for backwards compat
+			targetDir = "/workspace/src"
+		}
+
+		cloneCmd := fmt.Sprintf("git clone --branch %s %s %s", branch, repo.URL, targetDir)
+		if repo.SecretRef != nil {
+			cloneCmd = fmt.Sprintf("GIT_SSH_COMMAND='ssh -i /git-credentials/ssh-privatekey -o StrictHostKeyChecking=no' %s", cloneCmd)
+		}
+		// Skip if already cloned (PVC persists across pod restarts)
+		// Use || true so a failed clone (e.g. private repo without credentials) doesn't kill the init container
+		sb.WriteString(fmt.Sprintf("if [ ! -d \"%s/.git\" ]; then %s || echo 'WARNING: failed to clone %s'; fi\n", targetDir, cloneCmd, repo.URL))
+	}
+
+	// Generate .code-workspace file for multi-repo setups
+	if isMulti {
+		sb.WriteString(`# Generate VS Code multi-root workspace file
+cat > /workspace/workspace.code-workspace << 'WSEOF'
+{
+  "folders": [
+`)
+		for i, repo := range repos {
+			name := repo.Name
+			if name == "" {
+				name = repoNameFromURL(repo.URL)
+			}
+			comma := ","
+			if i == len(repos)-1 {
+				comma = ""
+			}
+			sb.WriteString(fmt.Sprintf("    { \"path\": \"%s\" }%s\n", name, comma))
+		}
+		sb.WriteString(`  ],
+  "settings": {}
+}
+WSEOF
+`)
+	}
+
+	return sb.String()
+}
+
+// buildEntrypointScript generates the main container entrypoint that:
+// 1. Creates a dev user with uid 1000
+// 2. Installs sshd + neovim if not present
+// 3. Clones neovim config to ~/.config/nvim if specified
+// 4. Starts sshd on port 2222
+func buildEntrypointScript(ws *butlerv1alpha1.Workspace) string {
+	var sb strings.Builder
+
+	sb.WriteString(`set -e
+# Ensure a "dev" user exists with uid 1000
+if ! id dev >/dev/null 2>&1; then
+  EXISTING=$(getent passwd 1000 2>/dev/null | cut -d: -f1) || true
+  if [ -n "$EXISTING" ] && [ "$EXISTING" != "dev" ]; then
+    usermod -l dev "$EXISTING" 2>/dev/null || true
+    usermod -d /home/dev -m dev 2>/dev/null || true
+    groupmod -n dev "$EXISTING" 2>/dev/null || true
+  else
+    if command -v useradd >/dev/null 2>&1; then
+      useradd -m -s /bin/bash -u 1000 dev 2>/dev/null || true
+    elif command -v adduser >/dev/null 2>&1; then
+      adduser -D -s /bin/bash -u 1000 dev 2>/dev/null || true
+    fi
+  fi
+fi
+DEV_HOME=$(getent passwd dev 2>/dev/null | cut -d: -f6) || true
+[ -z "$DEV_HOME" ] && DEV_HOME="/home/dev"
+mkdir -p "$DEV_HOME"
+# Install packages
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get update -qq
+  command -v sshd >/dev/null 2>&1 || apt-get install -y -qq openssh-server >/dev/null 2>&1 || true
+  command -v git  >/dev/null 2>&1 || apt-get install -y -qq git >/dev/null 2>&1 || true
+  command -v curl >/dev/null 2>&1 || apt-get install -y -qq curl >/dev/null 2>&1 || true
+  command -v unzip >/dev/null 2>&1 || apt-get install -y -qq unzip >/dev/null 2>&1 || true
+  command -v cc >/dev/null 2>&1 || apt-get install -y -qq build-essential >/dev/null 2>&1 || true
+elif command -v apk >/dev/null 2>&1; then
+  command -v sshd >/dev/null 2>&1 || apk add --no-cache openssh-server >/dev/null 2>&1 || true
+  command -v git  >/dev/null 2>&1 || apk add --no-cache git >/dev/null 2>&1 || true
+  command -v curl >/dev/null 2>&1 || apk add --no-cache curl >/dev/null 2>&1 || true
+  command -v unzip >/dev/null 2>&1 || apk add --no-cache unzip >/dev/null 2>&1 || true
+  command -v cc >/dev/null 2>&1 || apk add --no-cache build-base >/dev/null 2>&1 || true
+fi
+# Install modern neovim from GitHub releases (package managers ship ancient versions)
+if ! command -v nvim >/dev/null 2>&1; then
+  NVIM_VER="v0.10.3"
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64)       NVIM_PKG="nvim-linux64";;
+    aarch64|arm64) NVIM_PKG="nvim-linux64";;
+    *) NVIM_PKG="";;
+  esac
+  if [ -n "$NVIM_PKG" ]; then
+    curl -fsSL "https://github.com/neovim/neovim/releases/download/${NVIM_VER}/${NVIM_PKG}.tar.gz" | tar xzf - -C /opt 2>/dev/null || true
+    if [ -x "/opt/${NVIM_PKG}/bin/nvim" ]; then
+      ln -sf "/opt/${NVIM_PKG}/bin/nvim" /usr/local/bin/nvim
+    fi
+  fi
+fi
+`)
+
+	// Setup neovim config if specified
+	if ws.Spec.EditorConfig != nil {
+		if ws.Spec.EditorConfig.NeovimConfigRepo != "" {
+			// Clone full config repo to ~/.config/nvim
+			sb.WriteString(fmt.Sprintf(`# Clone neovim config
+NVIM_DIR="$DEV_HOME/.config/nvim"
+if [ ! -d "$NVIM_DIR/.git" ]; then
+  mkdir -p "$DEV_HOME/.config"
+  git clone %s "$NVIM_DIR" || echo "WARNING: failed to clone neovim config"
+  chown -R 1000:1000 "$DEV_HOME/.config" 2>/dev/null || true
+fi
+`, ws.Spec.EditorConfig.NeovimConfigRepo))
+		} else if ws.Spec.EditorConfig.NeovimConfigArchive != "" {
+			// Extract base64-encoded tar.gz archive of full nvim config directory
+			sb.WriteString(fmt.Sprintf(`# Extract neovim config archive
+NVIM_DIR="$DEV_HOME/.config/nvim"
+if [ ! -d "$NVIM_DIR" ] || [ -z "$(ls -A "$NVIM_DIR" 2>/dev/null)" ]; then
+  mkdir -p "$NVIM_DIR"
+  echo '%s' | base64 -d | tar xzf - -C "$NVIM_DIR" 2>/dev/null || echo "WARNING: failed to extract neovim config archive"
+  chown -R 1000:1000 "$DEV_HOME/.config" 2>/dev/null || true
+fi
+`, ws.Spec.EditorConfig.NeovimConfigArchive))
+		} else if ws.Spec.EditorConfig.NeovimInitLua != "" {
+			// Write inline init.lua
+			sb.WriteString(fmt.Sprintf(`# Write inline neovim config
+NVIM_DIR="$DEV_HOME/.config/nvim"
+if [ ! -f "$NVIM_DIR/init.lua" ]; then
+  mkdir -p "$NVIM_DIR"
+  cat > "$NVIM_DIR/init.lua" << 'NVIMLUA'
+%s
+NVIMLUA
+  chown -R 1000:1000 "$DEV_HOME/.config" 2>/dev/null || true
+fi
+`, ws.Spec.EditorConfig.NeovimInitLua))
+		}
+	}
+
+	sb.WriteString(`# Setup SSH
+mkdir -p /run/sshd "$DEV_HOME/.ssh"
+if [ -f /tmp/ssh-keys/authorized_keys ]; then
+  cp /tmp/ssh-keys/authorized_keys "$DEV_HOME/.ssh/authorized_keys"
+  chmod 600 "$DEV_HOME/.ssh/authorized_keys"
+  chown -R 1000:1000 "$DEV_HOME/.ssh" 2>/dev/null || true
+fi
+if command -v sshd >/dev/null 2>&1; then
+  /usr/sbin/sshd -D -p 2222 -o AuthorizedKeysFile="$DEV_HOME/.ssh/authorized_keys" -o PasswordAuthentication=no &
+fi
+exec sleep infinity`)
+
+	return sb.String()
 }
