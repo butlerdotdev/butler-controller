@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -168,6 +169,104 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 					totalNodes, pc.Name, maxNodes,
 				),
 			))
+		}
+	}
+
+	// Enforce team-level CPU, Memory, and Storage quotas.
+	if tc.Spec.TeamRef != nil {
+		team := &butlerv1alpha1.Team{}
+		if err := v.Client.Get(ctx, types.NamespacedName{Name: tc.Spec.TeamRef.Name}, team); err == nil {
+			if limits := team.Spec.ResourceLimits; limits != nil {
+				// List existing clusters for resource accounting
+				var tcList butlerv1alpha1.TenantClusterList
+				if err := v.Client.List(ctx, &tcList, client.InNamespace(tc.Namespace)); err == nil {
+					mt := tc.Spec.Workers.MachineTemplate
+					replicas := tc.Spec.Workers.Replicas
+
+					// CPU quota check
+					if limits.MaxCPUCores != nil && !limits.MaxCPUCores.IsZero() {
+						requestedCPU := resource.NewQuantity(int64(mt.CPU)*int64(replicas), resource.DecimalSI)
+						currentCPU := resource.NewQuantity(0, resource.DecimalSI)
+						for i := range tcList.Items {
+							if tcList.Items[i].Name != tc.Name {
+								other := tcList.Items[i]
+								otherCPU := resource.NewQuantity(
+									int64(other.Spec.Workers.MachineTemplate.CPU)*int64(other.Spec.Workers.Replicas),
+									resource.DecimalSI,
+								)
+								currentCPU.Add(*otherCPU)
+							}
+						}
+						totalCPU := currentCPU.DeepCopy()
+						totalCPU.Add(*requestedCPU)
+						if totalCPU.Cmp(*limits.MaxCPUCores) > 0 {
+							allErrs = append(allErrs, field.Forbidden(
+								field.NewPath("spec", "workers"),
+								fmt.Sprintf(
+									"total CPU (%s) would exceed team %q CPU quota (%s)",
+									totalCPU.String(), team.Name, limits.MaxCPUCores.String(),
+								),
+							))
+						}
+					}
+
+					// Memory quota check
+					if limits.MaxMemory != nil && !limits.MaxMemory.IsZero() {
+						requestedMemory := resource.NewQuantity(0, resource.BinarySI)
+						for i := int32(0); i < replicas; i++ {
+							requestedMemory.Add(mt.Memory)
+						}
+						currentMemory := resource.NewQuantity(0, resource.BinarySI)
+						for i := range tcList.Items {
+							if tcList.Items[i].Name != tc.Name {
+								other := tcList.Items[i]
+								for j := int32(0); j < other.Spec.Workers.Replicas; j++ {
+									currentMemory.Add(other.Spec.Workers.MachineTemplate.Memory)
+								}
+							}
+						}
+						totalMemory := currentMemory.DeepCopy()
+						totalMemory.Add(*requestedMemory)
+						if totalMemory.Cmp(*limits.MaxMemory) > 0 {
+							allErrs = append(allErrs, field.Forbidden(
+								field.NewPath("spec", "workers"),
+								fmt.Sprintf(
+									"total memory (%s) would exceed team %q memory quota (%s)",
+									totalMemory.String(), team.Name, limits.MaxMemory.String(),
+								),
+							))
+						}
+					}
+
+					// Storage quota check
+					if limits.MaxStorage != nil && !limits.MaxStorage.IsZero() {
+						requestedStorage := resource.NewQuantity(0, resource.BinarySI)
+						for i := int32(0); i < replicas; i++ {
+							requestedStorage.Add(mt.DiskSize)
+						}
+						currentStorage := resource.NewQuantity(0, resource.BinarySI)
+						for i := range tcList.Items {
+							if tcList.Items[i].Name != tc.Name {
+								other := tcList.Items[i]
+								for j := int32(0); j < other.Spec.Workers.Replicas; j++ {
+									currentStorage.Add(other.Spec.Workers.MachineTemplate.DiskSize)
+								}
+							}
+						}
+						totalStorage := currentStorage.DeepCopy()
+						totalStorage.Add(*requestedStorage)
+						if totalStorage.Cmp(*limits.MaxStorage) > 0 {
+							allErrs = append(allErrs, field.Forbidden(
+								field.NewPath("spec", "workers"),
+								fmt.Sprintf(
+									"total storage (%s) would exceed team %q storage quota (%s)",
+									totalStorage.String(), team.Name, limits.MaxStorage.String(),
+								),
+							))
+						}
+					}
+				}
+			}
 		}
 	}
 

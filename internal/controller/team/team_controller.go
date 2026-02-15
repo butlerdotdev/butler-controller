@@ -25,6 +25,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -484,11 +485,43 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, team *butlerv1alpha1.T
 	team.Status.ClusterCount = clusterCount
 
 	// Calculate resource usage
-	resourceUsage, err := r.calculateResourceUsage(ctx, team.Name)
+	resourceUsage, err := r.calculateResourceUsage(ctx, team)
 	if err != nil {
 		return err
 	}
 	team.Status.ResourceUsage = resourceUsage
+
+	// Set QuotaExceeded condition based on utilization
+	quotaExceeded := false
+	if usage := resourceUsage; usage != nil {
+		if usage.ClusterUtilization != nil && *usage.ClusterUtilization >= 100 {
+			quotaExceeded = true
+		}
+		if usage.NodeUtilization != nil && *usage.NodeUtilization >= 100 {
+			quotaExceeded = true
+		}
+		if usage.CPUUtilization != nil && *usage.CPUUtilization >= 100 {
+			quotaExceeded = true
+		}
+		if usage.MemoryUtilization != nil && *usage.MemoryUtilization >= 100 {
+			quotaExceeded = true
+		}
+	}
+	if quotaExceeded {
+		meta.SetStatusCondition(&team.Status.Conditions, metav1.Condition{
+			Type:    butlerv1alpha1.TeamConditionQuotaExceeded,
+			Status:  metav1.ConditionTrue,
+			Reason:  "QuotaExceeded",
+			Message: "Team has exceeded one or more resource quotas",
+		})
+	} else {
+		meta.SetStatusCondition(&team.Status.Conditions, metav1.Condition{
+			Type:    butlerv1alpha1.TeamConditionQuotaExceeded,
+			Status:  metav1.ConditionFalse,
+			Reason:  "WithinQuota",
+			Message: "Team is within resource quotas",
+		})
+	}
 
 	// Update observed generation
 	team.Status.ObservedGeneration = team.Generation
@@ -528,9 +561,9 @@ func (r *Reconciler) countTenantClusters(ctx context.Context, namespace string) 
 }
 
 // calculateResourceUsage calculates the total resource usage for all TenantClusters.
-func (r *Reconciler) calculateResourceUsage(ctx context.Context, namespace string) (*butlerv1alpha1.TeamResourceUsage, error) {
+func (r *Reconciler) calculateResourceUsage(ctx context.Context, team *butlerv1alpha1.Team) (*butlerv1alpha1.TeamResourceUsage, error) {
 	clusterList := &butlerv1alpha1.TenantClusterList{}
-	if err := r.List(ctx, clusterList, client.InNamespace(namespace)); err != nil {
+	if err := r.List(ctx, clusterList, client.InNamespace(team.Name)); err != nil {
 		return nil, err
 	}
 
@@ -539,11 +572,67 @@ func (r *Reconciler) calculateResourceUsage(ctx context.Context, namespace strin
 	}
 
 	var totalWorkers int32
+	totalCPU := resource.NewQuantity(0, resource.DecimalSI)
+	totalMemory := resource.NewQuantity(0, resource.BinarySI)
+	totalStorage := resource.NewQuantity(0, resource.BinarySI)
+
 	for _, cluster := range clusterList.Items {
-		totalWorkers += cluster.Spec.Workers.Replicas
-		// TODO: Calculate CPU and Memory from MachineTemplate when needed
+		replicas := cluster.Spec.Workers.Replicas
+		totalWorkers += replicas
+
+		mt := cluster.Spec.Workers.MachineTemplate
+		// CPU: int32 cores * replicas
+		cpuPerCluster := resource.NewQuantity(int64(mt.CPU)*int64(replicas), resource.DecimalSI)
+		totalCPU.Add(*cpuPerCluster)
+
+		// Memory: resource.Quantity * replicas
+		if !mt.Memory.IsZero() {
+			memPerNode := mt.Memory.DeepCopy()
+			for i := int32(0); i < replicas; i++ {
+				totalMemory.Add(memPerNode)
+			}
+		}
+
+		// Storage: resource.Quantity * replicas
+		if !mt.DiskSize.IsZero() {
+			diskPerNode := mt.DiskSize.DeepCopy()
+			for i := int32(0); i < replicas; i++ {
+				totalStorage.Add(diskPerNode)
+			}
+		}
 	}
+
 	usage.TotalNodes = totalWorkers
+
+	if !totalCPU.IsZero() {
+		usage.TotalCPU = totalCPU
+	}
+	if !totalMemory.IsZero() {
+		usage.TotalMemory = totalMemory
+	}
+	if !totalStorage.IsZero() {
+		usage.TotalStorage = totalStorage
+	}
+
+	// Compute utilization percentages against TeamResourceLimits
+	if limits := team.Spec.ResourceLimits; limits != nil {
+		if limits.MaxClusters != nil && *limits.MaxClusters > 0 {
+			pct := int32(int64(usage.Clusters) * 100 / int64(*limits.MaxClusters))
+			usage.ClusterUtilization = &pct
+		}
+		if limits.MaxTotalNodes != nil && *limits.MaxTotalNodes > 0 {
+			pct := int32(int64(totalWorkers) * 100 / int64(*limits.MaxTotalNodes))
+			usage.NodeUtilization = &pct
+		}
+		if limits.MaxCPUCores != nil && !limits.MaxCPUCores.IsZero() && usage.TotalCPU != nil {
+			pct := int32(usage.TotalCPU.Value() * 100 / limits.MaxCPUCores.Value())
+			usage.CPUUtilization = &pct
+		}
+		if limits.MaxMemory != nil && !limits.MaxMemory.IsZero() && usage.TotalMemory != nil {
+			pct := int32(usage.TotalMemory.Value() * 100 / limits.MaxMemory.Value())
+			usage.MemoryUtilization = &pct
+		}
+	}
 
 	return usage, nil
 }

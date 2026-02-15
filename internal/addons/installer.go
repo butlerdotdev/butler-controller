@@ -528,6 +528,60 @@ spec:
 	return nil
 }
 
+// UpdateMetalLBPool updates the MetalLB IPAddressPool with the given address ranges.
+// This is used by elastic IPAM to configure multiple address ranges.
+func (i *Installer) UpdateMetalLBPool(ctx context.Context, kubeconfig []byte, ranges []string) error {
+	logger := log.FromContext(ctx)
+
+	kubeconfigPath, cleanup, err := i.writeKubeconfig(kubeconfig)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	// Build addresses YAML list
+	var addressLines string
+	for _, r := range ranges {
+		addressLines += fmt.Sprintf("    - %s\n", r)
+	}
+
+	poolManifest := fmt.Sprintf(`apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: default-pool
+  namespace: metallb-system
+spec:
+  addresses:
+%s---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: default
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - default-pool
+`, addressLines)
+
+	tmpFile, err := os.CreateTemp("", "metallb-pool-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(poolManifest); err != nil {
+		return fmt.Errorf("failed to write pool manifest: %w", err)
+	}
+	tmpFile.Close()
+
+	if err := i.runKubectl(ctx, kubeconfigPath, "apply", "-f", tmpFile.Name()); err != nil {
+		return fmt.Errorf("failed to apply MetalLB pool: %w", err)
+	}
+
+	logger.Info("updated MetalLB IP pool", "ranges", ranges)
+	return nil
+}
+
 // InstallTraefik installs Traefik ingress controller.
 func (i *Installer) InstallTraefik(ctx context.Context, kubeconfig []byte, version string) error {
 	logger := log.FromContext(ctx)
