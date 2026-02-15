@@ -51,6 +51,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=networkpools/finalizers,verbs=update
 // +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=ipallocations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=ipallocations/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=tenantclusters,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -103,6 +104,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		client.MatchingFields{"spec.poolRef.name": pool.Name},
 	); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// Garbage collect orphaned allocations (TenantCluster deleted but allocation remains)
+	if gcCount := r.gcOrphanedAllocations(ctx, pool, allocList); gcCount > 0 {
+		logger.Info("garbage collected orphaned allocations", "count", gcCount)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	// Process pending allocations (FIFO by creation timestamp)
@@ -413,6 +420,53 @@ func (r *Reconciler) updatePoolStatus(ctx context.Context, pool *butlerv1alpha1.
 	}
 
 	return r.Status().Update(ctx, pool)
+}
+
+// gcOrphanedAllocations deletes IPAllocations whose tenantClusterRef points
+// to a TenantCluster that no longer exists. Returns the number of allocations deleted.
+func (r *Reconciler) gcOrphanedAllocations(ctx context.Context, pool *butlerv1alpha1.NetworkPool, allocList *butlerv1alpha1.IPAllocationList) int {
+	logger := log.FromContext(ctx)
+	deleted := 0
+
+	for i := range allocList.Items {
+		alloc := &allocList.Items[i]
+
+		// Only GC allocated entries — pending/failed are transient
+		if alloc.Status.Phase != butlerv1alpha1.IPAllocationPhaseAllocated {
+			continue
+		}
+
+		// Skip allocations without a tenant cluster ref
+		ref := alloc.Spec.TenantClusterRef
+		if ref.Name == "" || ref.Namespace == "" {
+			continue
+		}
+
+		// Check if the referenced TenantCluster still exists
+		tc := &butlerv1alpha1.TenantCluster{}
+		err := r.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: ref.Namespace}, tc)
+		if err == nil {
+			continue // TC exists, allocation is valid
+		}
+		if !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to check TenantCluster existence", "name", ref.Name, "namespace", ref.Namespace)
+			continue
+		}
+
+		// TenantCluster is gone — delete the orphaned allocation
+		logger.Info("garbage collecting orphaned IPAllocation",
+			"allocation", alloc.Name, "tenant", ref.Name, "namespace", ref.Namespace)
+		if err := r.Delete(ctx, alloc); err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to delete orphaned IPAllocation", "name", alloc.Name)
+			continue
+		}
+		r.Recorder.Eventf(pool, "Normal", "OrphanedAllocationGC",
+			"Garbage collected IPAllocation %s (TenantCluster %s/%s no longer exists)",
+			alloc.Name, ref.Namespace, ref.Name)
+		deleted++
+	}
+
+	return deleted
 }
 
 // SetupWithManager sets up the controller with the Manager.
