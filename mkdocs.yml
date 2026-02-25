@@ -1,0 +1,19 @@
+site_name: Butler Controller
+docs_dir: docs
+nav:
+  - Home: index.md
+  - Architecture:
+    - Overview: architecture/ARCHITECTURE.md
+    - ADR-001 Monotonic Addon Installation: architecture/ADR-001-monotonic-addon-installation.md
+    - ADR-002 Multi-Tenancy Modes: architecture/ADR-002-multi-tenancy-modes.md
+    - ADR-003 Team Namespace Model: architecture/ADR-003-team-namespace-model.md
+    - ADR-004 Hosted Control Planes: architecture/ADR-004-kamaji-hosted-control-planes.md
+    - ADR-005 Integration Controllers: architecture/ADR-005-kamaji-integration-controllers.md
+    - ADR-006 Tiered Status Refresh: architecture/ADR-006-tiered-status-refresh.md
+    - ADR-007 Hybrid Addon Management: architecture/ADR-007-hybrid-addon-management.md
+    - ADR-008 Enterprise Networking IPAM: architecture/ADR-008-enterprise-networking-ipam.md
+    - ADR-009 Immutable OS Support: architecture/ADR-009-immutable-os-worker-support.md
+  - Research:
+    - Immutable OS Testing: research/immutable-os-litmus-test.md
+plugins:
+  - search
