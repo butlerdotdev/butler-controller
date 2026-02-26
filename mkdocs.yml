@@ -12,8 +12,5 @@ nav:
     - ADR-006 Tiered Status Refresh: architecture/ADR-006-tiered-status-refresh.md
     - ADR-007 Hybrid Addon Management: architecture/ADR-007-hybrid-addon-management.md
     - ADR-008 Enterprise Networking IPAM: architecture/ADR-008-enterprise-networking-ipam.md
-    - ADR-009 Immutable OS Support: architecture/ADR-009-immutable-os-worker-support.md
-  - Research:
-    - Immutable OS Testing: research/immutable-os-litmus-test.md
 plugins:
   - search
