@@ -54,6 +54,7 @@ type ChartInstallOptions struct {
 	Namespace   string            // e.g., "velero"
 	Version     string            // e.g., "7.2.1"
 	Values      map[string]string // Optional helm --set values
+	ValuesJSON  []byte            // Optional JSON values written to temp file and passed via --values
 	Timeout     string            // Optional, defaults to "10m"
 }
 
@@ -673,6 +674,21 @@ func (i *Installer) InstallChart(ctx context.Context, kubeconfig []byte, opts Ch
 		"--version", opts.Version,
 		"--wait",
 		"--timeout", timeout,
+	}
+
+	// Add JSON values file if provided
+	if len(opts.ValuesJSON) > 0 {
+		valuesFile, err := os.CreateTemp("", "helm-values-*.json")
+		if err != nil {
+			return fmt.Errorf("failed to create values file: %w", err)
+		}
+		defer os.Remove(valuesFile.Name())
+		if _, err := valuesFile.Write(opts.ValuesJSON); err != nil {
+			valuesFile.Close()
+			return fmt.Errorf("failed to write values file: %w", err)
+		}
+		valuesFile.Close()
+		args = append(args, "--values", valuesFile.Name())
 	}
 
 	// Add any custom values

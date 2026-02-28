@@ -18,6 +18,7 @@ package tenantaddon
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -152,6 +153,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		"namespace", addonDef.GetNamespace(),
 		"release", addonDef.GetReleaseName())
 
+	// Merge AddonDefinition defaults with TenantAddon spec values (spec overrides defaults)
+	mergedValues, err := mergeValues(addonDef.Spec.Defaults.Values, addon.Spec.Values)
+	if err != nil {
+		logger.Error(err, "failed to merge values")
+		return r.setFailedStatus(ctx, req, ReasonInstallFailed, "failed to merge values: "+err.Error())
+	}
+
 	if err := r.Installer.InstallChart(ctx, kubeconfig, addons.ChartInstallOptions{
 		RepoName:    "butler-" + addon.Spec.Addon,
 		RepoURL:     addonDef.Spec.Chart.Repository,
@@ -159,7 +167,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		ReleaseName: addonDef.GetReleaseName(),
 		Namespace:   addonDef.GetNamespace(),
 		Version:     version,
-		Values:      nil, // TODO: merge addon.Spec.Values with addonDef.Spec.Defaults.Values
+		ValuesJSON:  mergedValues,
 	}); err != nil {
 		logger.Error(err, "failed to install addon")
 		return r.setFailedStatus(ctx, req, ReasonInstallFailed, err.Error())
@@ -373,6 +381,46 @@ func (r *Reconciler) setPendingStatus(ctx context.Context, req ctrl.Request, rea
 	}
 
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+
+// mergeValues merges AddonDefinition default values with TenantAddon spec values.
+// Spec values take precedence over defaults via deep merge.
+func mergeValues(defaults, overrides *butlerv1alpha1.ExtensionValues) ([]byte, error) {
+	defaultMap, err := defaults.ToMap()
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse default values: %w", err)
+	}
+	overrideMap, err := overrides.ToMap()
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse override values: %w", err)
+	}
+
+	if defaultMap == nil && overrideMap == nil {
+		return nil, nil
+	}
+
+	merged := make(map[string]interface{})
+	for k, v := range defaultMap {
+		merged[k] = v
+	}
+	deepMerge(merged, overrideMap)
+
+	return json.Marshal(merged)
+}
+
+// deepMerge recursively merges src into dst. src values override dst.
+func deepMerge(dst, src map[string]interface{}) {
+	for k, srcVal := range src {
+		if dstVal, exists := dst[k]; exists {
+			srcMap, srcOk := srcVal.(map[string]interface{})
+			dstMap, dstOk := dstVal.(map[string]interface{})
+			if srcOk && dstOk {
+				deepMerge(dstMap, srcMap)
+				continue
+			}
+		}
+		dst[k] = srcVal
+	}
 }
 
 // SetupWithManager sets up the controller with the Manager.
