@@ -21,7 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"gopkg.in/yaml.v3"
-	"net/url"
+
 	"strings"
 	"time"
 
@@ -687,16 +687,11 @@ func buildVectorAgentValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig
 		return nil
 	}
 
-	host := pipeline.LogEndpoint
-	if u, err := url.Parse(pipeline.LogEndpoint); err == nil && u.Hostname() != "" {
-		host = u.Hostname()
-	}
-
 	values := map[string]interface{}{
 		"customConfig": map[string]interface{}{
 			"sinks": map[string]interface{}{
 				"aggregator": map[string]interface{}{
-					"address": fmt.Sprintf("%s:6000", host),
+					"uri": pipeline.LogEndpoint,
 				},
 			},
 		},
