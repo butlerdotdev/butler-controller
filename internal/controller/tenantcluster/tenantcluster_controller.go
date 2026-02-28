@@ -643,10 +643,11 @@ func (r *Reconciler) ensureAutoEnrolledAddon(ctx context.Context, tc *butlerv1al
 			Name:      addonName,
 			Namespace: tc.Namespace,
 			Labels: map[string]string{
-				butlerv1alpha1.LabelManagedBy:         "butler",
-				butlerv1alpha1.LabelTeam:              tc.Labels[butlerv1alpha1.LabelTeam],
-				butlerv1alpha1.LabelTenant:            tc.Name,
-				"butler.butlerlabs.dev/auto-enrolled": "true",
+				butlerv1alpha1.LabelManagedBy:              "butler",
+				butlerv1alpha1.LabelTeam:                   tc.Labels[butlerv1alpha1.LabelTeam],
+				"butler.butlerlabs.dev/cluster":            tc.Name,
+				"butler.butlerlabs.dev/addon-definition":   addonDefName,
+				"butler.butlerlabs.dev/auto-enrolled":      "true",
 			},
 		},
 		Spec: butlerv1alpha1.TenantAddonSpec{
