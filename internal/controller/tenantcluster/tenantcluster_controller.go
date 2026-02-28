@@ -179,6 +179,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		// Don't fail the reconcile, just log - scaling is not critical path
 	}
 
+	// Detect and apply machineTemplate changes (CPU/memory/disk)
+	// Creates a new immutable template and updates MachineDeployment for rolling update
+	if err := r.reconcileMachineTemplate(ctx, tc); err != nil {
+		logger.Error(err, "failed to reconcile MachineTemplate")
+	}
+
 	// Elastic IPAM: grow/shrink LB IP allocations for Ready clusters
 	if err := r.reconcileElasticIPAM(ctx, tc, butlerConfig); err != nil {
 		logger.Error(err, "elastic IPAM reconciliation failed")
@@ -1001,6 +1007,197 @@ func (r *Reconciler) reconcileMachineDeploymentReplicas(ctx context.Context, tc 
 	logger.Info("MachineDeployment scaled successfully",
 		"name", mdName,
 		"replicas", desiredReplicas)
+
+	return nil
+}
+
+// reconcileMachineTemplate detects CPU/memory/disk changes in the TenantCluster spec
+// and performs a rolling update by creating a new immutable MachineTemplate and updating
+// the MachineDeployment's infrastructureRef to point to it.
+func (r *Reconciler) reconcileMachineTemplate(ctx context.Context, tc *butlerv1alpha1.TenantCluster) error {
+	logger := log.FromContext(ctx)
+
+	if tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseReady &&
+		tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseInstalling {
+		return nil
+	}
+	if tc.Status.TenantNamespace == "" {
+		return nil
+	}
+
+	// Get the MachineDeployment
+	mdName := fmt.Sprintf("%s-workers", tc.Name)
+	md := &unstructured.Unstructured{}
+	md.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   capi.ClusterAPIGroup,
+		Version: capi.ClusterAPIVersion,
+		Kind:    "MachineDeployment",
+	})
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: tc.Status.TenantNamespace,
+		Name:      mdName,
+	}, md); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get MachineDeployment: %w", err)
+	}
+
+	// Get current infrastructureRef from MachineDeployment
+	infraRefName, _, _ := unstructured.NestedString(md.Object,
+		"spec", "template", "spec", "infrastructureRef", "name")
+	infraRefKind, _, _ := unstructured.NestedString(md.Object,
+		"spec", "template", "spec", "infrastructureRef", "kind")
+	infraRefAPIVersion, _, _ := unstructured.NestedString(md.Object,
+		"spec", "template", "spec", "infrastructureRef", "apiVersion")
+	if infraRefName == "" || infraRefKind == "" {
+		return nil
+	}
+
+	// Get the current MachineTemplate
+	currentTmpl := &unstructured.Unstructured{}
+	currentTmpl.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   capi.InfrastructureAPIGroup,
+		Version: strings.TrimPrefix(infraRefAPIVersion, capi.InfrastructureAPIGroup+"/"),
+		Kind:    infraRefKind,
+	})
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: tc.Status.TenantNamespace,
+		Name:      infraRefName,
+	}, currentTmpl); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get current MachineTemplate: %w", err)
+	}
+
+	// Extract current specs from the template based on provider type
+	var currentCPU int64
+	var currentMemory string
+
+	if infraRefKind == "KubevirtMachineTemplate" {
+		currentCPU, _, _ = unstructured.NestedInt64(currentTmpl.Object,
+			"spec", "template", "spec", "virtualMachineTemplate", "spec",
+			"template", "spec", "domain", "cpu", "cores")
+		currentMemory, _, _ = unstructured.NestedString(currentTmpl.Object,
+			"spec", "template", "spec", "virtualMachineTemplate", "spec",
+			"template", "spec", "domain", "resources", "requests", "memory")
+	} else {
+		// Nutanix or other providers — skip for now
+		return nil
+	}
+
+	// Compute desired specs from TenantCluster
+	desiredCPU := int64(tc.Spec.Workers.MachineTemplate.CPU)
+	if desiredCPU < 1 {
+		desiredCPU = 2 // default
+	}
+	desiredMemory := "4Gi" // default
+	if !tc.Spec.Workers.MachineTemplate.Memory.IsZero() {
+		memBytes := tc.Spec.Workers.MachineTemplate.Memory.Value()
+		memGi := memBytes / (1024 * 1024 * 1024)
+		if memGi > 0 {
+			desiredMemory = fmt.Sprintf("%dGi", memGi)
+		} else {
+			memMi := memBytes / (1024 * 1024)
+			desiredMemory = fmt.Sprintf("%dMi", memMi)
+		}
+	}
+
+	// Compare — if no change, nothing to do
+	if currentCPU == desiredCPU && currentMemory == desiredMemory {
+		return nil
+	}
+
+	logger.Info("machine template change detected",
+		"cluster", tc.Name,
+		"currentCPU", currentCPU, "desiredCPU", desiredCPU,
+		"currentMemory", currentMemory, "desiredMemory", desiredMemory)
+
+	// Determine new template name — increment version suffix
+	newName := infraRefName + "-v2"
+	// Check if -v2 already exists, if so try -v3, etc.
+	for i := 2; i <= 20; i++ {
+		candidate := fmt.Sprintf("%s-worker-v%d", tc.Name, i)
+		check := &unstructured.Unstructured{}
+		check.SetGroupVersionKind(currentTmpl.GroupVersionKind())
+		err := r.Get(ctx, types.NamespacedName{
+			Namespace: tc.Status.TenantNamespace,
+			Name:      candidate,
+		}, check)
+		if apierrors.IsNotFound(err) {
+			newName = candidate
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to check template name %s: %w", candidate, err)
+		}
+		// Already exists — check if MachineDeployment already points to it
+		if infraRefName == candidate {
+			// Already using this one, need next version
+			continue
+		}
+	}
+
+	// Deep copy the current template and update specs
+	newTmpl := currentTmpl.DeepCopy()
+	newTmpl.SetName(newName)
+	newTmpl.SetResourceVersion("")
+	newTmpl.SetUID("")
+	newTmpl.SetCreationTimestamp(metav1.Time{})
+	// Remove managedFields to avoid conflicts
+	newTmpl.SetManagedFields(nil)
+
+	if infraRefKind == "KubevirtMachineTemplate" {
+		// Update CPU cores
+		if err := unstructured.SetNestedField(newTmpl.Object, desiredCPU,
+			"spec", "template", "spec", "virtualMachineTemplate", "spec",
+			"template", "spec", "domain", "cpu", "cores"); err != nil {
+			return fmt.Errorf("failed to set CPU cores: %w", err)
+		}
+		// Update memory requests
+		if err := unstructured.SetNestedField(newTmpl.Object, desiredMemory,
+			"spec", "template", "spec", "virtualMachineTemplate", "spec",
+			"template", "spec", "domain", "resources", "requests", "memory"); err != nil {
+			return fmt.Errorf("failed to set memory requests: %w", err)
+		}
+		// Update memory limits
+		if err := unstructured.SetNestedField(newTmpl.Object, desiredMemory,
+			"spec", "template", "spec", "virtualMachineTemplate", "spec",
+			"template", "spec", "domain", "resources", "limits", "memory"); err != nil {
+			return fmt.Errorf("failed to set memory limits: %w", err)
+		}
+		// Update CPU limits
+		if err := unstructured.SetNestedField(newTmpl.Object, fmt.Sprintf("%d", desiredCPU),
+			"spec", "template", "spec", "virtualMachineTemplate", "spec",
+			"template", "spec", "domain", "resources", "limits", "cpu"); err != nil {
+			return fmt.Errorf("failed to set CPU limits: %w", err)
+		}
+	}
+
+	// Create the new template
+	if err := r.Create(ctx, newTmpl); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			// Race condition — already created, just update MD
+		} else {
+			return fmt.Errorf("failed to create new MachineTemplate %s: %w", newName, err)
+		}
+	} else {
+		logger.Info("created new MachineTemplate",
+			"name", newName,
+			"cpu", desiredCPU,
+			"memory", desiredMemory)
+	}
+
+	// Update MachineDeployment to point to the new template
+	patch := []byte(fmt.Sprintf(`{"spec":{"template":{"spec":{"infrastructureRef":{"name":"%s"}}}}}`, newName))
+	if err := r.Patch(ctx, md, client.RawPatch(types.MergePatchType, patch)); err != nil {
+		return fmt.Errorf("failed to update MachineDeployment infrastructureRef: %w", err)
+	}
+
+	logger.Info("updated MachineDeployment to new MachineTemplate",
+		"machineDeployment", mdName,
+		"newTemplate", newName)
 
 	return nil
 }
