@@ -18,8 +18,10 @@ package tenantcluster
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"gopkg.in/yaml.v3"
+	"net/url"
 	"strings"
 	"time"
 
@@ -77,6 +79,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=teams,verbs=get;list;watch
 // +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=butlerconfigs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=providerconfigs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=tenantaddons,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;delete
@@ -160,6 +163,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			return ctrl.Result{}, err
 		}
 		return result, nil
+	}
+
+	// Auto-enroll observability agents for Ready clusters
+	if tc.Status.Phase == butlerv1alpha1.TenantClusterPhaseReady {
+		if err := r.reconcileAutoEnrollObservability(ctx, tc, butlerConfig); err != nil {
+			logger.Error(err, "failed to auto-enroll observability agents")
+		}
 	}
 
 	// Sync MachineDeployment replicas for Ready clusters
@@ -564,6 +574,181 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 	logger.Info("TenantCluster is ready", "name", tc.Name)
 
 	return ctrl.Result{}, nil
+}
+
+// reconcileAutoEnrollObservability creates TenantAddon resources for observability
+// agents when autoEnroll is enabled in ButlerConfig and a pipeline is configured.
+// Each agent (vector, prometheus, otel) is independently controlled.
+func (r *Reconciler) reconcileAutoEnrollObservability(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) error {
+	logger := log.FromContext(ctx)
+
+	if butlerConfig == nil || butlerConfig.Spec.Observability == nil {
+		return nil
+	}
+
+	obs := butlerConfig.Spec.Observability
+	if obs.Collection == nil || obs.Collection.AutoEnroll == nil {
+		return nil
+	}
+
+	if obs.Pipeline == nil || obs.Pipeline.ClusterRef == nil {
+		return nil
+	}
+
+	// Don't install agents on the pipeline cluster itself
+	pipeRef := obs.Pipeline.ClusterRef
+	if pipeRef.Name == tc.Name && pipeRef.Namespace == tc.Namespace {
+		return nil
+	}
+
+	enroll := obs.Collection.AutoEnroll
+
+	if enroll.VectorAgent && obs.Pipeline.LogEndpoint != "" {
+		if err := r.ensureAutoEnrolledAddon(ctx, tc, "vector-agent", buildVectorAgentValues(obs.Pipeline)); err != nil {
+			logger.Error(err, "failed to auto-enroll vector-agent")
+		}
+	}
+
+	if enroll.Prometheus && obs.Pipeline.MetricEndpoint != "" {
+		if err := r.ensureAutoEnrolledAddon(ctx, tc, "prometheus-operator", buildPrometheusValues(obs.Pipeline)); err != nil {
+			logger.Error(err, "failed to auto-enroll prometheus-operator")
+		}
+	}
+
+	if enroll.OtelCollector && obs.Pipeline.TraceEndpoint != "" {
+		if err := r.ensureAutoEnrolledAddon(ctx, tc, "otel-collector", buildOtelCollectorValues(obs.Pipeline)); err != nil {
+			logger.Error(err, "failed to auto-enroll otel-collector")
+		}
+	}
+
+	return nil
+}
+
+// ensureAutoEnrolledAddon creates a TenantAddon if it doesn't already exist.
+func (r *Reconciler) ensureAutoEnrolledAddon(ctx context.Context, tc *butlerv1alpha1.TenantCluster, addonDefName string, values *butlerv1alpha1.ExtensionValues) error {
+	logger := log.FromContext(ctx)
+	addonName := fmt.Sprintf("%s-%s", tc.Name, addonDefName)
+
+	existing := &butlerv1alpha1.TenantAddon{}
+	err := r.Get(ctx, client.ObjectKey{Name: addonName, Namespace: tc.Namespace}, existing)
+	if err == nil {
+		return nil // already exists
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to check TenantAddon %s: %w", addonName, err)
+	}
+
+	addon := &butlerv1alpha1.TenantAddon{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      addonName,
+			Namespace: tc.Namespace,
+			Labels: map[string]string{
+				butlerv1alpha1.LabelManagedBy:         "butler",
+				butlerv1alpha1.LabelTeam:              tc.Labels[butlerv1alpha1.LabelTeam],
+				butlerv1alpha1.LabelTenant:            tc.Name,
+				"butler.butlerlabs.dev/auto-enrolled": "true",
+			},
+		},
+		Spec: butlerv1alpha1.TenantAddonSpec{
+			ClusterRef: butlerv1alpha1.LocalObjectReference{Name: tc.Name},
+			Addon:      addonDefName,
+			Version:    "", // use AddonDefinition default
+			Values:     values,
+		},
+	}
+
+	if err := controllerutil.SetControllerReference(tc, addon, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set owner reference: %w", err)
+	}
+
+	logger.Info("auto-enrolling observability addon",
+		"addon", addonName, "cluster", tc.Name)
+
+	if err := r.Create(ctx, addon); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to create TenantAddon %s: %w", addonName, err)
+	}
+
+	return nil
+}
+
+// buildVectorAgentValues configures the vector-agent sink to forward to the pipeline aggregator.
+func buildVectorAgentValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig) *butlerv1alpha1.ExtensionValues {
+	if pipeline == nil || pipeline.LogEndpoint == "" {
+		return nil
+	}
+
+	host := pipeline.LogEndpoint
+	if u, err := url.Parse(pipeline.LogEndpoint); err == nil && u.Hostname() != "" {
+		host = u.Hostname()
+	}
+
+	values := map[string]interface{}{
+		"customConfig": map[string]interface{}{
+			"sinks": map[string]interface{}{
+				"aggregator": map[string]interface{}{
+					"address": fmt.Sprintf("%s:6000", host),
+				},
+			},
+		},
+	}
+
+	raw, err := json.Marshal(values)
+	if err != nil {
+		return nil
+	}
+	return &butlerv1alpha1.ExtensionValues{Raw: raw}
+}
+
+// buildPrometheusValues configures remote-write to the pipeline metric endpoint.
+func buildPrometheusValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig) *butlerv1alpha1.ExtensionValues {
+	if pipeline == nil || pipeline.MetricEndpoint == "" {
+		return nil
+	}
+
+	values := map[string]interface{}{
+		"prometheus": map[string]interface{}{
+			"prometheusSpec": map[string]interface{}{
+				"remoteWrite": []map[string]interface{}{
+					{"url": pipeline.MetricEndpoint},
+				},
+			},
+		},
+	}
+
+	raw, err := json.Marshal(values)
+	if err != nil {
+		return nil
+	}
+	return &butlerv1alpha1.ExtensionValues{Raw: raw}
+}
+
+// buildOtelCollectorValues configures the OTLP exporter to the pipeline trace endpoint.
+func buildOtelCollectorValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig) *butlerv1alpha1.ExtensionValues {
+	if pipeline == nil || pipeline.TraceEndpoint == "" {
+		return nil
+	}
+
+	values := map[string]interface{}{
+		"config": map[string]interface{}{
+			"exporters": map[string]interface{}{
+				"otlp": map[string]interface{}{
+					"endpoint": pipeline.TraceEndpoint,
+					"tls": map[string]interface{}{
+						"insecure": true,
+					},
+				},
+			},
+		},
+	}
+
+	raw, err := json.Marshal(values)
+	if err != nil {
+		return nil
+	}
+	return &butlerv1alpha1.ExtensionValues{Raw: raw}
 }
 
 func (r *Reconciler) getTenantKubeconfig(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) ([]byte, error) {
