@@ -34,12 +34,12 @@
 
 butler-controller is the core controller responsible for tenant cluster lifecycle management in the Butler platform. It handles:
 
-- **Tenant Cluster Provisioning**: Creates and manages Kubernetes clusters using CAPI and Kamaji
+- **Tenant Cluster Provisioning**: Creates and manages Kubernetes clusters using CAPI and Steward
 - **Multi-Tenancy**: Team-based isolation with RBAC and resource quotas
 - **Addon Management**: Installs and manages cluster addons (CNI, storage, ingress, etc.)
 - **GitOps Integration**: Optional Flux bootstrap for declarative cluster management
 
-butler-controller runs in the Butler management cluster and watches for TenantCluster custom resources. When a TenantCluster is created, the controller orchestrates VM provisioning, control plane setup via Kamaji, worker node joining, and addon installation.
+butler-controller runs in the Butler management cluster and watches for TenantCluster custom resources. When a TenantCluster is created, the controller orchestrates VM provisioning, control plane setup via Steward, worker node joining, and addon installation.
 
 ## Architecture
 
@@ -48,14 +48,14 @@ flowchart TD
     subgraph MC[Management Cluster]
         BC[butler-controller]
         CAPI[Cluster API]
-        Kamaji[Kamaji]
+        Steward[Steward]
         
         BC -->|Creates| TC[TenantCluster CR]
         BC -->|Creates| CAPIC[CAPI Cluster]
-        BC -->|Creates| KCP[KamajiControlPlane]
+        BC -->|Creates| SCP[StewardControlPlane]
         BC -->|Creates| MD[MachineDeployment]
         
-        Kamaji -->|Hosts| API[Tenant API Server]
+        Steward -->|Hosts| API[Tenant API Server]
     end
     
     subgraph TC1[Tenant Cluster]
@@ -77,10 +77,10 @@ flowchart TD
 |------------|---------|----------------|
 | ButlerConfigReconciler | ButlerConfig | Platform-wide configuration singleton |
 | TeamReconciler | Team | Creates namespaces and RBAC for teams |
-| TenantClusterReconciler | TenantCluster | Full cluster lifecycle (CAPI, Kamaji, addons) |
+| TenantClusterReconciler | TenantCluster | Full cluster lifecycle (CAPI, Steward, addons) |
 | TenantAddonReconciler | TenantAddon | Post-creation addon management |
-| KamajiSecretReconciler | Secrets | Kubeconfig format translation for CAPI |
-| KamajiStatusReconciler | TenantControlPlane | CAPI status synchronization |
+| StewardSecretReconciler | Secrets | Kubeconfig format translation for CAPI |
+| StewardStatusReconciler | TenantControlPlane | CAPI status synchronization |
 
 ## Custom Resources
 
@@ -193,7 +193,7 @@ Team/acme (cluster-scoped)
     ├── TenantCluster/production
     │   └── Creates: Namespace/production-a7b8c9
     │       ├── CAPI Cluster
-    │       ├── KamajiControlPlane
+    │       ├── StewardControlPlane
     │       └── MachineDeployment
     ├── TenantCluster/staging
     └── TenantAddon/production-argocd
