@@ -19,6 +19,7 @@ package capi
 import (
 	"testing"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -517,6 +518,284 @@ func TestCommonLabels(t *testing.T) {
 	}
 	if labels[butlerv1alpha1.LabelTeam] != "team-alpha" {
 		t.Error("expected team label when teamRef is set")
+	}
+}
+
+func TestResolveControlPlaneResources_NoConfig(t *testing.T) {
+	tc := newTestTenantCluster("test", "default")
+	pc := newTestProviderConfig("harvester")
+
+	builder := NewBuilder(tc, pc, "ns")
+	result := builder.resolveControlPlaneResources()
+
+	if result != nil {
+		t.Error("expected nil when no ButlerConfig and no TC resources")
+	}
+}
+
+func TestResolveControlPlaneResources_ButlerConfigOnly(t *testing.T) {
+	tc := newTestTenantCluster("test", "default")
+	pc := newTestProviderConfig("harvester")
+	bc := newTestButlerConfig()
+	bc.Spec.DefaultControlPlaneResources = &butlerv1alpha1.ControlPlaneResourcesSpec{
+		APIServer: &butlerv1alpha1.ComponentResources{
+			Requests: &butlerv1alpha1.ResourceQuantities{
+				CPU:    quantityPtr("100m"),
+				Memory: quantityPtr("256Mi"),
+			},
+		},
+	}
+
+	builder := NewBuilder(tc, pc, "ns").WithButlerConfig(bc)
+	result := builder.resolveControlPlaneResources()
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if result.APIServer == nil {
+		t.Fatal("expected APIServer to be set")
+	}
+	if result.APIServer.Requests.CPU.String() != "100m" {
+		t.Errorf("expected CPU 100m, got %s", result.APIServer.Requests.CPU.String())
+	}
+}
+
+func TestResolveControlPlaneResources_TCOnly(t *testing.T) {
+	tc := newTestTenantCluster("test", "default")
+	tc.Spec.ControlPlane.Resources = &butlerv1alpha1.ControlPlaneResourcesSpec{
+		Scheduler: &butlerv1alpha1.ComponentResources{
+			Requests: &butlerv1alpha1.ResourceQuantities{
+				CPU: quantityPtr("50m"),
+			},
+		},
+	}
+	pc := newTestProviderConfig("harvester")
+
+	builder := NewBuilder(tc, pc, "ns")
+	result := builder.resolveControlPlaneResources()
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if result.Scheduler == nil {
+		t.Fatal("expected Scheduler to be set")
+	}
+	if result.Scheduler.Requests.CPU.String() != "50m" {
+		t.Errorf("expected CPU 50m, got %s", result.Scheduler.Requests.CPU.String())
+	}
+	if result.APIServer != nil {
+		t.Error("expected APIServer to be nil")
+	}
+}
+
+func TestResolveControlPlaneResources_MergeOverride(t *testing.T) {
+	tc := newTestTenantCluster("test", "default")
+	tc.Spec.ControlPlane.Resources = &butlerv1alpha1.ControlPlaneResourcesSpec{
+		APIServer: &butlerv1alpha1.ComponentResources{
+			Requests: &butlerv1alpha1.ResourceQuantities{
+				CPU:    quantityPtr("500m"),
+				Memory: quantityPtr("1Gi"),
+			},
+		},
+		// ControllerManager NOT set — should inherit from ButlerConfig
+	}
+
+	pc := newTestProviderConfig("harvester")
+	bc := newTestButlerConfig()
+	bc.Spec.DefaultControlPlaneResources = &butlerv1alpha1.ControlPlaneResourcesSpec{
+		APIServer: &butlerv1alpha1.ComponentResources{
+			Requests: &butlerv1alpha1.ResourceQuantities{
+				CPU:    quantityPtr("100m"),
+				Memory: quantityPtr("256Mi"),
+			},
+		},
+		ControllerManager: &butlerv1alpha1.ComponentResources{
+			Requests: &butlerv1alpha1.ResourceQuantities{
+				CPU: quantityPtr("50m"),
+			},
+		},
+	}
+
+	builder := NewBuilder(tc, pc, "ns").WithButlerConfig(bc)
+	result := builder.resolveControlPlaneResources()
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	// APIServer should be overridden by TC
+	if result.APIServer.Requests.CPU.String() != "500m" {
+		t.Errorf("expected APIServer CPU 500m (TC override), got %s", result.APIServer.Requests.CPU.String())
+	}
+
+	// ControllerManager should inherit from ButlerConfig
+	if result.ControllerManager == nil {
+		t.Fatal("expected ControllerManager to inherit from ButlerConfig")
+	}
+	if result.ControllerManager.Requests.CPU.String() != "50m" {
+		t.Errorf("expected ControllerManager CPU 50m (BC default), got %s", result.ControllerManager.Requests.CPU.String())
+	}
+}
+
+func TestResolveControlPlaneResources_PartialOverride(t *testing.T) {
+	tc := newTestTenantCluster("test", "default")
+	tc.Spec.ControlPlane.Resources = &butlerv1alpha1.ControlPlaneResourcesSpec{
+		Scheduler: &butlerv1alpha1.ComponentResources{
+			Requests: &butlerv1alpha1.ResourceQuantities{
+				CPU: quantityPtr("200m"),
+			},
+		},
+	}
+
+	pc := newTestProviderConfig("harvester")
+	bc := newTestButlerConfig()
+	bc.Spec.DefaultControlPlaneResources = &butlerv1alpha1.ControlPlaneResourcesSpec{
+		APIServer: &butlerv1alpha1.ComponentResources{
+			Requests: &butlerv1alpha1.ResourceQuantities{
+				CPU: quantityPtr("100m"),
+			},
+		},
+		Scheduler: &butlerv1alpha1.ComponentResources{
+			Requests: &butlerv1alpha1.ResourceQuantities{
+				CPU: quantityPtr("25m"),
+			},
+		},
+	}
+
+	builder := NewBuilder(tc, pc, "ns").WithButlerConfig(bc)
+	result := builder.resolveControlPlaneResources()
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	// APIServer from ButlerConfig (not overridden)
+	if result.APIServer == nil || result.APIServer.Requests.CPU.String() != "100m" {
+		t.Error("expected APIServer CPU 100m from ButlerConfig")
+	}
+
+	// Scheduler from TC (overridden)
+	if result.Scheduler == nil || result.Scheduler.Requests.CPU.String() != "200m" {
+		t.Error("expected Scheduler CPU 200m from TC override")
+	}
+}
+
+func TestComponentResourceMap(t *testing.T) {
+	tc := newTestTenantCluster("test", "default")
+	pc := newTestProviderConfig("harvester")
+	builder := NewBuilder(tc, pc, "ns")
+
+	cr := &butlerv1alpha1.ComponentResources{
+		Requests: &butlerv1alpha1.ResourceQuantities{
+			CPU:    quantityPtr("100m"),
+			Memory: quantityPtr("256Mi"),
+		},
+		Limits: &butlerv1alpha1.ResourceQuantities{
+			CPU:    quantityPtr("2"),
+			Memory: quantityPtr("1Gi"),
+		},
+	}
+
+	result := builder.componentResourceMap(cr)
+	resMap, ok := result["resources"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected resources key in result")
+	}
+
+	reqMap, ok := resMap["requests"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected requests in resources")
+	}
+	if reqMap["cpu"] != "100m" {
+		t.Errorf("expected cpu 100m, got %v", reqMap["cpu"])
+	}
+	if reqMap["memory"] != "256Mi" {
+		t.Errorf("expected memory 256Mi, got %v", reqMap["memory"])
+	}
+
+	limMap, ok := resMap["limits"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected limits in resources")
+	}
+	if limMap["cpu"] != "2" {
+		t.Errorf("expected cpu 2, got %v", limMap["cpu"])
+	}
+	if limMap["memory"] != "1Gi" {
+		t.Errorf("expected memory 1Gi, got %v", limMap["memory"])
+	}
+}
+
+func TestSCPIncludesResources(t *testing.T) {
+	tc := newTestTenantCluster("test", "default")
+	pc := newTestProviderConfig("harvester")
+	bc := newTestButlerConfig()
+	bc.Spec.DefaultControlPlaneResources = &butlerv1alpha1.ControlPlaneResourcesSpec{
+		APIServer: &butlerv1alpha1.ComponentResources{
+			Requests: &butlerv1alpha1.ResourceQuantities{
+				CPU:    quantityPtr("100m"),
+				Memory: quantityPtr("256Mi"),
+			},
+		},
+	}
+
+	builder := NewBuilder(tc, pc, "test-ns").WithButlerConfig(bc)
+	rs, err := builder.Build()
+	if err != nil {
+		t.Fatalf("failed to build: %v", err)
+	}
+
+	spec := rs.ControlPlane.Object["spec"].(map[string]interface{})
+
+	// Should have apiServer key with resources
+	apiServer, ok := spec["apiServer"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected apiServer key in SCP spec")
+	}
+	resMap, ok := apiServer["resources"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected resources in apiServer")
+	}
+	reqMap := resMap["requests"].(map[string]interface{})
+	if reqMap["cpu"] != "100m" {
+		t.Errorf("expected cpu 100m, got %v", reqMap["cpu"])
+	}
+}
+
+func TestSCPNoResourcesWhenNotConfigured(t *testing.T) {
+	tc := newTestTenantCluster("test", "default")
+	pc := newTestProviderConfig("harvester")
+
+	builder := NewBuilder(tc, pc, "test-ns")
+	rs, err := builder.Build()
+	if err != nil {
+		t.Fatalf("failed to build: %v", err)
+	}
+
+	spec := rs.ControlPlane.Object["spec"].(map[string]interface{})
+
+	// Should NOT have apiServer, controllerManager, or scheduler keys
+	if _, ok := spec["apiServer"]; ok {
+		t.Error("expected no apiServer key when resources not configured")
+	}
+	if _, ok := spec["controllerManager"]; ok {
+		t.Error("expected no controllerManager key when resources not configured")
+	}
+	if _, ok := spec["scheduler"]; ok {
+		t.Error("expected no scheduler key when resources not configured")
+	}
+}
+
+func quantityPtr(s string) *resource.Quantity {
+	q := resource.MustParse(s)
+	return &q
+}
+
+func newTestButlerConfig() *butlerv1alpha1.ButlerConfig {
+	return &butlerv1alpha1.ButlerConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "butler",
+		},
+		Spec: butlerv1alpha1.ButlerConfigSpec{},
 	}
 }
 
