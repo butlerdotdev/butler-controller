@@ -394,6 +394,20 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 		"network": network,
 	}
 
+	// Add control plane resources if configured (ButlerConfig defaults + TenantCluster overrides)
+	resources := b.resolveControlPlaneResources()
+	if resources != nil {
+		if resources.APIServer != nil {
+			spec["apiServer"] = b.componentResourceMap(resources.APIServer)
+		}
+		if resources.ControllerManager != nil {
+			spec["controllerManager"] = b.componentResourceMap(resources.ControllerManager)
+		}
+		if resources.Scheduler != nil {
+			spec["scheduler"] = b.componentResourceMap(resources.Scheduler)
+		}
+	}
+
 	// Add certSANs if specified
 	if len(b.tc.Spec.ControlPlane.CertSANs) > 0 {
 		certSANs := make([]interface{}, len(b.tc.Spec.ControlPlane.CertSANs))
@@ -1012,6 +1026,79 @@ func (b *Builder) needsIngressHostsEntry() bool {
 	mode := b.butlerConfig.GetControlPlaneExposureMode()
 	return mode == butlerv1alpha1.ControlPlaneExposureModeIngress ||
 		mode == butlerv1alpha1.ControlPlaneExposureModeGateway
+}
+
+// resolveControlPlaneResources merges ButlerConfig defaults with TenantCluster overrides.
+// Returns nil if no resources are configured (BestEffort QoS).
+func (b *Builder) resolveControlPlaneResources() *butlerv1alpha1.ControlPlaneResourcesSpec {
+	// Start with platform defaults
+	var result *butlerv1alpha1.ControlPlaneResourcesSpec
+	if b.butlerConfig != nil {
+		result = b.butlerConfig.GetDefaultControlPlaneResources()
+	}
+
+	// Per-cluster overrides replace per-component
+	tcResources := b.tc.Spec.ControlPlane.Resources
+	if tcResources == nil {
+		return result
+	}
+
+	// If no platform defaults, use TC resources directly
+	if result == nil {
+		return tcResources
+	}
+
+	// Merge: TC component overrides replace entire component from ButlerConfig
+	merged := result.DeepCopy()
+	if tcResources.APIServer != nil {
+		merged.APIServer = tcResources.APIServer
+	}
+	if tcResources.ControllerManager != nil {
+		merged.ControllerManager = tcResources.ControllerManager
+	}
+	if tcResources.Scheduler != nil {
+		merged.Scheduler = tcResources.Scheduler
+	}
+	return merged
+}
+
+// componentResourceMap converts a ComponentResources to an unstructured map
+// matching the StewardControlPlane's ControlPlaneComponent shape (which wraps
+// corev1.ResourceRequirements under a "resources" key).
+func (b *Builder) componentResourceMap(cr *butlerv1alpha1.ComponentResources) map[string]interface{} {
+	result := map[string]interface{}{}
+	resMap := map[string]interface{}{}
+
+	if cr.Requests != nil {
+		reqMap := map[string]interface{}{}
+		if cr.Requests.CPU != nil {
+			reqMap["cpu"] = cr.Requests.CPU.String()
+		}
+		if cr.Requests.Memory != nil {
+			reqMap["memory"] = cr.Requests.Memory.String()
+		}
+		if len(reqMap) > 0 {
+			resMap["requests"] = reqMap
+		}
+	}
+
+	if cr.Limits != nil {
+		limMap := map[string]interface{}{}
+		if cr.Limits.CPU != nil {
+			limMap["cpu"] = cr.Limits.CPU.String()
+		}
+		if cr.Limits.Memory != nil {
+			limMap["memory"] = cr.Limits.Memory.String()
+		}
+		if len(limMap) > 0 {
+			resMap["limits"] = limMap
+		}
+	}
+
+	if len(resMap) > 0 {
+		result["resources"] = resMap
+	}
+	return result
 }
 
 // buildMachineDeployment constructs the MachineDeployment resource.
