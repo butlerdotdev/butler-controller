@@ -1,10 +1,24 @@
-# butler-controller
+<p align="center">
+  <img src="https://raw.githubusercontent.com/butlerdotdev/butler/main/assets/mascots/butler.png" alt="Butler" width="150"/>
+</p>
 
-[![Release](https://img.shields.io/github/v/release/butlerdotdev/butler-controller)](https://github.com/butlerdotdev/butler-controller/releases)
-[![License](https://img.shields.io/github/license/butlerdotdev/butler-controller)](LICENSE)
-[![Go Version](https://img.shields.io/github/go-mod/go-version/butlerdotdev/butler-controller)](go.mod)
+<h1 align="center">Butler Controller</h1>
 
-Kubernetes controller for managing tenant clusters on the Butler platform.
+<p align="center">
+  Tenant cluster lifecycle and addon management controller for the <a href="https://github.com/butlerdotdev/butler">Butler</a> platform.
+</p>
+
+<p align="center">
+  <a href="https://github.com/butlerdotdev/butler-controller/releases"><img src="https://img.shields.io/github/v/release/butlerdotdev/butler-controller" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/butlerdotdev/butler-controller" alt="License"></a>
+  <img src="https://img.shields.io/github/go-mod/go-version/butlerdotdev/butler-controller" alt="Go Version">
+</p>
+
+<p align="center">
+  <a href="https://github.com/butlerdotdev/butler">Butler</a> · <a href="https://docs.butlerlabs.dev">Docs</a> · <a href="https://butlerlabs.dev">Website</a>
+</p>
+
+---
 
 ## Table of Contents
 
