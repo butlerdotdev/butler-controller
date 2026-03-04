@@ -148,6 +148,7 @@ func (r *Reconciler) checkHarvesterVMIStatus(ctx context.Context, is *butlerv1al
 		}
 		condType, _, _ := unstructured.NestedString(condMap, "type")
 		condStatus, _, _ := unstructured.NestedString(condMap, "status")
+		message, _, _ := unstructured.NestedString(condMap, "message")
 
 		if condType == "Imported" && condStatus == "True" {
 			// Image is ready
@@ -157,10 +158,24 @@ func (r *Reconciler) checkHarvesterVMIStatus(ctx context.Context, is *butlerv1al
 
 		if condType == "Imported" && condStatus == "False" {
 			reason, _, _ := unstructured.NestedString(condMap, "reason")
-			message, _, _ := unstructured.NestedString(condMap, "message")
 			if reason == "ImportFailed" || reason == "Failed" {
 				return r.setFailed(ctx, is, "HarvesterImportFailed",
 					fmt.Sprintf("VirtualMachineImage import failed: %s", message))
+			}
+		}
+
+		// Harvester CDI retry limit exceeded — terminal failure
+		if condType == "RetryLimitExceeded" && condStatus == "True" {
+			return r.setFailed(ctx, is, "HarvesterRetryLimitExceeded",
+				fmt.Sprintf("VirtualMachineImage download failed after retries: %s", message))
+		}
+
+		// Harvester CDI initialization failed
+		if condType == "Initialized" && condStatus == "False" {
+			reason, _, _ := unstructured.NestedString(condMap, "reason")
+			if reason == "Failed" || reason == "ImportFailed" {
+				return r.setFailed(ctx, is, "HarvesterInitFailed",
+					fmt.Sprintf("VirtualMachineImage initialization failed: %s", message))
 			}
 		}
 	}

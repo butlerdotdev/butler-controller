@@ -300,6 +300,8 @@ func (r *Reconciler) getProviderCredentials(ctx context.Context, pc *butlerv1alp
 }
 
 // buildArtifactURL constructs the factory download URL for an image.
+// Uses the Talos Image Factory URL format: {factory}/image/{schematic}/{version}/{platform}-{arch}.{format}
+// The platform is "nocloud" for KubeVirt/cloud-init targets (Harvester, Nutanix).
 func buildArtifactURL(factoryURL string, ref butlerv1alpha1.ImageFactoryRef, format string) string {
 	factoryURL = strings.TrimSuffix(factoryURL, "/")
 	if format == "" {
@@ -309,7 +311,11 @@ func buildArtifactURL(factoryURL string, ref butlerv1alpha1.ImageFactoryRef, for
 	if arch == "" {
 		arch = "amd64"
 	}
-	return fmt.Sprintf("%s/image/%s/%s/talos-%s.%s", factoryURL, ref.SchematicID, ref.Version, arch, format)
+	platform := ref.Platform
+	if platform == "" {
+		platform = "nocloud"
+	}
+	return fmt.Sprintf("%s/image/%s/%s/%s-%s.%s", factoryURL, ref.SchematicID, ref.Version, platform, arch, format)
 }
 
 // buildProviderImageName generates a deterministic image name for the provider.
