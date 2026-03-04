@@ -189,7 +189,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ImageSync controller. Thin controller for image sync lifecycle management
+	// ImageSync controller. Fulfills image syncs from factory to providers
 	if err = (&imagesync.Reconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
