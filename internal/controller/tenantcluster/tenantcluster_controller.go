@@ -1730,12 +1730,16 @@ func (r *Reconciler) reconcileImageSync(ctx context.Context, tc *butlerv1alpha1.
 		return "", nil
 	}
 
-	// Resolve image version and architecture
+	// Resolve image version, architecture, and platform
 	version := tc.Spec.Workers.MachineTemplate.OS.Version
 	if version == "" {
 		version = "9.5" // default OS version from kubebuilder marker
 	}
+	// Architecture defaults to amd64 — all current Butler providers target amd64.
+	// When multi-arch support is added, this should read from MachineTemplate or OS spec.
 	arch := "amd64"
+	// Platform defaults to nocloud — works for KubeVirt/cloud-init targets (Harvester, Nutanix).
+	platform := "nocloud"
 
 	// Truncate schematicID to 63 chars for label value (Kubernetes label limit)
 	labelSchematicID := schematicID
@@ -1838,6 +1842,7 @@ func (r *Reconciler) reconcileImageSync(ctx context.Context, tc *butlerv1alpha1.
 				SchematicID: schematicID,
 				Version:     version,
 				Arch:        arch,
+				Platform:    platform,
 			},
 			ProviderConfigRef: pcRef,
 			Format:            "qcow2",

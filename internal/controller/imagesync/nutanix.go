@@ -79,10 +79,7 @@ func (r *Reconciler) reconcileNutanix(ctx context.Context, is *butlerv1alpha1.Im
 	// Store task UUID in status for polling
 	is.SetPhase(butlerv1alpha1.ImageSyncPhaseDownloading)
 	is.Status.ObservedGeneration = is.Generation
-	// Store task UUID in failure reason temporarily (we don't have a dedicated field)
-	// This is a pragmatic approach — the task UUID is needed for polling
-	is.Status.FailureReason = "task:" + taskUUID
-	is.Status.FailureMessage = ""
+	is.Status.ProviderTaskID = taskUUID
 	meta.SetStatusCondition(&is.Status.Conditions, metav1.Condition{
 		Type:               butlerv1alpha1.ConditionTypeProgressing,
 		Status:             metav1.ConditionTrue,
@@ -105,10 +102,7 @@ func (r *Reconciler) pollNutanixImage(ctx context.Context, is *butlerv1alpha1.Im
 	}
 
 	// Check if we have a task UUID stored
-	taskUUID := ""
-	if strings.HasPrefix(is.Status.FailureReason, "task:") {
-		taskUUID = strings.TrimPrefix(is.Status.FailureReason, "task:")
-	}
+	taskUUID := is.Status.ProviderTaskID
 
 	if taskUUID != "" {
 		// Poll task status
@@ -134,12 +128,11 @@ func (r *Reconciler) pollNutanixImage(ctx context.Context, is *butlerv1alpha1.Im
 			if imageUUID == "" {
 				return r.setFailed(ctx, is, "ImageUUIDNotFound", "task succeeded but image UUID not found")
 			}
-			// Clear the task tracking
-			is.Status.FailureReason = ""
+			is.Status.ProviderTaskID = ""
 			return r.setReady(ctx, is, imageUUID)
 
 		case "FAILED":
-			is.Status.FailureReason = ""
+			is.Status.ProviderTaskID = ""
 			return r.setFailed(ctx, is, "NutanixTaskFailed",
 				fmt.Sprintf("image creation task failed: %s", status.Message))
 		}
