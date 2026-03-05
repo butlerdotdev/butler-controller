@@ -34,6 +34,7 @@ import (
 
 	"github.com/butlerdotdev/butler-controller/internal/addons"
 	"github.com/butlerdotdev/butler-controller/internal/controller/butlerconfig"
+	"github.com/butlerdotdev/butler-controller/internal/controller/imagesync"
 	"github.com/butlerdotdev/butler-controller/internal/controller/ipallocation"
 	"github.com/butlerdotdev/butler-controller/internal/controller/kamajisecret"
 	"github.com/butlerdotdev/butler-controller/internal/controller/kamajistatus"
@@ -188,6 +189,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// ImageSync controller. Fulfills image syncs from factory to providers
+	if err = (&imagesync.Reconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ImageSync")
+		os.Exit(1)
+	}
+
 	// ProviderConfig controller. Health checks and capacity reporting
 	if err = (&providerconfig.Reconciler{
 		Client:   mgr.GetClient(),
@@ -260,7 +270,7 @@ func main() {
 	}
 
 	setupLog.Info("starting manager",
-		"controllers", []string{"ButlerConfig", "Team", "TenantCluster", "TenantAddon", "ManagementAddon", "NetworkPool", "IPAllocation", "ProviderConfig", "Workspace", "KamajiSecret", "KamajiStatus"})
+		"controllers", []string{"ButlerConfig", "Team", "TenantCluster", "TenantAddon", "ManagementAddon", "NetworkPool", "IPAllocation", "ImageSync", "ProviderConfig", "Workspace", "KamajiSecret", "KamajiStatus"})
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")

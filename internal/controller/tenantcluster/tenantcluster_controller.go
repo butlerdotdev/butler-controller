@@ -153,6 +153,53 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 	}
 
+	// Resolve ProviderConfig for image sync (needed before infrastructure reconciliation)
+	providerConfig, pcErr := r.getProviderConfig(ctx, tc)
+	if pcErr != nil {
+		logger.V(1).Info("ProviderConfig not yet available, skipping image sync", "error", pcErr)
+	}
+
+	// Reconcile image sync before infrastructure — ensures the OS image is available
+	// on the provider before VMs are created. The resolved provider image ref is injected
+	// into the in-memory TC spec so the CAPI builder picks it up.
+	if providerConfig != nil {
+		providerImageRef, imageSyncErr := r.reconcileImageSync(ctx, tc, providerConfig, butlerConfig)
+		if imageSyncErr != nil {
+			logger.Info("image sync not yet ready, waiting", "error", imageSyncErr)
+			if err := r.Status().Update(ctx, tc); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+		}
+
+		// Apply provider image ref to in-memory TC spec for the builder
+		if providerImageRef != "" {
+			switch providerConfig.Spec.Provider {
+			case butlerv1alpha1.ProviderTypeHarvester:
+				if tc.Spec.InfrastructureOverride == nil {
+					tc.Spec.InfrastructureOverride = &butlerv1alpha1.InfrastructureOverride{}
+				}
+				if tc.Spec.InfrastructureOverride.Harvester == nil {
+					tc.Spec.InfrastructureOverride.Harvester = &butlerv1alpha1.HarvesterOverride{}
+				}
+				tc.Spec.InfrastructureOverride.Harvester.ImageName = providerImageRef
+			case butlerv1alpha1.ProviderTypeNutanix:
+				if tc.Spec.InfrastructureOverride == nil {
+					tc.Spec.InfrastructureOverride = &butlerv1alpha1.InfrastructureOverride{}
+				}
+				if tc.Spec.InfrastructureOverride.Nutanix == nil {
+					tc.Spec.InfrastructureOverride.Nutanix = &butlerv1alpha1.NutanixOverride{}
+				}
+				tc.Spec.InfrastructureOverride.Nutanix.ImageUUID = providerImageRef
+			case butlerv1alpha1.ProviderTypeProxmox:
+				// Proxmox uses TemplateID (int) — image sync returns a string ref.
+				// Provider controller is responsible for setting the correct template.
+				logger.V(1).Info("Proxmox image ref from ImageSync not applied (TemplateID is int)",
+					"providerImageRef", providerImageRef)
+			}
+		}
+	}
+
 	result, err := r.reconcileInfrastructure(ctx, tc, butlerConfig)
 	if err != nil {
 		logger.Error(err, "failed to reconcile infrastructure")
@@ -1648,6 +1695,185 @@ func (r *Reconciler) handleDeletion(ctx context.Context, tc *butlerv1alpha1.Tena
 
 	logger.Info("TenantCluster deletion complete", "name", tc.Name)
 	return ctrl.Result{}, nil
+}
+
+// reconcileImageSync ensures the OS image is synced to the infrastructure provider
+// via the Butler Image Factory. It creates an ImageSync resource if needed, deduplicates
+// across TenantClusters sharing the same schematic+version+provider, and returns the
+// provider-specific image reference once the sync is complete.
+//
+// Returns:
+//   - providerImageRef: the provider-specific image reference (e.g., "default/talos-v1.12.4-amd64")
+//     Empty string if no sync is needed (no schematic configured or auto-sync disabled).
+//   - error: non-nil triggers a requeue (image sync in progress, failed, or creation error).
+func (r *Reconciler) reconcileImageSync(ctx context.Context, tc *butlerv1alpha1.TenantCluster, pc *butlerv1alpha1.ProviderConfig, bc *butlerv1alpha1.ButlerConfig) (string, error) {
+	logger := log.FromContext(ctx)
+
+	// Resolve schematicID: TC spec takes precedence, then ButlerConfig default
+	schematicID := tc.Spec.Workers.MachineTemplate.OS.SchematicID
+	if schematicID == "" && bc != nil && bc.Spec.ImageFactory != nil {
+		schematicID = bc.Spec.ImageFactory.DefaultSchematicID
+	}
+	if schematicID == "" {
+		// No schematic configured — no image sync needed
+		return "", nil
+	}
+
+	// Image factory must be configured if a schematicID is set
+	if bc == nil || !bc.IsImageFactoryConfigured() {
+		return "", fmt.Errorf("schematicID %q is set but Image Factory is not configured in ButlerConfig", schematicID)
+	}
+
+	// Check if auto-sync is enabled
+	if !bc.IsAutoSyncEnabled() {
+		logger.V(1).Info("image auto-sync disabled, skipping ImageSync creation")
+		return "", nil
+	}
+
+	// Resolve image version, architecture, and platform
+	version := tc.Spec.Workers.MachineTemplate.OS.Version
+	if version == "" {
+		version = "9.5" // default OS version from kubebuilder marker
+	}
+	// Architecture defaults to amd64 — all current Butler providers target amd64.
+	// When multi-arch support is added, this should read from MachineTemplate or OS spec.
+	arch := "amd64"
+	// Platform is the artifact name prefix in the factory URL.
+	// For Butler Image Factory: use the OS type (talos, flatcar, kairos, bottlerocket).
+	// For Siderolabs factory (factory.talos.dev): use "nocloud" (or metal, vmware, etc.).
+	platform := string(tc.Spec.Workers.MachineTemplate.OS.Type)
+	if platform == "" {
+		platform = "nocloud"
+	}
+
+	// Truncate schematicID to 63 chars for label value (Kubernetes label limit)
+	labelSchematicID := schematicID
+	if len(labelSchematicID) > 63 {
+		labelSchematicID = labelSchematicID[:63]
+	}
+
+	// Build label selector for deduplication
+	matchLabels := map[string]string{
+		butlerv1alpha1.LabelSchematicID:    labelSchematicID,
+		butlerv1alpha1.LabelImageVersion:   version,
+		butlerv1alpha1.LabelProviderConfig: pc.Name,
+		butlerv1alpha1.LabelImageArch:      arch,
+	}
+
+	// List existing ImageSyncs matching labels in the TC's namespace
+	var existingList butlerv1alpha1.ImageSyncList
+	if err := r.List(ctx, &existingList,
+		client.InNamespace(tc.Namespace),
+		client.MatchingLabels(matchLabels),
+	); err != nil {
+		return "", fmt.Errorf("failed to list ImageSyncs: %w", err)
+	}
+
+	if len(existingList.Items) > 0 {
+		is := &existingList.Items[0]
+
+		switch {
+		case is.IsReady():
+			logger.V(1).Info("ImageSync is ready", "name", is.Name, "providerImageRef", is.Status.ProviderImageRef)
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionImageReady,
+				metav1.ConditionTrue, "ImageReady", "OS image synced to provider")
+			tc.Status.ImageSyncRef = &butlerv1alpha1.LocalObjectReference{Name: is.Name}
+			return is.Status.ProviderImageRef, nil
+
+		case is.IsFailed():
+			reason := is.Status.FailureReason
+			if reason == "" {
+				reason = "ImageSyncFailed"
+			}
+			message := is.Status.FailureMessage
+			if message == "" {
+				message = "Image sync failed"
+			}
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionImageReady,
+				metav1.ConditionFalse, reason, message)
+			tc.Status.ImageSyncRef = &butlerv1alpha1.LocalObjectReference{Name: is.Name}
+			return "", fmt.Errorf("ImageSync %s failed: %s", is.Name, message)
+
+		default:
+			// In progress (Pending, Building, Downloading, Uploading)
+			logger.Info("ImageSync in progress", "name", is.Name, "phase", is.Status.Phase)
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionImageReady,
+				metav1.ConditionFalse, "ImageSyncInProgress",
+				fmt.Sprintf("Image sync %s is %s", is.Name, is.Status.Phase))
+			tc.Status.ImageSyncRef = &butlerv1alpha1.LocalObjectReference{Name: is.Name}
+			return "", fmt.Errorf("ImageSync %s is in progress (phase: %s)", is.Name, is.Status.Phase)
+		}
+	}
+
+	// No existing ImageSync found — create one
+
+	// Build a short, DNS-safe name
+	schematicPrefix := schematicID
+	if len(schematicPrefix) > 8 {
+		schematicPrefix = schematicPrefix[:8]
+	}
+	// Sanitize version for DNS label (replace dots with dashes, strip leading 'v')
+	sanitizedVersion := strings.ReplaceAll(version, ".", "-")
+	sanitizedVersion = strings.TrimPrefix(sanitizedVersion, "v")
+	imageSyncName := fmt.Sprintf("%s-%s-%s", tc.Name, schematicPrefix, sanitizedVersion)
+	// Ensure name is DNS-safe (max 253 chars for object names, but keep it reasonable)
+	if len(imageSyncName) > 63 {
+		imageSyncName = imageSyncName[:63]
+	}
+
+	// Resolve provider config reference
+	pcRef := butlerv1alpha1.ProviderReference{
+		Name: pc.Name,
+	}
+	if pc.Namespace != "" && pc.Namespace != tc.Namespace {
+		pcRef.Namespace = pc.Namespace
+	}
+
+	is := &butlerv1alpha1.ImageSync{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      imageSyncName,
+			Namespace: tc.Namespace,
+			Labels: map[string]string{
+				butlerv1alpha1.LabelManagedBy:       "butler",
+				butlerv1alpha1.LabelTenant:          tc.Name,
+				butlerv1alpha1.LabelSchematicID:     labelSchematicID,
+				butlerv1alpha1.LabelImageVersion:    version,
+				butlerv1alpha1.LabelProviderConfig:  pc.Name,
+				butlerv1alpha1.LabelImageArch:       arch,
+			},
+		},
+		Spec: butlerv1alpha1.ImageSyncSpec{
+			FactoryRef: butlerv1alpha1.ImageFactoryRef{
+				SchematicID: schematicID,
+				Version:     version,
+				Arch:        arch,
+				Platform:    platform,
+			},
+			ProviderConfigRef: pcRef,
+			Format:            "qcow2",
+			TransferMode:      butlerv1alpha1.TransferModeDirect,
+		},
+	}
+
+	// Set owner reference for garbage collection
+	if err := controllerutil.SetControllerReference(tc, is, r.Scheme); err != nil {
+		return "", fmt.Errorf("failed to set owner reference on ImageSync: %w", err)
+	}
+
+	logger.Info("creating ImageSync", "name", is.Name, "schematicID", schematicID, "version", version)
+	if err := r.Create(ctx, is); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			// Race condition — another reconcile created it. Requeue to pick it up.
+			return "", fmt.Errorf("ImageSync %s was just created, requeueing", imageSyncName)
+		}
+		return "", fmt.Errorf("failed to create ImageSync %s: %w", imageSyncName, err)
+	}
+
+	r.setCondition(tc, butlerv1alpha1.TenantClusterConditionImageReady,
+		metav1.ConditionFalse, "ImageSyncPending", "Image sync created, waiting for provider to process")
+	tc.Status.ImageSyncRef = &butlerv1alpha1.LocalObjectReference{Name: is.Name}
+
+	return "", fmt.Errorf("ImageSync %s created, waiting for completion", imageSyncName)
 }
 
 func (r *Reconciler) setFailedStatus(ctx context.Context, tc *butlerv1alpha1.TenantCluster, reason, message string) (ctrl.Result, error) {
