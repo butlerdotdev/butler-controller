@@ -19,6 +19,7 @@ package imagesync
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -300,8 +301,16 @@ func (r *Reconciler) getProviderCredentials(ctx context.Context, pc *butlerv1alp
 }
 
 // buildArtifactURL constructs the factory download URL for an image.
-// Uses the Talos Image Factory URL format: {factory}/image/{schematic}/{version}/{platform}-{arch}.{format}
-// The platform is "nocloud" for KubeVirt/cloud-init targets (Harvester, Nutanix).
+// URL format: {factory}/image/{schematic}/{version}/{platform}-{arch}.{format}
+//
+// The Platform field in FactoryRef serves as the artifact name prefix, which has
+// different semantics depending on the factory:
+//   - Siderolabs factory (factory.talos.dev): platform identifier (nocloud, metal, vmware, aws, gcp)
+//   - Butler Image Factory: OS type (talos, flatcar, kairos, bottlerocket)
+//
+// The ImageSync creator (user, TC reconciler, or bootstrap reconciler) is responsible
+// for setting the correct Platform value. If unset, defaults to "nocloud" for
+// backward compatibility with factory.talos.dev.
 func buildArtifactURL(factoryURL string, ref butlerv1alpha1.ImageFactoryRef, format string) string {
 	factoryURL = strings.TrimSuffix(factoryURL, "/")
 	if format == "" {
@@ -323,7 +332,12 @@ func buildProviderImageName(is *butlerv1alpha1.ImageSync) string {
 	if is.Spec.DisplayName != "" {
 		return sanitizeName(is.Spec.DisplayName)
 	}
-	// Build from schematic + version: talos-v1-12-4-amd64-butler
+	// Build from platform + version: talos-v1-12-4-amd64-butler
+	// Platform is the OS type for Butler factory, or platform name for Siderolabs factory.
+	platform := is.Spec.FactoryRef.Platform
+	if platform == "" {
+		platform = "nocloud"
+	}
 	version := strings.ReplaceAll(is.Spec.FactoryRef.Version, ".", "-")
 	arch := is.Spec.FactoryRef.Arch
 	if arch == "" {
@@ -333,21 +347,30 @@ func buildProviderImageName(is *butlerv1alpha1.ImageSync) string {
 	if len(schematicPrefix) > 8 {
 		schematicPrefix = schematicPrefix[:8]
 	}
-	name := fmt.Sprintf("talos-%s-%s-%s-butler", version, arch, schematicPrefix)
+	name := fmt.Sprintf("%s-%s-%s-%s-butler", platform, version, arch, schematicPrefix)
 	return sanitizeName(name)
 }
 
-// sanitizeName converts a string into a valid Kubernetes resource name.
+// invalidDNSChars matches any character not allowed in DNS subdomain names.
+var invalidDNSChars = regexp.MustCompile(`[^a-z0-9.-]`)
+
+// sanitizeName converts a string into a valid Kubernetes DNS subdomain name.
 func sanitizeName(name string) string {
 	name = strings.ToLower(name)
 	name = strings.ReplaceAll(name, " ", "-")
 	name = strings.ReplaceAll(name, "_", "-")
+	// Remove any remaining invalid characters (parentheses, etc.)
+	name = invalidDNSChars.ReplaceAllString(name, "")
+	// Collapse multiple consecutive hyphens
+	for strings.Contains(name, "--") {
+		name = strings.ReplaceAll(name, "--", "-")
+	}
 	// Truncate to 63 chars (K8s label limit)
 	if len(name) > 63 {
 		name = name[:63]
 	}
-	// Trim trailing hyphens
-	name = strings.TrimRight(name, "-")
+	// Trim leading/trailing hyphens and dots
+	name = strings.Trim(name, "-.")
 	return name
 }
 

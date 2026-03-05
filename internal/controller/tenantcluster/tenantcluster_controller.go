@@ -1738,8 +1738,13 @@ func (r *Reconciler) reconcileImageSync(ctx context.Context, tc *butlerv1alpha1.
 	// Architecture defaults to amd64 — all current Butler providers target amd64.
 	// When multi-arch support is added, this should read from MachineTemplate or OS spec.
 	arch := "amd64"
-	// Platform defaults to nocloud — works for KubeVirt/cloud-init targets (Harvester, Nutanix).
-	platform := "nocloud"
+	// Platform is the artifact name prefix in the factory URL.
+	// For Butler Image Factory: use the OS type (talos, flatcar, kairos, bottlerocket).
+	// For Siderolabs factory (factory.talos.dev): use "nocloud" (or metal, vmware, etc.).
+	platform := string(tc.Spec.Workers.MachineTemplate.OS.Type)
+	if platform == "" {
+		platform = "nocloud"
+	}
 
 	// Truncate schematicID to 63 chars for label value (Kubernetes label limit)
 	labelSchematicID := schematicID
