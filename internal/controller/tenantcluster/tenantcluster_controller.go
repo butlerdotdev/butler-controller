@@ -221,7 +221,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// Sync MachineDeployment replicas for Ready clusters
 	// This handles scaling operations after initial provisioning
-	if err := r.reconcileMachineDeploymentReplicas(ctx, tc); err != nil {
+	if err := r.reconcileMachineDeploymentReplicas(ctx, tc, butlerConfig); err != nil {
 		logger.Error(err, "failed to reconcile MachineDeployment replicas")
 		// Don't fail the reconcile, just log - scaling is not critical path
 	}
@@ -978,8 +978,8 @@ func (r *Reconciler) checkInfrastructureStatus(ctx context.Context, tc *butlerv1
 // reconcileMachineDeploymentReplicas syncs worker count from TenantCluster spec to MachineDeployment.
 // This is called on every reconcile to ensure spec.workers.replicas changes are propagated
 // to the underlying CAPI MachineDeployment, enabling cluster scaling operations.
-// It also updates the TenantCluster status with current worker counts.
-func (r *Reconciler) reconcileMachineDeploymentReplicas(ctx context.Context, tc *butlerv1alpha1.TenantCluster) error {
+// It also updates the TenantCluster status with current worker counts and the WorkersReady condition.
+func (r *Reconciler) reconcileMachineDeploymentReplicas(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) error {
 	logger := log.FromContext(ctx)
 
 	// Only sync when cluster is Ready or Installing
@@ -1025,8 +1025,40 @@ func (r *Reconciler) reconcileMachineDeploymentReplicas(ctx context.Context, tc 
 
 	// Update TenantCluster status with worker counts from MachineDeployment
 	readyReplicas, _, _ := unstructured.NestedInt64(md.Object, "status", "readyReplicas")
+
+	// CAPI MachineDeployment readyReplicas can be 0 even when workers are actually running,
+	// because CAPI can't match Machine→Node without spec.providerID (e.g. Talos, Flatcar on KubeVirt).
+	// When the cluster is already Ready, fall back to querying the tenant API server directly.
+	// To avoid unnecessary API calls at scale, skip the query when the previous reconcile already
+	// found all workers ready (status matches desired). Only re-query on first check or during scaling.
+	if readyReplicas == 0 && tc.Status.Phase == butlerv1alpha1.TenantClusterPhaseReady {
+		previousReady := tc.Status.WorkerNodesReady
+		if previousReady > 0 && previousReady == int32(desiredReplicas) {
+			// Workers fully converged last time — reuse cached count
+			readyReplicas = int64(previousReady)
+		} else {
+			// First check, scaling in progress, or workers not yet converged — query tenant API
+			if nodeCount, err := r.countTenantReadyNodes(ctx, tc, butlerConfig); err == nil && nodeCount > 0 {
+				readyReplicas = int64(nodeCount)
+				logger.V(1).Info("using tenant node count as CAPI readyReplicas fallback",
+					"nodeCount", nodeCount)
+			}
+		}
+	}
+
 	tc.Status.WorkerNodesReady = int32(readyReplicas)
 	tc.Status.WorkerNodesDesired = int32(desiredReplicas)
+
+	// Update WorkersReady condition based on current worker counts
+	if tc.Status.WorkerNodesReady >= tc.Status.WorkerNodesDesired && tc.Status.WorkerNodesDesired > 0 {
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionWorkersReady,
+			metav1.ConditionTrue, ReasonWorkersReady,
+			fmt.Sprintf("All %d workers ready", tc.Status.WorkerNodesReady))
+	} else {
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionWorkersReady,
+			metav1.ConditionFalse, ReasonWorkersProvisioning,
+			fmt.Sprintf("Workers provisioning: %d/%d ready", tc.Status.WorkerNodesReady, tc.Status.WorkerNodesDesired))
+	}
 
 	// Check if MachineDeployment spec needs to be scaled
 	if currentSpecReplicas == desiredReplicas {
@@ -1051,6 +1083,52 @@ func (r *Reconciler) reconcileMachineDeploymentReplicas(ctx context.Context, tc 
 		"replicas", desiredReplicas)
 
 	return nil
+}
+
+// countTenantReadyNodes queries the tenant cluster's API server to count Ready worker nodes.
+// This is a fallback for when CAPI readyReplicas is unreliable (e.g. no providerID on nodes).
+// Returns 0 without error if the tenant cluster is unreachable (non-fatal).
+func (r *Reconciler) countTenantReadyNodes(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) (int32, error) {
+	kubeconfigData, err := r.getTenantKubeconfig(ctx, tc, butlerConfig)
+	if err != nil {
+		return 0, nil // non-fatal: kubeconfig not available yet
+	}
+
+	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigData)
+	if err != nil {
+		return 0, nil
+	}
+	// Short timeout to avoid blocking reconcile if tenant API is slow
+	restConfig.Timeout = 10 * time.Second
+
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return 0, nil
+	}
+
+	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return 0, nil // non-fatal: tenant cluster may be unreachable
+	}
+
+	var readyCount int32
+	for _, node := range nodes.Items {
+		// Skip control plane nodes (only count workers)
+		if _, isMaster := node.Labels["node-role.kubernetes.io/master"]; isMaster {
+			continue
+		}
+		if _, isCP := node.Labels["node-role.kubernetes.io/control-plane"]; isCP {
+			continue
+		}
+		for _, cond := range node.Status.Conditions {
+			if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
+				readyCount++
+				break
+			}
+		}
+	}
+
+	return readyCount, nil
 }
 
 // reconcileMachineTemplate detects CPU/memory/disk changes in the TenantCluster spec
