@@ -2640,52 +2640,125 @@ func (r *Reconciler) validateProviderAccess(ctx context.Context, tc *butlerv1alp
 	return r.validateProviderLimits(ctx, tc, pc)
 }
 
-// validateProviderLimits checks maxClustersPerTeam and maxNodesPerTeam limits from ProviderConfig.
+// validateProviderLimits checks maxClustersPerTeam and maxNodesPerTeam limits from ProviderConfig,
+// then checks team-level resource quotas as defense-in-depth when webhooks are disabled.
 func (r *Reconciler) validateProviderLimits(ctx context.Context, tc *butlerv1alpha1.TenantCluster, pc *butlerv1alpha1.ProviderConfig) error {
-	if pc.Spec.Limits == nil {
-		return nil
-	}
+	if pc.Spec.Limits != nil {
+		if pc.Spec.Limits.MaxClustersPerTeam != nil {
+			maxClusters := *pc.Spec.Limits.MaxClustersPerTeam
+			var tcList butlerv1alpha1.TenantClusterList
+			if err := r.List(ctx, &tcList, client.InNamespace(tc.Namespace)); err != nil {
+				return fmt.Errorf("failed to list TenantClusters: %w", err)
+			}
 
-	if pc.Spec.Limits.MaxClustersPerTeam != nil {
-		maxClusters := *pc.Spec.Limits.MaxClustersPerTeam
-		var tcList butlerv1alpha1.TenantClusterList
-		if err := r.List(ctx, &tcList, client.InNamespace(tc.Namespace)); err != nil {
-			return fmt.Errorf("failed to list TenantClusters: %w", err)
-		}
+			var existingCount int32
+			for i := range tcList.Items {
+				if tcList.Items[i].Name != tc.Name {
+					existingCount++
+				}
+			}
 
-		var existingCount int32
-		for i := range tcList.Items {
-			if tcList.Items[i].Name != tc.Name {
-				existingCount++
+			if existingCount >= maxClusters {
+				msg := fmt.Sprintf("team namespace %q has %d cluster(s), provider %q limits to %d",
+					tc.Namespace, existingCount, pc.Name, maxClusters)
+				r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+					metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
+				return fmt.Errorf("quota exceeded: %s", msg)
 			}
 		}
 
-		if existingCount >= maxClusters {
-			msg := fmt.Sprintf("team namespace %q has %d cluster(s), provider %q limits to %d",
-				tc.Namespace, existingCount, pc.Name, maxClusters)
+		if pc.Spec.Limits.MaxNodesPerTeam != nil {
+			maxNodes := *pc.Spec.Limits.MaxNodesPerTeam
+			var tcList butlerv1alpha1.TenantClusterList
+			if err := r.List(ctx, &tcList, client.InNamespace(tc.Namespace)); err != nil {
+				return fmt.Errorf("failed to list TenantClusters: %w", err)
+			}
+
+			totalNodes := tc.Spec.Workers.Replicas
+			for i := range tcList.Items {
+				if tcList.Items[i].Name != tc.Name {
+					totalNodes += tcList.Items[i].Spec.Workers.Replicas
+				}
+			}
+
+			if totalNodes > maxNodes {
+				msg := fmt.Sprintf("total worker replicas (%d) exceeds provider %q per-team limit (%d)",
+					totalNodes, pc.Name, maxNodes)
+				r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+					metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
+				return fmt.Errorf("quota exceeded: %s", msg)
+			}
+		}
+	}
+
+	// Check team-level resource quotas (defense-in-depth when webhooks are disabled)
+	return r.validateTeamQuotas(ctx, tc)
+}
+
+// validateTeamQuotas checks Team.spec.resourceLimits for maxClusters, maxTotalNodes,
+// and maxNodesPerCluster. CPU/Memory/Storage are checked by the webhook.
+func (r *Reconciler) validateTeamQuotas(ctx context.Context, tc *butlerv1alpha1.TenantCluster) error {
+	if tc.Spec.TeamRef == nil {
+		return nil
+	}
+
+	logger := log.FromContext(ctx)
+
+	team := &butlerv1alpha1.Team{}
+	if err := r.Get(ctx, types.NamespacedName{Name: tc.Spec.TeamRef.Name}, team); err != nil {
+		logger.V(1).Info("could not fetch team for quota check", "team", tc.Spec.TeamRef.Name, "error", err)
+		return nil // Don't block if team can't be fetched
+	}
+
+	limits := team.Spec.ResourceLimits
+	if limits == nil {
+		return nil
+	}
+
+	// Per-cluster node limit
+	if limits.MaxNodesPerCluster != nil {
+		if tc.Spec.Workers.Replicas > *limits.MaxNodesPerCluster {
+			msg := fmt.Sprintf("worker replicas (%d) exceeds team %q per-cluster node limit (%d)",
+				tc.Spec.Workers.Replicas, team.Name, *limits.MaxNodesPerCluster)
 			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
 				metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
 			return fmt.Errorf("quota exceeded: %s", msg)
 		}
 	}
 
-	if pc.Spec.Limits.MaxNodesPerTeam != nil {
-		maxNodes := *pc.Spec.Limits.MaxNodesPerTeam
-		var tcList butlerv1alpha1.TenantClusterList
-		if err := r.List(ctx, &tcList, client.InNamespace(tc.Namespace)); err != nil {
-			return fmt.Errorf("failed to list TenantClusters: %w", err)
-		}
+	var tcList butlerv1alpha1.TenantClusterList
+	if err := r.List(ctx, &tcList, client.InNamespace(tc.Namespace)); err != nil {
+		return fmt.Errorf("failed to list TenantClusters: %w", err)
+	}
 
+	// Cluster count limit
+	if limits.MaxClusters != nil {
+		var existingCount int32
+		for i := range tcList.Items {
+			if tcList.Items[i].Name != tc.Name {
+				existingCount++
+			}
+		}
+		if existingCount+1 > *limits.MaxClusters {
+			msg := fmt.Sprintf("team %q has %d cluster(s), team quota limits to %d",
+				team.Name, existingCount, *limits.MaxClusters)
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+				metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
+			return fmt.Errorf("quota exceeded: %s", msg)
+		}
+	}
+
+	// Total nodes limit
+	if limits.MaxTotalNodes != nil {
 		totalNodes := tc.Spec.Workers.Replicas
 		for i := range tcList.Items {
 			if tcList.Items[i].Name != tc.Name {
 				totalNodes += tcList.Items[i].Spec.Workers.Replicas
 			}
 		}
-
-		if totalNodes > maxNodes {
-			msg := fmt.Sprintf("total worker replicas (%d) exceeds provider %q per-team limit (%d)",
-				totalNodes, pc.Name, maxNodes)
+		if totalNodes > *limits.MaxTotalNodes {
+			msg := fmt.Sprintf("total worker nodes (%d) would exceed team %q node quota (%d)",
+				totalNodes, team.Name, *limits.MaxTotalNodes)
 			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
 				metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
 			return fmt.Errorf("quota exceeded: %s", msg)

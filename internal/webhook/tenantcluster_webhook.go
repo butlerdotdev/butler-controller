@@ -183,6 +183,58 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 					mt := tc.Spec.Workers.MachineTemplate
 					replicas := tc.Spec.Workers.Replicas
 
+					// Cluster count check
+					if limits.MaxClusters != nil {
+						existingCount := int32(0)
+						for i := range tcList.Items {
+							if tcList.Items[i].Name != tc.Name {
+								existingCount++
+							}
+						}
+						// Adding this cluster would make existingCount+1
+						if existingCount+1 > *limits.MaxClusters {
+							allErrs = append(allErrs, field.Forbidden(
+								field.NewPath("spec"),
+								fmt.Sprintf(
+									"team %q already has %d cluster(s); team quota limits to %d",
+									team.Name, existingCount, *limits.MaxClusters,
+								),
+							))
+						}
+					}
+
+					// Total nodes check
+					if limits.MaxTotalNodes != nil {
+						totalNodes := replicas
+						for i := range tcList.Items {
+							if tcList.Items[i].Name != tc.Name {
+								totalNodes += tcList.Items[i].Spec.Workers.Replicas
+							}
+						}
+						if totalNodes > *limits.MaxTotalNodes {
+							allErrs = append(allErrs, field.Forbidden(
+								field.NewPath("spec", "workers", "replicas"),
+								fmt.Sprintf(
+									"total worker nodes (%d) would exceed team %q node quota (%d)",
+									totalNodes, team.Name, *limits.MaxTotalNodes,
+								),
+							))
+						}
+					}
+
+					// Per-cluster node limit check
+					if limits.MaxNodesPerCluster != nil {
+						if replicas > *limits.MaxNodesPerCluster {
+							allErrs = append(allErrs, field.Forbidden(
+								field.NewPath("spec", "workers", "replicas"),
+								fmt.Sprintf(
+									"worker replicas (%d) exceeds team %q per-cluster node limit (%d)",
+									replicas, team.Name, *limits.MaxNodesPerCluster,
+								),
+							))
+						}
+					}
+
 					// CPU quota check
 					if limits.MaxCPUCores != nil && !limits.MaxCPUCores.IsZero() {
 						requestedCPU := resource.NewQuantity(int64(mt.CPU)*int64(replicas), resource.DecimalSI)
