@@ -825,48 +825,37 @@ func parseImageNamespace(imageName string) (string, string) {
 	return "default", imageName
 }
 
-// getMachineSpecs extracts CPU, Memory, and Disk from TenantCluster spec.
-// Returns values formatted for HarvesterMachineTemplate.
-func (b *Builder) getMachineSpecs() (cpu int64, memory string, disk string) {
-	// Defaults
+// GetMachineSpecs extracts CPU, Memory, and Disk from TenantCluster spec with defaults.
+func GetMachineSpecs(tc *butlerv1alpha1.TenantCluster) (cpu int64, memory string, disk string) {
 	cpu = DefaultWorkerCPU
 	memoryMB := DefaultWorkerMemoryMB
 	diskGB := DefaultWorkerDiskGB
 
-	// Check if MachineTemplate is specified
-	mt := b.tc.Spec.Workers.MachineTemplate
+	mt := tc.Spec.Workers.MachineTemplate
 
-	// CPU - direct int32 field
 	if mt.CPU > 0 {
 		cpu = int64(mt.CPU)
 	}
 
-	// Memory - resource.Quantity, need to convert to string for Harvester
-	// Harvester expects format like "8Gi" or "8192Mi"
 	if !mt.Memory.IsZero() {
-		// Get value in bytes and convert to Gi for cleaner output
 		memBytes := mt.Memory.Value()
 		memGi := memBytes / (1024 * 1024 * 1024)
 		if memGi > 0 {
 			memory = fmt.Sprintf("%dGi", memGi)
 		} else {
-			// Fall back to Mi if less than 1Gi
 			memMi := memBytes / (1024 * 1024)
 			memory = fmt.Sprintf("%dMi", memMi)
 		}
 	} else {
-		// Use default in Mi format
 		memory = fmt.Sprintf("%dMi", memoryMB)
 	}
 
-	// DiskSize - resource.Quantity, convert to string for Harvester volumeSize
 	if !mt.DiskSize.IsZero() {
 		diskBytes := mt.DiskSize.Value()
 		diskGiB := diskBytes / (1024 * 1024 * 1024)
 		if diskGiB > 0 {
 			disk = fmt.Sprintf("%dGi", diskGiB)
 		} else {
-			// Unlikely but handle sub-Gi disks
 			diskMi := diskBytes / (1024 * 1024)
 			disk = fmt.Sprintf("%dMi", diskMi)
 		}
@@ -875,6 +864,10 @@ func (b *Builder) getMachineSpecs() (cpu int64, memory string, disk string) {
 	}
 
 	return cpu, memory, disk
+}
+
+func (b *Builder) getMachineSpecs() (cpu int64, memory string, disk string) {
+	return GetMachineSpecs(b.tc)
 }
 
 // buildKubeadmConfigTemplate constructs the KubeadmConfigTemplate with Rocky Linux bootstrap.
@@ -1028,27 +1021,23 @@ func (b *Builder) needsIngressHostsEntry() bool {
 		mode == butlerv1alpha1.ControlPlaneExposureModeGateway
 }
 
-// resolveControlPlaneResources merges ButlerConfig defaults with TenantCluster overrides.
+// ResolveControlPlaneResources merges ButlerConfig defaults with TenantCluster overrides.
 // Returns nil if no resources are configured (BestEffort QoS).
-func (b *Builder) resolveControlPlaneResources() *butlerv1alpha1.ControlPlaneResourcesSpec {
-	// Start with platform defaults
+func ResolveControlPlaneResources(tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) *butlerv1alpha1.ControlPlaneResourcesSpec {
 	var result *butlerv1alpha1.ControlPlaneResourcesSpec
-	if b.butlerConfig != nil {
-		result = b.butlerConfig.GetDefaultControlPlaneResources()
+	if butlerConfig != nil {
+		result = butlerConfig.GetDefaultControlPlaneResources()
 	}
 
-	// Per-cluster overrides replace per-component
-	tcResources := b.tc.Spec.ControlPlane.Resources
+	tcResources := tc.Spec.ControlPlane.Resources
 	if tcResources == nil {
 		return result
 	}
 
-	// If no platform defaults, use TC resources directly
 	if result == nil {
 		return tcResources
 	}
 
-	// Merge: TC component overrides replace entire component from ButlerConfig
 	merged := result.DeepCopy()
 	if tcResources.APIServer != nil {
 		merged.APIServer = tcResources.APIServer
@@ -1062,10 +1051,13 @@ func (b *Builder) resolveControlPlaneResources() *butlerv1alpha1.ControlPlaneRes
 	return merged
 }
 
-// componentResourceMap converts a ComponentResources to an unstructured map
-// matching the StewardControlPlane's ControlPlaneComponent shape (which wraps
-// corev1.ResourceRequirements under a "resources" key).
-func (b *Builder) componentResourceMap(cr *butlerv1alpha1.ComponentResources) map[string]interface{} {
+func (b *Builder) resolveControlPlaneResources() *butlerv1alpha1.ControlPlaneResourcesSpec {
+	return ResolveControlPlaneResources(b.tc, b.butlerConfig)
+}
+
+// ComponentResourceMap converts a ComponentResources to an unstructured map
+// matching the StewardControlPlane's ControlPlaneComponent shape.
+func ComponentResourceMap(cr *butlerv1alpha1.ComponentResources) map[string]interface{} {
 	result := map[string]interface{}{}
 	resMap := map[string]interface{}{}
 
@@ -1099,6 +1091,10 @@ func (b *Builder) componentResourceMap(cr *butlerv1alpha1.ComponentResources) ma
 		result["resources"] = resMap
 	}
 	return result
+}
+
+func (b *Builder) componentResourceMap(cr *butlerv1alpha1.ComponentResources) map[string]interface{} {
+	return ComponentResourceMap(cr)
 }
 
 // buildMachineDeployment constructs the MachineDeployment resource.
