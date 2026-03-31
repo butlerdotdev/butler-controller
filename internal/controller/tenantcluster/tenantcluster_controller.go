@@ -1174,9 +1174,12 @@ func (r *Reconciler) reconcileNodeProviderIDs(ctx context.Context, tc *butlerv1a
 	}, md); err != nil {
 		return nil
 	}
-	mdReplicas, _, _ := unstructured.NestedInt64(md.Object, "spec", "replicas")
+	mdDesired, _, _ := unstructured.NestedInt64(md.Object, "spec", "replicas")
 	mdReady, _, _ := unstructured.NestedInt64(md.Object, "status", "readyReplicas")
-	if mdReplicas > 0 && mdReady == mdReplicas {
+	mdTotal, _, _ := unstructured.NestedInt64(md.Object, "status", "replicas")
+	// Only short-circuit when all replicas are ready AND no extra replicas exist
+	// (rolling updates temporarily create more replicas than desired).
+	if mdDesired > 0 && mdReady == mdDesired && mdTotal == mdDesired {
 		return nil
 	}
 
