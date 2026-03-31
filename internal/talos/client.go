@@ -38,7 +38,8 @@ func NewClient() *Client {
 
 // ApplyConfig applies a Talos machine config to a node using talosctl.
 // The --insecure flag is always used because these are fresh VMs in maintenance mode.
-func (c *Client) ApplyConfig(ctx context.Context, nodeIP string, configData []byte) error {
+// Optional configPatches are passed as --config-patch arguments for per-node overrides.
+func (c *Client) ApplyConfig(ctx context.Context, nodeIP string, configData []byte, configPatches ...string) error {
 	logger := log.FromContext(ctx)
 
 	configFile, err := os.CreateTemp("", "talos-config-*.yaml")
@@ -58,6 +59,9 @@ func (c *Client) ApplyConfig(ctx context.Context, nodeIP string, configData []by
 		"--nodes", nodeIP,
 		"--file", configFile.Name(),
 		"--insecure",
+	}
+	for _, patch := range configPatches {
+		args = append(args, "--config-patch", patch)
 	}
 
 	logger.V(1).Info("applying Talos config", "node", nodeIP)
