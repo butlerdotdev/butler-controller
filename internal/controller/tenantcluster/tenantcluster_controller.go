@@ -227,6 +227,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		// Don't fail the reconcile, just log - scaling is not critical path
 	}
 
+	// Patch Node.spec.providerID on tenant nodes to enable CAPI Machine-to-Node matching.
+	// Required for MachineDeployment rolling updates on providers where the kubelet does not
+	// set providerID natively (Talos, Flatcar on KubeVirt/Nutanix).
+	if err := r.reconcileNodeProviderIDs(ctx, tc, butlerConfig); err != nil {
+		logger.Error(err, "failed to reconcile node providerIDs")
+	}
+
 	// Sync StewardControlPlane spec (K8s version, CP replicas, CP resources)
 	if err := r.reconcileStewardControlPlane(ctx, tc, butlerConfig); err != nil {
 		logger.Error(err, "failed to reconcile StewardControlPlane")
@@ -1135,6 +1142,148 @@ func (r *Reconciler) countTenantReadyNodes(ctx context.Context, tc *butlerv1alph
 	}
 
 	return readyCount, nil
+}
+
+// reconcileNodeProviderIDs patches spec.providerID on tenant cluster Nodes to match
+// the CAPI Machine providerID. Without this, CAPI cannot populate Machine.status.nodeRef
+// and MachineDeployment rolling updates stall. Affects Talos and Flatcar workers on
+// KubeVirt and Nutanix where the kubelet does not set providerID natively.
+// No-op for nodes that already have providerID set (including cloud provider nodes).
+func (r *Reconciler) reconcileNodeProviderIDs(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) error {
+	if tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseReady {
+		return nil
+	}
+	if tc.Status.TenantNamespace == "" {
+		return nil
+	}
+
+	logger := log.FromContext(ctx)
+
+	// Short-circuit: if CAPI MachineDeployment already reports all replicas ready,
+	// providerIDs are already set (CAPI needs nodeRef to count ready replicas).
+	mdName := fmt.Sprintf("%s-workers", tc.Name)
+	md := &unstructured.Unstructured{}
+	md.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   capi.ClusterAPIGroup,
+		Version: capi.ClusterAPIVersion,
+		Kind:    "MachineDeployment",
+	})
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: tc.Status.TenantNamespace,
+		Name:      mdName,
+	}, md); err != nil {
+		return nil
+	}
+	mdDesired, _, _ := unstructured.NestedInt64(md.Object, "spec", "replicas")
+	mdReady, _, _ := unstructured.NestedInt64(md.Object, "status", "readyReplicas")
+	mdTotal, _, _ := unstructured.NestedInt64(md.Object, "status", "replicas")
+	// Only short-circuit when all replicas are ready AND no extra replicas exist
+	// (rolling updates temporarily create more replicas than desired).
+	if mdDesired > 0 && mdReady == mdDesired && mdTotal == mdDesired {
+		return nil
+	}
+
+	machineList := &unstructured.UnstructuredList{}
+	machineList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   capi.ClusterAPIGroup,
+		Version: capi.ClusterAPIVersion,
+		Kind:    "MachineList",
+	})
+	if err := r.List(ctx, machineList, client.InNamespace(tc.Status.TenantNamespace),
+		client.MatchingLabels{"cluster.x-k8s.io/cluster-name": tc.Name}); err != nil {
+		return fmt.Errorf("failed to list Machines: %w", err)
+	}
+
+	// Build IP -> providerID map. Skip Machines in Deleting/Failed phase and
+	// detect duplicate IPs (can happen during rolling updates) to avoid wrong assignments.
+	ipToProviderID := make(map[string]string)
+	duplicateIPs := make(map[string]bool)
+	for _, machine := range machineList.Items {
+		phase, _, _ := unstructured.NestedString(machine.Object, "status", "phase")
+		if phase == "Deleting" || phase == "Failed" {
+			continue
+		}
+		providerID, _, _ := unstructured.NestedString(machine.Object, "spec", "providerID")
+		if providerID == "" {
+			continue
+		}
+		addresses, _, _ := unstructured.NestedSlice(machine.Object, "status", "addresses")
+		for _, addr := range addresses {
+			addrMap, ok := addr.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			addrType, _ := addrMap["type"].(string)
+			addrValue, _ := addrMap["address"].(string)
+			if addrType != "InternalIP" || addrValue == "" {
+				continue
+			}
+			if _, exists := ipToProviderID[addrValue]; exists {
+				duplicateIPs[addrValue] = true
+				continue
+			}
+			ipToProviderID[addrValue] = providerID
+		}
+	}
+	for ip := range duplicateIPs {
+		logger.V(1).Info("skipping ambiguous IP shared by multiple Machines", "ip", ip)
+		delete(ipToProviderID, ip)
+	}
+
+	if len(ipToProviderID) == 0 {
+		return nil
+	}
+
+	kubeconfigData, err := r.getTenantKubeconfig(ctx, tc, butlerConfig)
+	if err != nil {
+		return fmt.Errorf("failed to get tenant kubeconfig: %w", err)
+	}
+	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigData)
+	if err != nil {
+		return fmt.Errorf("failed to parse tenant kubeconfig: %w", err)
+	}
+	restConfig.Timeout = 10 * time.Second
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create tenant clientset: %w", err)
+	}
+
+	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to list tenant nodes: %w", err)
+	}
+
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		if node.Spec.ProviderID != "" {
+			continue
+		}
+
+		var nodeIP string
+		for _, addr := range node.Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP {
+				nodeIP = addr.Address
+				break
+			}
+		}
+		if nodeIP == "" {
+			continue
+		}
+
+		providerID, ok := ipToProviderID[nodeIP]
+		if !ok {
+			continue
+		}
+
+		patch := []byte(fmt.Sprintf(`{"spec":{"providerID":%q}}`, providerID))
+		if _, err := clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{}); err != nil {
+			logger.Info("failed to set providerID on tenant node", "node", node.Name, "providerID", providerID, "error", err)
+			continue
+		}
+		logger.Info("set providerID on tenant node", "node", node.Name, "providerID", providerID)
+	}
+
+	return nil
 }
 
 // reconcileStewardControlPlane patches the StewardControlPlane when the TenantCluster
