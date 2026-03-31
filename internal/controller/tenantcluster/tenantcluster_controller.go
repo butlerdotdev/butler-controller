@@ -2503,8 +2503,9 @@ func (r *Reconciler) reconcileTalosApplyConfig(ctx context.Context, tc *butlerv1
 		}
 
 		pendingCount++
+		hostnamePatch := fmt.Sprintf(`{"machine":{"network":{"hostname":%q}}}`, machine.Name)
 		logger.Info("applying Talos config to Machine", "machine", machine.Name, "ip", machine.IP)
-		if err := talosClient.ApplyConfig(ctx, machine.IP, machineConfig); err != nil {
+		if err := talosClient.ApplyConfig(ctx, machine.IP, machineConfig, hostnamePatch); err != nil {
 			// "certificate required" means the node left maintenance mode and already has config.
 			// Treat as success and annotate.
 			if strings.Contains(err.Error(), "certificate required") {
