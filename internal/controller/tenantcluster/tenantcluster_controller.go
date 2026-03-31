@@ -1146,7 +1146,9 @@ func (r *Reconciler) countTenantReadyNodes(ctx context.Context, tc *butlerv1alph
 
 // reconcileNodeProviderIDs patches spec.providerID on tenant cluster Nodes to match
 // the CAPI Machine providerID. Without this, CAPI cannot populate Machine.status.nodeRef
-// and MachineDeployment rolling updates stall.
+// and MachineDeployment rolling updates stall. Affects Talos and Flatcar workers on
+// KubeVirt and Nutanix where the kubelet does not set providerID natively.
+// No-op for nodes that already have providerID set (including cloud provider nodes).
 func (r *Reconciler) reconcileNodeProviderIDs(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) error {
 	if tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseReady {
 		return nil
@@ -1157,7 +1159,27 @@ func (r *Reconciler) reconcileNodeProviderIDs(ctx context.Context, tc *butlerv1a
 
 	logger := log.FromContext(ctx)
 
-	// List CAPI Machines in the tenant namespace
+	// Short-circuit: if CAPI MachineDeployment already reports all replicas ready,
+	// providerIDs are already set (CAPI needs nodeRef to count ready replicas).
+	mdName := fmt.Sprintf("%s-workers", tc.Name)
+	md := &unstructured.Unstructured{}
+	md.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   capi.ClusterAPIGroup,
+		Version: capi.ClusterAPIVersion,
+		Kind:    "MachineDeployment",
+	})
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: tc.Status.TenantNamespace,
+		Name:      mdName,
+	}, md); err != nil {
+		return nil
+	}
+	mdReplicas, _, _ := unstructured.NestedInt64(md.Object, "spec", "replicas")
+	mdReady, _, _ := unstructured.NestedInt64(md.Object, "status", "readyReplicas")
+	if mdReplicas > 0 && mdReady == mdReplicas {
+		return nil
+	}
+
 	machineList := &unstructured.UnstructuredList{}
 	machineList.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   capi.ClusterAPIGroup,
@@ -1166,12 +1188,18 @@ func (r *Reconciler) reconcileNodeProviderIDs(ctx context.Context, tc *butlerv1a
 	})
 	if err := r.List(ctx, machineList, client.InNamespace(tc.Status.TenantNamespace),
 		client.MatchingLabels{"cluster.x-k8s.io/cluster-name": tc.Name}); err != nil {
-		return nil
+		return fmt.Errorf("failed to list Machines: %w", err)
 	}
 
-	// Build IP -> providerID map from Machines
+	// Build IP -> providerID map. Skip Machines in Deleting/Failed phase and
+	// detect duplicate IPs (can happen during rolling updates) to avoid wrong assignments.
 	ipToProviderID := make(map[string]string)
+	duplicateIPs := make(map[string]bool)
 	for _, machine := range machineList.Items {
+		phase, _, _ := unstructured.NestedString(machine.Object, "status", "phase")
+		if phase == "Deleting" || phase == "Failed" {
+			continue
+		}
 		providerID, _, _ := unstructured.NestedString(machine.Object, "spec", "providerID")
 		if providerID == "" {
 			continue
@@ -1184,34 +1212,42 @@ func (r *Reconciler) reconcileNodeProviderIDs(ctx context.Context, tc *butlerv1a
 			}
 			addrType, _ := addrMap["type"].(string)
 			addrValue, _ := addrMap["address"].(string)
-			if addrType == "InternalIP" && addrValue != "" {
-				ipToProviderID[addrValue] = providerID
+			if addrType != "InternalIP" || addrValue == "" {
+				continue
 			}
+			if _, exists := ipToProviderID[addrValue]; exists {
+				duplicateIPs[addrValue] = true
+				continue
+			}
+			ipToProviderID[addrValue] = providerID
 		}
+	}
+	for ip := range duplicateIPs {
+		logger.V(1).Info("skipping ambiguous IP shared by multiple Machines", "ip", ip)
+		delete(ipToProviderID, ip)
 	}
 
 	if len(ipToProviderID) == 0 {
 		return nil
 	}
 
-	// Get tenant clientset
 	kubeconfigData, err := r.getTenantKubeconfig(ctx, tc, butlerConfig)
 	if err != nil {
-		return nil
+		return fmt.Errorf("failed to get tenant kubeconfig: %w", err)
 	}
 	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigData)
 	if err != nil {
-		return nil
+		return fmt.Errorf("failed to parse tenant kubeconfig: %w", err)
 	}
 	restConfig.Timeout = 10 * time.Second
 	clientset, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
-		return nil
+		return fmt.Errorf("failed to create tenant clientset: %w", err)
 	}
 
 	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil
+		return fmt.Errorf("failed to list tenant nodes: %w", err)
 	}
 
 	for i := range nodes.Items {
@@ -1236,9 +1272,9 @@ func (r *Reconciler) reconcileNodeProviderIDs(ctx context.Context, tc *butlerv1a
 			continue
 		}
 
-		node.Spec.ProviderID = providerID
-		if _, err := clientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{}); err != nil {
-			logger.V(1).Info("failed to set providerID on tenant node", "node", node.Name, "providerID", providerID, "error", err)
+		patch := []byte(fmt.Sprintf(`{"spec":{"providerID":%q}}`, providerID))
+		if _, err := clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{}); err != nil {
+			logger.Info("failed to set providerID on tenant node", "node", node.Name, "providerID", providerID, "error", err)
 			continue
 		}
 		logger.Info("set providerID on tenant node", "node", node.Name, "providerID", providerID)
