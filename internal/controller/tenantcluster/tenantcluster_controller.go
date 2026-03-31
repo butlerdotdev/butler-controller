@@ -1177,13 +1177,11 @@ func (r *Reconciler) reconcileStewardControlPlane(ctx context.Context, tc *butle
 		changes = append(changes, fmt.Sprintf("version %s->%s", currentVersion, tc.Spec.KubernetesVersion))
 	}
 
-	// Replicas drift
+	// Replicas drift. Only patch if TC explicitly sets replicas (> 0).
+	// SCP defaults to 2 via kubebuilder; patching 0 -> 1 would fight the default.
 	currentReplicas, _, _ := unstructured.NestedInt64(scp.Object, "spec", "replicas")
 	desiredReplicas := int64(tc.Spec.ControlPlane.Replicas)
-	if desiredReplicas < 1 {
-		desiredReplicas = 1
-	}
-	if desiredReplicas != currentReplicas {
+	if desiredReplicas > 0 && desiredReplicas != currentReplicas {
 		specPatch["replicas"] = desiredReplicas
 		changes = append(changes, fmt.Sprintf("replicas %d->%d", currentReplicas, desiredReplicas))
 	}
@@ -1192,19 +1190,19 @@ func (r *Reconciler) reconcileStewardControlPlane(ctx context.Context, tc *butle
 	desired := capi.ResolveControlPlaneResources(tc, butlerConfig)
 	if desired != nil {
 		if desired.APIServer != nil {
-			if r.cpComponentDrifted(scp, "apiServer", desired.APIServer) {
+			if cpComponentDrifted(scp, "apiServer", desired.APIServer) {
 				specPatch["apiServer"] = capi.ComponentResourceMap(desired.APIServer)
 				changes = append(changes, "apiServer resources")
 			}
 		}
 		if desired.ControllerManager != nil {
-			if r.cpComponentDrifted(scp, "controllerManager", desired.ControllerManager) {
+			if cpComponentDrifted(scp, "controllerManager", desired.ControllerManager) {
 				specPatch["controllerManager"] = capi.ComponentResourceMap(desired.ControllerManager)
 				changes = append(changes, "controllerManager resources")
 			}
 		}
 		if desired.Scheduler != nil {
-			if r.cpComponentDrifted(scp, "scheduler", desired.Scheduler) {
+			if cpComponentDrifted(scp, "scheduler", desired.Scheduler) {
 				specPatch["scheduler"] = capi.ComponentResourceMap(desired.Scheduler)
 				changes = append(changes, "scheduler resources")
 			}
@@ -1224,9 +1222,7 @@ func (r *Reconciler) reconcileStewardControlPlane(ctx context.Context, tc *butle
 	return r.Patch(ctx, scp, client.RawPatch(types.MergePatchType, patchBytes))
 }
 
-// cpComponentDrifted returns true when the desired ComponentResources differ
-// from the values stored on the live StewardControlPlane for a given component.
-func (r *Reconciler) cpComponentDrifted(scp *unstructured.Unstructured, component string, desired *butlerv1alpha1.ComponentResources) bool {
+func cpComponentDrifted(scp *unstructured.Unstructured, component string, desired *butlerv1alpha1.ComponentResources) bool {
 	check := func(path []string, want *resource.Quantity) bool {
 		if want == nil {
 			return false
@@ -1402,29 +1398,40 @@ func (r *Reconciler) reconcileMachineTemplate(ctx context.Context, tc *butlerv1a
 	// Remove managedFields to avoid conflicts
 	newTmpl.SetManagedFields(nil)
 
+	var setErrs []error
+	setField := func(obj map[string]interface{}, val interface{}, fields ...string) {
+		if err := unstructured.SetNestedField(obj, val, fields...); err != nil {
+			setErrs = append(setErrs, err)
+		}
+	}
+
 	switch infraRefKind {
 	case "KubevirtMachineTemplate":
 		vmBase := []string{"spec", "template", "spec", "virtualMachineTemplate", "spec", "template", "spec", "domain"}
-		_ = unstructured.SetNestedField(newTmpl.Object, desiredCPU, append(vmBase, "cpu", "cores")...)
-		_ = unstructured.SetNestedField(newTmpl.Object, desiredMemory, append(vmBase, "resources", "requests", "memory")...)
-		_ = unstructured.SetNestedField(newTmpl.Object, desiredMemory, append(vmBase, "resources", "limits", "memory")...)
-		_ = unstructured.SetNestedField(newTmpl.Object, fmt.Sprintf("%d", desiredCPU), append(vmBase, "resources", "limits", "cpu")...)
+		setField(newTmpl.Object, desiredCPU, append(vmBase, "cpu", "cores")...)
+		setField(newTmpl.Object, desiredMemory, append(vmBase, "resources", "requests", "memory")...)
+		setField(newTmpl.Object, desiredMemory, append(vmBase, "resources", "limits", "memory")...)
+		setField(newTmpl.Object, fmt.Sprintf("%d", desiredCPU), append(vmBase, "resources", "limits", "cpu")...)
 
 		dvTemplates, ok, _ := unstructured.NestedSlice(newTmpl.Object,
 			"spec", "template", "spec", "virtualMachineTemplate", "spec", "dataVolumeTemplates")
 		if ok && len(dvTemplates) > 0 {
 			if dvt, ok := dvTemplates[0].(map[string]interface{}); ok {
-				_ = unstructured.SetNestedField(dvt, desiredDisk, "spec", "storage", "resources", "requests", "storage")
+				setField(dvt, desiredDisk, "spec", "storage", "resources", "requests", "storage")
 				dvTemplates[0] = dvt
-				_ = unstructured.SetNestedField(newTmpl.Object, dvTemplates,
+				setField(newTmpl.Object, dvTemplates,
 					"spec", "template", "spec", "virtualMachineTemplate", "spec", "dataVolumeTemplates")
 			}
 		}
 
 	case "NutanixMachineTemplate":
-		_ = unstructured.SetNestedField(newTmpl.Object, desiredCPU, "spec", "template", "spec", "vcpuSockets")
-		_ = unstructured.SetNestedField(newTmpl.Object, desiredMemory, "spec", "template", "spec", "memorySize")
-		_ = unstructured.SetNestedField(newTmpl.Object, desiredDisk, "spec", "template", "spec", "systemDiskSize")
+		setField(newTmpl.Object, desiredCPU, "spec", "template", "spec", "vcpuSockets")
+		setField(newTmpl.Object, desiredMemory, "spec", "template", "spec", "memorySize")
+		setField(newTmpl.Object, desiredDisk, "spec", "template", "spec", "systemDiskSize")
+	}
+
+	if len(setErrs) > 0 {
+		return fmt.Errorf("failed to set fields on new MachineTemplate: %v", setErrs[0])
 	}
 
 	// Create the new template

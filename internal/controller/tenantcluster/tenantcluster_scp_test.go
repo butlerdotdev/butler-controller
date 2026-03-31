@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
+	"github.com/butlerdotdev/butler-controller/internal/capi"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -49,9 +50,7 @@ func quantityPtr(s string) *resource.Quantity {
 }
 
 func TestCpComponentDrifted(t *testing.T) {
-	r := &Reconciler{}
-
-	tests := []struct {
+		tests := []struct {
 		name      string
 		scpCPU    string
 		scpMemory string
@@ -110,12 +109,25 @@ func TestCpComponentDrifted(t *testing.T) {
 					Memory: quantityPtr(tt.wantMem),
 				},
 			}
-			got := r.cpComponentDrifted(scp, "apiServer", desired)
+			got := cpComponentDrifted(scp, "apiServer", desired)
 			if got != tt.drifted {
 				t.Errorf("cpComponentDrifted() = %v, want %v", got, tt.drifted)
 			}
 		})
 	}
+
+	t.Run("limits drift with nil requests", func(t *testing.T) {
+		scp := makeSCP("v1.31.0", 1, "", "")
+		desired := &butlerv1alpha1.ComponentResources{
+			Limits: &butlerv1alpha1.ResourceQuantities{
+				CPU:    quantityPtr("2"),
+				Memory: quantityPtr("1Gi"),
+			},
+		}
+		if !cpComponentDrifted(scp, "apiServer", desired) {
+			t.Error("expected drift when limits set but not on SCP")
+		}
+	})
 }
 
 func TestReconcileStewardControlPlane_PatchContent(t *testing.T) {
@@ -268,10 +280,7 @@ func TestReconcileStewardControlPlane_PatchContent(t *testing.T) {
 
 func int64Ptr(v int64) *int64 { return &v }
 
-// buildSCPPatch extracts the patch-building logic so it can be tested without a real client.
-// This mirrors the logic inside reconcileStewardControlPlane.
 func buildSCPPatch(tc *butlerv1alpha1.TenantCluster, scp *unstructured.Unstructured, butlerConfig *butlerv1alpha1.ButlerConfig) (map[string]interface{}, []string) {
-	r := &Reconciler{}
 	patch := map[string]interface{}{"spec": map[string]interface{}{}}
 	specPatch := patch["spec"].(map[string]interface{})
 	var changes []string
@@ -284,22 +293,24 @@ func buildSCPPatch(tc *butlerv1alpha1.TenantCluster, scp *unstructured.Unstructu
 
 	currentReplicas, _, _ := unstructured.NestedInt64(scp.Object, "spec", "replicas")
 	desiredReplicas := int64(tc.Spec.ControlPlane.Replicas)
-	if desiredReplicas < 1 {
-		desiredReplicas = 1
-	}
-	if desiredReplicas != currentReplicas {
+	if desiredReplicas > 0 && desiredReplicas != currentReplicas {
 		specPatch["replicas"] = desiredReplicas
 		changes = append(changes, "replicas")
 	}
 
-	desired := tc.Spec.ControlPlane.Resources
-	if butlerConfig != nil {
-		// Would use capi.ResolveControlPlaneResources here in production
-	}
+	desired := capi.ResolveControlPlaneResources(tc, butlerConfig)
 	if desired != nil {
-		if desired.APIServer != nil && r.cpComponentDrifted(scp, "apiServer", desired.APIServer) {
-			specPatch["apiServer"] = map[string]interface{}{"changed": true}
+		if desired.APIServer != nil && cpComponentDrifted(scp, "apiServer", desired.APIServer) {
+			specPatch["apiServer"] = capi.ComponentResourceMap(desired.APIServer)
 			changes = append(changes, "apiServer")
+		}
+		if desired.ControllerManager != nil && cpComponentDrifted(scp, "controllerManager", desired.ControllerManager) {
+			specPatch["controllerManager"] = capi.ComponentResourceMap(desired.ControllerManager)
+			changes = append(changes, "controllerManager")
+		}
+		if desired.Scheduler != nil && cpComponentDrifted(scp, "scheduler", desired.Scheduler) {
+			specPatch["scheduler"] = capi.ComponentResourceMap(desired.Scheduler)
+			changes = append(changes, "scheduler")
 		}
 	}
 
