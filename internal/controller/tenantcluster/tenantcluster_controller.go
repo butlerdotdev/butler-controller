@@ -29,6 +29,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -224,6 +225,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err := r.reconcileMachineDeploymentReplicas(ctx, tc, butlerConfig); err != nil {
 		logger.Error(err, "failed to reconcile MachineDeployment replicas")
 		// Don't fail the reconcile, just log - scaling is not critical path
+	}
+
+	// Sync StewardControlPlane spec (K8s version, CP replicas, CP resources)
+	if err := r.reconcileStewardControlPlane(ctx, tc, butlerConfig); err != nil {
+		logger.Error(err, "failed to reconcile StewardControlPlane")
 	}
 
 	// Detect and apply machineTemplate changes (CPU/memory/disk)
@@ -1131,6 +1137,130 @@ func (r *Reconciler) countTenantReadyNodes(ctx context.Context, tc *butlerv1alph
 	return readyCount, nil
 }
 
+// reconcileStewardControlPlane patches the StewardControlPlane when the TenantCluster
+// spec diverges from the live SCP (version, replicas, CP resources).
+func (r *Reconciler) reconcileStewardControlPlane(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) error {
+	logger := log.FromContext(ctx)
+
+	if tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseReady &&
+		tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseInstalling {
+		return nil
+	}
+	if tc.Status.TenantNamespace == "" {
+		return nil
+	}
+
+	scp := &unstructured.Unstructured{}
+	scp.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   capi.ControlPlaneAPIGroup,
+		Version: capi.ControlPlaneAPIVersion,
+		Kind:    "StewardControlPlane",
+	})
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: tc.Status.TenantNamespace,
+		Name:      tc.Name,
+	}, scp); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get StewardControlPlane: %w", err)
+	}
+
+	patch := map[string]interface{}{"spec": map[string]interface{}{}}
+	specPatch := patch["spec"].(map[string]interface{})
+	var changes []string
+
+	// Version drift
+	currentVersion, _, _ := unstructured.NestedString(scp.Object, "spec", "version")
+	if tc.Spec.KubernetesVersion != "" && tc.Spec.KubernetesVersion != currentVersion {
+		specPatch["version"] = tc.Spec.KubernetesVersion
+		changes = append(changes, fmt.Sprintf("version %s->%s", currentVersion, tc.Spec.KubernetesVersion))
+	}
+
+	// Replicas drift
+	currentReplicas, _, _ := unstructured.NestedInt64(scp.Object, "spec", "replicas")
+	desiredReplicas := int64(tc.Spec.ControlPlane.Replicas)
+	if desiredReplicas < 1 {
+		desiredReplicas = 1
+	}
+	if desiredReplicas != currentReplicas {
+		specPatch["replicas"] = desiredReplicas
+		changes = append(changes, fmt.Sprintf("replicas %d->%d", currentReplicas, desiredReplicas))
+	}
+
+	// CP resource drift
+	desired := capi.ResolveControlPlaneResources(tc, butlerConfig)
+	if desired != nil {
+		if desired.APIServer != nil {
+			if r.cpComponentDrifted(scp, "apiServer", desired.APIServer) {
+				specPatch["apiServer"] = capi.ComponentResourceMap(desired.APIServer)
+				changes = append(changes, "apiServer resources")
+			}
+		}
+		if desired.ControllerManager != nil {
+			if r.cpComponentDrifted(scp, "controllerManager", desired.ControllerManager) {
+				specPatch["controllerManager"] = capi.ComponentResourceMap(desired.ControllerManager)
+				changes = append(changes, "controllerManager resources")
+			}
+		}
+		if desired.Scheduler != nil {
+			if r.cpComponentDrifted(scp, "scheduler", desired.Scheduler) {
+				specPatch["scheduler"] = capi.ComponentResourceMap(desired.Scheduler)
+				changes = append(changes, "scheduler resources")
+			}
+		}
+	}
+
+	if len(changes) == 0 {
+		return nil
+	}
+
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("failed to marshal SCP patch: %w", err)
+	}
+
+	logger.Info("updating StewardControlPlane", "cluster", tc.Name, "changes", changes)
+	return r.Patch(ctx, scp, client.RawPatch(types.MergePatchType, patchBytes))
+}
+
+// cpComponentDrifted returns true when the desired ComponentResources differ
+// from the values stored on the live StewardControlPlane for a given component.
+func (r *Reconciler) cpComponentDrifted(scp *unstructured.Unstructured, component string, desired *butlerv1alpha1.ComponentResources) bool {
+	check := func(path []string, want *resource.Quantity) bool {
+		if want == nil {
+			return false
+		}
+		cur, ok, _ := unstructured.NestedString(scp.Object, path...)
+		if !ok {
+			return true
+		}
+		curQ, err := resource.ParseQuantity(cur)
+		if err != nil {
+			return true
+		}
+		return curQ.Cmp(*want) != 0
+	}
+
+	if desired.Requests != nil {
+		if check([]string{"spec", component, "resources", "requests", "cpu"}, desired.Requests.CPU) {
+			return true
+		}
+		if check([]string{"spec", component, "resources", "requests", "memory"}, desired.Requests.Memory) {
+			return true
+		}
+	}
+	if desired.Limits != nil {
+		if check([]string{"spec", component, "resources", "limits", "cpu"}, desired.Limits.CPU) {
+			return true
+		}
+		if check([]string{"spec", component, "resources", "limits", "memory"}, desired.Limits.Memory) {
+			return true
+		}
+	}
+	return false
+}
+
 // reconcileMachineTemplate detects CPU/memory/disk changes in the TenantCluster spec
 // and performs a rolling update by creating a new immutable MachineTemplate and updating
 // the MachineDeployment's infrastructureRef to point to it.
@@ -1191,48 +1321,52 @@ func (r *Reconciler) reconcileMachineTemplate(ctx context.Context, tc *butlerv1a
 		return fmt.Errorf("failed to get current MachineTemplate: %w", err)
 	}
 
-	// Extract current specs from the template based on provider type
-	var currentCPU int64
-	var currentMemory string
+	desiredCPU, desiredMemory, desiredDisk := capi.GetMachineSpecs(tc)
 
-	if infraRefKind == "KubevirtMachineTemplate" {
+	var currentCPU int64
+	var currentMemory, currentDisk string
+
+	switch infraRefKind {
+	case "KubevirtMachineTemplate":
 		currentCPU, _, _ = unstructured.NestedInt64(currentTmpl.Object,
 			"spec", "template", "spec", "virtualMachineTemplate", "spec",
 			"template", "spec", "domain", "cpu", "cores")
 		currentMemory, _, _ = unstructured.NestedString(currentTmpl.Object,
 			"spec", "template", "spec", "virtualMachineTemplate", "spec",
 			"template", "spec", "domain", "resources", "requests", "memory")
-	} else {
-		// Nutanix or other providers — skip for now
+		dvTemplates, ok, _ := unstructured.NestedSlice(currentTmpl.Object,
+			"spec", "template", "spec", "virtualMachineTemplate", "spec",
+			"dataVolumeTemplates")
+		if ok && len(dvTemplates) > 0 {
+			if dvt, ok := dvTemplates[0].(map[string]interface{}); ok {
+				currentDisk, _, _ = unstructured.NestedString(dvt,
+					"spec", "storage", "resources", "requests", "storage")
+			}
+		}
+
+	case "NutanixMachineTemplate":
+		currentCPU, _, _ = unstructured.NestedInt64(currentTmpl.Object,
+			"spec", "template", "spec", "vcpuSockets")
+		currentMemory, _, _ = unstructured.NestedString(currentTmpl.Object,
+			"spec", "template", "spec", "memorySize")
+		currentDisk, _, _ = unstructured.NestedString(currentTmpl.Object,
+			"spec", "template", "spec", "systemDiskSize")
+
+	default:
+		logger.Info("machine template rolling update not supported for provider",
+			"kind", infraRefKind, "cluster", tc.Name)
 		return nil
 	}
 
-	// Compute desired specs from TenantCluster
-	desiredCPU := int64(tc.Spec.Workers.MachineTemplate.CPU)
-	if desiredCPU < 1 {
-		desiredCPU = 2 // default
-	}
-	desiredMemory := "4Gi" // default
-	if !tc.Spec.Workers.MachineTemplate.Memory.IsZero() {
-		memBytes := tc.Spec.Workers.MachineTemplate.Memory.Value()
-		memGi := memBytes / (1024 * 1024 * 1024)
-		if memGi > 0 {
-			desiredMemory = fmt.Sprintf("%dGi", memGi)
-		} else {
-			memMi := memBytes / (1024 * 1024)
-			desiredMemory = fmt.Sprintf("%dMi", memMi)
-		}
-	}
-
-	// Compare — if no change, nothing to do
-	if currentCPU == desiredCPU && currentMemory == desiredMemory {
+	if currentCPU == desiredCPU && currentMemory == desiredMemory && currentDisk == desiredDisk {
 		return nil
 	}
 
 	logger.Info("machine template change detected",
 		"cluster", tc.Name,
 		"currentCPU", currentCPU, "desiredCPU", desiredCPU,
-		"currentMemory", currentMemory, "desiredMemory", desiredMemory)
+		"currentMemory", currentMemory, "desiredMemory", desiredMemory,
+		"currentDisk", currentDisk, "desiredDisk", desiredDisk)
 
 	// Determine new template name — increment version suffix
 	newName := infraRefName + "-v2"
@@ -1268,31 +1402,29 @@ func (r *Reconciler) reconcileMachineTemplate(ctx context.Context, tc *butlerv1a
 	// Remove managedFields to avoid conflicts
 	newTmpl.SetManagedFields(nil)
 
-	if infraRefKind == "KubevirtMachineTemplate" {
-		// Update CPU cores
-		if err := unstructured.SetNestedField(newTmpl.Object, desiredCPU,
-			"spec", "template", "spec", "virtualMachineTemplate", "spec",
-			"template", "spec", "domain", "cpu", "cores"); err != nil {
-			return fmt.Errorf("failed to set CPU cores: %w", err)
+	switch infraRefKind {
+	case "KubevirtMachineTemplate":
+		vmBase := []string{"spec", "template", "spec", "virtualMachineTemplate", "spec", "template", "spec", "domain"}
+		_ = unstructured.SetNestedField(newTmpl.Object, desiredCPU, append(vmBase, "cpu", "cores")...)
+		_ = unstructured.SetNestedField(newTmpl.Object, desiredMemory, append(vmBase, "resources", "requests", "memory")...)
+		_ = unstructured.SetNestedField(newTmpl.Object, desiredMemory, append(vmBase, "resources", "limits", "memory")...)
+		_ = unstructured.SetNestedField(newTmpl.Object, fmt.Sprintf("%d", desiredCPU), append(vmBase, "resources", "limits", "cpu")...)
+
+		dvTemplates, ok, _ := unstructured.NestedSlice(newTmpl.Object,
+			"spec", "template", "spec", "virtualMachineTemplate", "spec", "dataVolumeTemplates")
+		if ok && len(dvTemplates) > 0 {
+			if dvt, ok := dvTemplates[0].(map[string]interface{}); ok {
+				_ = unstructured.SetNestedField(dvt, desiredDisk, "spec", "storage", "resources", "requests", "storage")
+				dvTemplates[0] = dvt
+				_ = unstructured.SetNestedField(newTmpl.Object, dvTemplates,
+					"spec", "template", "spec", "virtualMachineTemplate", "spec", "dataVolumeTemplates")
+			}
 		}
-		// Update memory requests
-		if err := unstructured.SetNestedField(newTmpl.Object, desiredMemory,
-			"spec", "template", "spec", "virtualMachineTemplate", "spec",
-			"template", "spec", "domain", "resources", "requests", "memory"); err != nil {
-			return fmt.Errorf("failed to set memory requests: %w", err)
-		}
-		// Update memory limits
-		if err := unstructured.SetNestedField(newTmpl.Object, desiredMemory,
-			"spec", "template", "spec", "virtualMachineTemplate", "spec",
-			"template", "spec", "domain", "resources", "limits", "memory"); err != nil {
-			return fmt.Errorf("failed to set memory limits: %w", err)
-		}
-		// Update CPU limits
-		if err := unstructured.SetNestedField(newTmpl.Object, fmt.Sprintf("%d", desiredCPU),
-			"spec", "template", "spec", "virtualMachineTemplate", "spec",
-			"template", "spec", "domain", "resources", "limits", "cpu"); err != nil {
-			return fmt.Errorf("failed to set CPU limits: %w", err)
-		}
+
+	case "NutanixMachineTemplate":
+		_ = unstructured.SetNestedField(newTmpl.Object, desiredCPU, "spec", "template", "spec", "vcpuSockets")
+		_ = unstructured.SetNestedField(newTmpl.Object, desiredMemory, "spec", "template", "spec", "memorySize")
+		_ = unstructured.SetNestedField(newTmpl.Object, desiredDisk, "spec", "template", "spec", "systemDiskSize")
 	}
 
 	// Create the new template
