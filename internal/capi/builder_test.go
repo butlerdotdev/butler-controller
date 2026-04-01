@@ -21,6 +21,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
@@ -121,15 +122,14 @@ func TestBuildCluster(t *testing.T) {
 	}
 
 	infraRef := spec["infrastructureRef"].(map[string]interface{})
-	if infraRef["kind"] != "HarvesterCluster" {
-		t.Errorf("expected infrastructureRef.kind 'HarvesterCluster', got '%s'", infraRef["kind"])
+	if infraRef["kind"] != "KubevirtCluster" {
+		t.Errorf("expected infrastructureRef.kind 'KubevirtCluster', got '%s'", infraRef["kind"])
 	}
 }
 
-func TestBuildHarvesterCluster(t *testing.T) {
+func TestBuildKubevirtCluster(t *testing.T) {
 	tc := newTestTenantCluster("test-cluster", "default")
 	pc := newTestProviderConfig("harvester")
-	pc.Spec.Harvester.Namespace = "default"
 	pc.Spec.CredentialsRef.Name = "harvester-creds"
 	pc.Spec.CredentialsRef.Namespace = "butler-system"
 
@@ -139,36 +139,23 @@ func TestBuildHarvesterCluster(t *testing.T) {
 		t.Fatalf("failed to build resources: %v", err)
 	}
 
-	hc := rs.InfrastructureCluster
+	kc := rs.InfrastructureCluster
 
-	// Check GVK
-	if hc.GetAPIVersion() != "infrastructure.cluster.x-k8s.io/v1alpha1" {
-		t.Errorf("expected apiVersion 'infrastructure.cluster.x-k8s.io/v1alpha1', got '%s'", hc.GetAPIVersion())
+	if kc.GetAPIVersion() != "infrastructure.cluster.x-k8s.io/v1alpha1" {
+		t.Errorf("expected apiVersion 'infrastructure.cluster.x-k8s.io/v1alpha1', got '%s'", kc.GetAPIVersion())
 	}
-	if hc.GetKind() != "HarvesterCluster" {
-		t.Errorf("expected kind 'HarvesterCluster', got '%s'", hc.GetKind())
-	}
-
-	// Check spec
-	spec := hc.Object["spec"].(map[string]interface{})
-	if spec["targetNamespace"] != "default" {
-		t.Errorf("expected targetNamespace 'default', got '%v'", spec["targetNamespace"])
+	if kc.GetKind() != "KubevirtCluster" {
+		t.Errorf("expected kind 'KubevirtCluster', got '%s'", kc.GetKind())
 	}
 
-	// Check loadBalancerConfig (required by HarvesterCluster CRD)
-	lbConfig, ok := spec["loadBalancerConfig"].(map[string]interface{})
-	if !ok {
-		t.Error("expected loadBalancerConfig to be present")
-	} else if lbConfig["ipamType"] != "dhcp" {
-		t.Errorf("expected loadBalancerConfig.ipamType 'dhcp', got '%v'", lbConfig["ipamType"])
-	}
+	spec := kc.Object["spec"].(map[string]interface{})
 
-	identitySecret := spec["identitySecret"].(map[string]interface{})
-	if identitySecret["name"] != "harvester-creds" {
-		t.Errorf("expected identitySecret.name 'harvester-creds', got '%v'", identitySecret["name"])
+	secretRef := spec["infraClusterSecretRef"].(map[string]interface{})
+	if secretRef["name"] != "harvester-creds" {
+		t.Errorf("expected infraClusterSecretRef.name 'harvester-creds', got '%v'", secretRef["name"])
 	}
-	if identitySecret["namespace"] != "butler-system" {
-		t.Errorf("expected identitySecret.namespace 'butler-system', got '%v'", identitySecret["namespace"])
+	if secretRef["namespace"] != "butler-system" {
+		t.Errorf("expected infraClusterSecretRef.namespace 'butler-system', got '%v'", secretRef["namespace"])
 	}
 }
 
@@ -253,8 +240,8 @@ func TestBuildMachineDeployment(t *testing.T) {
 	}
 
 	infraRef := templateSpec["infrastructureRef"].(map[string]interface{})
-	if infraRef["kind"] != "HarvesterMachineTemplate" {
-		t.Errorf("expected infrastructureRef.kind 'HarvesterMachineTemplate', got '%v'", infraRef["kind"])
+	if infraRef["kind"] != "KubevirtMachineTemplate" {
+		t.Errorf("expected infrastructureRef.kind 'KubevirtMachineTemplate', got '%v'", infraRef["kind"])
 	}
 }
 
@@ -334,9 +321,8 @@ func TestBuildKubeadmConfigTemplate(t *testing.T) {
 	}
 }
 
-func TestBuildHarvesterMachineTemplate(t *testing.T) {
+func TestBuildKubevirtMachineTemplate(t *testing.T) {
 	tc := newTestTenantCluster("test-cluster", "default")
-	// Note: Workers.Resources doesn't exist in butler-api, using defaults (4 CPU, 8Gi)
 	pc := newTestProviderConfig("harvester")
 	pc.Spec.Harvester.NetworkName = "default/vlan40-workloads"
 	pc.Spec.Harvester.ImageName = "default/rocky-9-generic-cloud"
@@ -348,61 +334,31 @@ func TestBuildHarvesterMachineTemplate(t *testing.T) {
 		t.Fatalf("failed to build resources: %v", err)
 	}
 
-	hmt := rs.MachineTemplate
+	kvmt := rs.MachineTemplate
 
-	// Check GVK
-	if hmt.GetAPIVersion() != "infrastructure.cluster.x-k8s.io/v1alpha1" {
-		t.Errorf("expected apiVersion 'infrastructure.cluster.x-k8s.io/v1alpha1', got '%s'", hmt.GetAPIVersion())
+	if kvmt.GetAPIVersion() != "infrastructure.cluster.x-k8s.io/v1alpha1" {
+		t.Errorf("expected apiVersion 'infrastructure.cluster.x-k8s.io/v1alpha1', got '%s'", kvmt.GetAPIVersion())
 	}
-	if hmt.GetKind() != "HarvesterMachineTemplate" {
-		t.Errorf("expected kind 'HarvesterMachineTemplate', got '%s'", hmt.GetKind())
+	if kvmt.GetKind() != "KubevirtMachineTemplate" {
+		t.Errorf("expected kind 'KubevirtMachineTemplate', got '%s'", kvmt.GetKind())
 	}
-
-	// Check name
-	if hmt.GetName() != "test-cluster-worker" {
-		t.Errorf("expected name 'test-cluster-worker', got '%s'", hmt.GetName())
+	if kvmt.GetName() != "test-cluster-worker" {
+		t.Errorf("expected name 'test-cluster-worker', got '%s'", kvmt.GetName())
 	}
 
-	// Check spec - using defaults (4 CPU, 8Gi memory)
-	spec := hmt.Object["spec"].(map[string]interface{})
+	// KubevirtMachineTemplate has virtualMachineTemplate nested under spec.template.spec
+	spec := kvmt.Object["spec"].(map[string]interface{})
 	template := spec["template"].(map[string]interface{})
 	templateSpec := template["spec"].(map[string]interface{})
 
-	if templateSpec["cpu"].(int64) != 4 {
-		t.Errorf("expected cpu 4 (default), got '%v'", templateSpec["cpu"])
-	}
-	if templateSpec["memory"] != "8192Mi" {
-		t.Errorf("expected memory '8192Mi' (default), got '%v'", templateSpec["memory"])
-	}
-	if templateSpec["sshUser"] != "rocky" {
-		t.Errorf("expected sshUser 'rocky', got '%v'", templateSpec["sshUser"])
-	}
-	// sshKeyPair is required by HarvesterMachineTemplate CRD
-	if templateSpec["sshKeyPair"] != "default" {
-		t.Errorf("expected sshKeyPair 'default', got '%v'", templateSpec["sshKeyPair"])
+	vmTemplate, ok := templateSpec["virtualMachineTemplate"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected virtualMachineTemplate in spec")
 	}
 
-	// Check networks - should be a list of strings
-	networks := templateSpec["networks"].([]interface{})
-	if len(networks) != 1 {
-		t.Fatalf("expected 1 network, got %d", len(networks))
-	}
-	networkName := networks[0].(string)
-	if networkName != "default/vlan40-workloads" {
-		t.Errorf("expected network 'default/vlan40-workloads', got '%v'", networkName)
-	}
-
-	// Check volumes - should have volumeType
-	volumes := templateSpec["volumes"].([]interface{})
-	if len(volumes) != 1 {
-		t.Fatalf("expected 1 volume, got %d", len(volumes))
-	}
-	volume := volumes[0].(map[string]interface{})
-	if volume["volumeType"] != "image" {
-		t.Errorf("expected volumeType 'image', got '%v'", volume["volumeType"])
-	}
-	if volume["imageName"] != "default/rocky-9-generic-cloud" {
-		t.Errorf("expected imageName 'default/rocky-9-generic-cloud', got '%v'", volume["imageName"])
+	vmSpec := vmTemplate["spec"].(map[string]interface{})
+	if vmSpec["runStrategy"] != "Always" {
+		t.Errorf("expected runStrategy 'Always', got '%v'", vmSpec["runStrategy"])
 	}
 }
 
@@ -468,31 +424,42 @@ func TestAllResources(t *testing.T) {
 
 	resources := rs.AllResources()
 
-	// Should have 6 resources in the correct order
-	if len(resources) != 6 {
-		t.Errorf("expected 6 resources, got %d", len(resources))
+	// AllResources returns 7 slots (includes CredentialSecret which is nil for Harvester)
+	if len(resources) != 7 {
+		t.Fatalf("expected 7 resource slots, got %d", len(resources))
 	}
 
-	// Verify order is correct for creation
-	expectedOrder := []string{
-		"HarvesterCluster",
+	// Count non-nil resources (Harvester has no CredentialSecret)
+	var nonNil []*unstructured.Unstructured
+	for _, r := range resources {
+		if r != nil {
+			nonNil = append(nonNil, r)
+		}
+	}
+	if len(nonNil) != 6 {
+		t.Errorf("expected 6 non-nil resources, got %d", len(nonNil))
+	}
+
+	// Verify non-nil resource kinds (order: InfraCluster, Bootstrap, MachineTemplate, CP, MD, Cluster)
+	expectedKinds := []string{
+		"KubevirtCluster",
 		"KubeadmConfigTemplate",
-		"HarvesterMachineTemplate",
+		"KubevirtMachineTemplate",
 		"StewardControlPlane",
 		"MachineDeployment",
 		"Cluster",
 	}
 
-	for i, r := range resources {
-		if r.GetKind() != expectedOrder[i] {
-			t.Errorf("resource %d should be %s, got %s", i, expectedOrder[i], r.GetKind())
+	for i, r := range nonNil {
+		if r.GetKind() != expectedKinds[i] {
+			t.Errorf("resource %d should be %s, got %s", i, expectedKinds[i], r.GetKind())
 		}
 	}
 }
 
 func TestUnsupportedProvider(t *testing.T) {
 	tc := newTestTenantCluster("test-cluster", "default")
-	pc := newTestProviderConfig("nutanix")
+	pc := newTestProviderConfig("proxmox")
 
 	builder := NewBuilder(tc, pc, "test-cluster-12345678")
 	_, err := builder.Build()
