@@ -376,8 +376,14 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 				"namespace", resource.GetNamespace())
 
 			if err := r.Create(ctx, resource); err != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to create %s %s: %w",
-					resource.GetKind(), resource.GetName(), err)
+				if apierrors.IsAlreadyExists(err) {
+					logger.V(1).Info("CAPI resource created by concurrent reconcile",
+						"kind", resource.GetKind(),
+						"name", resource.GetName())
+				} else {
+					return ctrl.Result{}, fmt.Errorf("failed to create %s %s: %w",
+						resource.GetKind(), resource.GetName(), err)
+				}
 			}
 		} else if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to get %s %s: %w",
