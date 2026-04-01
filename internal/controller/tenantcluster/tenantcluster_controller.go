@@ -1711,12 +1711,12 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 			if currentHost != endpointHost || currentPort != endpointPort {
 				logger.Info("patching Cluster controlPlaneEndpoint", "currentHost", currentHost, "newHost", endpointHost, "currentPort", currentPort, "newPort", endpointPort)
 
-				if err := unstructured.SetNestedField(cluster.Object, endpointHost, "spec", "controlPlaneEndpoint", "host"); err != nil {
-					logger.Error(err, "failed to set controlPlaneEndpoint.host")
-				} else if err := unstructured.SetNestedField(cluster.Object, endpointPort, "spec", "controlPlaneEndpoint", "port"); err != nil {
-					logger.Error(err, "failed to set controlPlaneEndpoint.port")
-				} else if err := r.Update(ctx, cluster); err != nil {
-					logger.Error(err, "failed to update Cluster controlPlaneEndpoint")
+				patch := []byte(fmt.Sprintf(
+					`{"spec":{"controlPlaneEndpoint":{"host":%q,"port":%d}}}`,
+					endpointHost, endpointPort,
+				))
+				if err := r.Patch(ctx, cluster, client.RawPatch(types.MergePatchType, patch)); err != nil {
+					logger.Error(err, "failed to patch Cluster controlPlaneEndpoint")
 				} else {
 					logger.Info("successfully patched Cluster controlPlaneEndpoint", "host", endpointHost, "port", endpointPort)
 					return true, nil
