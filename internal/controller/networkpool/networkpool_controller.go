@@ -166,8 +166,26 @@ func (r *Reconciler) handleDeletion(ctx context.Context, pool *butlerv1alpha1.Ne
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	controllerutil.RemoveFinalizer(pool, butlerv1alpha1.FinalizerNetworkPool)
-	return ctrl.Result{}, r.Update(ctx, pool)
+	latest := &butlerv1alpha1.NetworkPool{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(pool), latest); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+	if controllerutil.ContainsFinalizer(latest, butlerv1alpha1.FinalizerNetworkPool) {
+		controllerutil.RemoveFinalizer(latest, butlerv1alpha1.FinalizerNetworkPool)
+		if err := r.Update(ctx, latest); err != nil {
+			if apierrors.IsNotFound(err) {
+				return ctrl.Result{}, nil
+			}
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{}, nil
 }
 
 func (r *Reconciler) validatePool(pool *butlerv1alpha1.NetworkPool) []string {

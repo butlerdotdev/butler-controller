@@ -587,9 +587,7 @@ func (r *Reconciler) handleDeletion(ctx context.Context, ws *butlerv1alpha1.Work
 		Namespace: ws.Namespace,
 	}, tc); err != nil {
 		if errors.IsNotFound(err) {
-			// Cluster gone, nothing to clean up on tenant side
-			controllerutil.RemoveFinalizer(ws, butlerv1alpha1.FinalizerWorkspace)
-			return ctrl.Result{}, r.Update(ctx, ws)
+			return r.removeFinalizer(ctx, ws)
 		}
 		return ctrl.Result{}, err
 	}
@@ -605,15 +603,13 @@ func (r *Reconciler) handleDeletion(ctx context.Context, ws *butlerv1alpha1.Work
 	kubeconfigData, err := r.getTenantKubeconfig(ctx, tc, butlerConfig)
 	if err != nil {
 		logger.Error(err, "failed to get tenant kubeconfig for cleanup, removing finalizer anyway")
-		controllerutil.RemoveFinalizer(ws, butlerv1alpha1.FinalizerWorkspace)
-		return ctrl.Result{}, r.Update(ctx, ws)
+		return r.removeFinalizer(ctx, ws)
 	}
 
 	tenantClient, err := r.buildTenantClient(kubeconfigData)
 	if err != nil {
 		logger.Error(err, "failed to build tenant client for cleanup, removing finalizer anyway")
-		controllerutil.RemoveFinalizer(ws, butlerv1alpha1.FinalizerWorkspace)
-		return ctrl.Result{}, r.Update(ctx, ws)
+		return r.removeFinalizer(ctx, ws)
 	}
 
 	// Delete service
@@ -651,12 +647,30 @@ func (r *Reconciler) handleDeletion(ctx context.Context, ws *butlerv1alpha1.Work
 		}
 	}
 
-	controllerutil.RemoveFinalizer(ws, butlerv1alpha1.FinalizerWorkspace)
-	if err := r.Update(ctx, ws); err != nil {
+	return r.removeFinalizer(ctx, ws)
+}
+
+// removeFinalizer re-fetches the Workspace, removes the finalizer, and handles conflicts.
+func (r *Reconciler) removeFinalizer(ctx context.Context, ws *butlerv1alpha1.Workspace) (ctrl.Result, error) {
+	latest := &butlerv1alpha1.Workspace{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(ws), latest); err != nil {
+		if errors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{}, err
 	}
-
-	logger.Info("workspace cleanup complete")
+	if controllerutil.ContainsFinalizer(latest, butlerv1alpha1.FinalizerWorkspace) {
+		controllerutil.RemoveFinalizer(latest, butlerv1alpha1.FinalizerWorkspace)
+		if err := r.Update(ctx, latest); err != nil {
+			if errors.IsNotFound(err) {
+				return ctrl.Result{}, nil
+			}
+			if errors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, err
+		}
+	}
 	return ctrl.Result{}, nil
 }
 

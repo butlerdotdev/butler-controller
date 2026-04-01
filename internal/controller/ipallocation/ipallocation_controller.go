@@ -115,8 +115,26 @@ func (r *Reconciler) handleDeletion(ctx context.Context, alloc *butlerv1alpha1.I
 	logger.Info("releasing IPAllocation", "name", alloc.Name,
 		"start", alloc.Status.StartAddress, "end", alloc.Status.EndAddress)
 
-	controllerutil.RemoveFinalizer(alloc, butlerv1alpha1.FinalizerIPAllocation)
-	return ctrl.Result{}, r.Update(ctx, alloc)
+	latest := &butlerv1alpha1.IPAllocation{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(alloc), latest); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+	if controllerutil.ContainsFinalizer(latest, butlerv1alpha1.FinalizerIPAllocation) {
+		controllerutil.RemoveFinalizer(latest, butlerv1alpha1.FinalizerIPAllocation)
+		if err := r.Update(ctx, latest); err != nil {
+			if apierrors.IsNotFound(err) {
+				return ctrl.Result{}, nil
+			}
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

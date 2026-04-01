@@ -200,9 +200,24 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, team *butlerv1alpha1.T
 
 	// Namespace is gone, remove finalizer
 	logger.Info("removing finalizer", "name", team.Name)
-	controllerutil.RemoveFinalizer(team, butlerv1alpha1.FinalizerTeam)
-	if err := r.Update(ctx, team); err != nil {
+	latest := &butlerv1alpha1.Team{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(team), latest); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{}, err
+	}
+	if controllerutil.ContainsFinalizer(latest, butlerv1alpha1.FinalizerTeam) {
+		controllerutil.RemoveFinalizer(latest, butlerv1alpha1.FinalizerTeam)
+		if err := r.Update(ctx, latest); err != nil {
+			if apierrors.IsNotFound(err) {
+				return ctrl.Result{}, nil
+			}
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, err
+		}
 	}
 
 	logger.Info("Team deletion complete", "name", team.Name)

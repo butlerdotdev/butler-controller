@@ -159,8 +159,26 @@ func (r *Reconciler) handleDeletion(ctx context.Context, pc *butlerv1alpha1.Prov
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	controllerutil.RemoveFinalizer(pc, butlerv1alpha1.FinalizerProviderConfig)
-	return ctrl.Result{}, r.Update(ctx, pc)
+	latest := &butlerv1alpha1.ProviderConfig{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(pc), latest); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+	if controllerutil.ContainsFinalizer(latest, butlerv1alpha1.FinalizerProviderConfig) {
+		controllerutil.RemoveFinalizer(latest, butlerv1alpha1.FinalizerProviderConfig)
+		if err := r.Update(ctx, latest); err != nil {
+			if apierrors.IsNotFound(err) {
+				return ctrl.Result{}, nil
+			}
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{}, nil
 }
 
 func (r *Reconciler) validateCredentials(ctx context.Context, pc *butlerv1alpha1.ProviderConfig) bool {
