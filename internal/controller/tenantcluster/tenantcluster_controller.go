@@ -2555,14 +2555,8 @@ func (r *Reconciler) annotateMachine(ctx context.Context, machineName, namespace
 		return err
 	}
 
-	annotations := machine.GetAnnotations()
-	if annotations == nil {
-		annotations = map[string]string{}
-	}
-	annotations["butler.butlerlabs.dev/talos-config-applied"] = "true"
-	machine.SetAnnotations(annotations)
-
-	return r.Update(ctx, machine)
+	patch := []byte(`{"metadata":{"annotations":{"butler.butlerlabs.dev/talos-config-applied":"true"}}}`)
+	return r.Patch(ctx, machine, client.RawPatch(types.MergePatchType, patch))
 }
 
 // reconcileTalosconfig creates a talosconfig Secret for CLI access to worker nodes.
