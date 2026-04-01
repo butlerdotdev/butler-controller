@@ -2783,7 +2783,7 @@ func (r *Reconciler) reconcileTalosBootstrap(ctx context.Context, tc *butlerv1al
 	}
 
 	// Get tenant client to create bootstrap token in tenant API server
-	tc2, err := r.getTenantClient(ctx, tc)
+	tenantClient, err := r.getTenantClient(ctx, tc)
 	if err != nil {
 		logger.Info("tenant client not available yet, waiting", "error", err)
 		return nil
@@ -2792,7 +2792,7 @@ func (r *Reconciler) reconcileTalosBootstrap(ctx context.Context, tc *butlerv1al
 	// Reuse existing bootstrap token if one was created by a previous attempt,
 	// otherwise generate a new one. This ensures idempotency when the reconciler
 	// succeeds in creating the token but fails before creating the bootstrap Secret.
-	bootstrapToken, err := talos.FindExistingBootstrapToken(ctx, tc2.Clientset)
+	bootstrapToken, err := talos.FindExistingBootstrapToken(ctx, tenantClient.Clientset)
 	if err != nil {
 		return fmt.Errorf("failed to check for existing bootstrap token: %w", err)
 	}
@@ -2805,7 +2805,7 @@ func (r *Reconciler) reconcileTalosBootstrap(ctx context.Context, tc *butlerv1al
 			return fmt.Errorf("failed to generate bootstrap token: %w", err)
 		}
 
-		if err := talos.CreateBootstrapTokenSecret(ctx, tc2.Clientset, bootstrapToken); err != nil {
+		if err := talos.CreateBootstrapTokenSecret(ctx, tenantClient.Clientset, bootstrapToken); err != nil {
 			return fmt.Errorf("failed to create bootstrap token in tenant: %w", err)
 		}
 
