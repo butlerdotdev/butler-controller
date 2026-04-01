@@ -86,8 +86,9 @@ var _ = BeforeSuite(func() {
 
 	// Register the NetworkPool controller (sole allocator for IPAllocations)
 	err = (&Reconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("networkpool-controller"),
 	}).SetupWithManager(mgr)
 	Expect(err).NotTo(HaveOccurred())
 
