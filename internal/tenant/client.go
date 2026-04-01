@@ -1,58 +1,36 @@
-/*
-Copyright 2026 The Butler Authors.
+// Copyright 2026 The Butler Authors.
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-// Package tenant provides utilities for managing connections to tenant clusters.
 package tenant
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// ClientManager manages Kubernetes clients for tenant clusters.
-//
-// Since Kamaji hosts tenant control planes in the management cluster,
-// we can connect to tenant APIs locally. This manager caches clients
-// to avoid recreating them on every reconciliation.
-//
-// Key features:
-// - Caches clients by tenant cluster name
-// - Automatically refreshes clients when kubeconfig changes
-// - Cleans up clients when tenant clusters are deleted
-// - Thread-safe for concurrent reconciliation
+// ClientManager manages cached Kubernetes clients for tenant clusters.
+// Tenant control planes are hosted in the management cluster via Steward,
+// so connections use the internal ClusterIP service endpoint (admin.svc).
+// Clients are cached by tenant namespace/name to avoid creating new HTTP/2
+// connections on every reconcile cycle.
 type ClientManager struct {
 	mu      sync.RWMutex
 	clients map[string]*TenantClient
 	mgr     client.Client
 }
 
-// TenantClient wraps connections to a tenant cluster.
+// TenantClient wraps a cached connection to a tenant cluster.
 type TenantClient struct {
-	// RESTConfig is the REST config for the tenant cluster.
 	RESTConfig *rest.Config
-
-	// Clientset is the Kubernetes clientset.
-	Clientset kubernetes.Interface
-
-	// Client is the controller-runtime client.
-	Client client.Client
+	Clientset  kubernetes.Interface
 }
 
 // NewClientManager creates a new ClientManager.
@@ -63,50 +41,72 @@ func NewClientManager(mgr client.Client) *ClientManager {
 	}
 }
 
-// GetClient returns a client for the specified tenant cluster.
-// If a client doesn't exist or the kubeconfig has changed, a new one is created.
-func (m *ClientManager) GetClient(ctx context.Context, namespace, name string) (*TenantClient, error) {
-	key := namespace + "/" + name
+// GetClient returns a cached client for the specified tenant cluster.
+// On cache miss, it fetches the admin kubeconfig Secret from the tenant
+// namespace, preferring the internal service endpoint (admin.svc) over
+// the external endpoint (admin.conf).
+func (m *ClientManager) GetClient(ctx context.Context, namespace, clusterName string) (*TenantClient, error) {
+	key := namespace + "/" + clusterName
 
-	// Check cache first
 	m.mu.RLock()
-	if client, ok := m.clients[key]; ok {
+	if c, ok := m.clients[key]; ok {
 		m.mu.RUnlock()
-		return client, nil
+		return c, nil
 	}
 	m.mu.RUnlock()
 
-	// Create new client
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Double-check after acquiring write lock
-	if client, ok := m.clients[key]; ok {
-		return client, nil
+	if c, ok := m.clients[key]; ok {
+		return c, nil
 	}
 
-	// TODO: Implement client creation
-	// 1. Get kubeconfig secret for tenant cluster
-	// 2. Parse kubeconfig
-	// 3. Create REST config
-	// 4. Create clientset and controller-runtime client
-	// 5. Cache and return
+	secretName := clusterName + "-admin-kubeconfig"
+	secret := &corev1.Secret{}
+	if err := m.mgr.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, secret); err != nil {
+		return nil, fmt.Errorf("fetching kubeconfig secret %s/%s: %w", namespace, secretName, err)
+	}
 
-	return nil, nil
+	var kubeconfigData []byte
+	for _, key := range []string{"admin.svc", "admin.conf"} {
+		if data, ok := secret.Data[key]; ok && len(data) > 0 {
+			kubeconfigData = data
+			break
+		}
+	}
+	if len(kubeconfigData) == 0 {
+		return nil, fmt.Errorf("kubeconfig secret %s/%s has no admin.svc or admin.conf key", namespace, secretName)
+	}
+
+	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigData)
+	if err != nil {
+		return nil, fmt.Errorf("parsing kubeconfig for %s/%s: %w", namespace, clusterName, err)
+	}
+	restConfig.Timeout = 10 * time.Second
+
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("creating clientset for %s/%s: %w", namespace, clusterName, err)
+	}
+
+	tc := &TenantClient{
+		RESTConfig: restConfig,
+		Clientset:  clientset,
+	}
+	m.clients[namespace+"/"+clusterName] = tc
+	return tc, nil
 }
 
-// RemoveClient removes a cached client.
-// Called when a tenant cluster is deleted.
-func (m *ClientManager) RemoveClient(namespace, name string) {
-	key := namespace + "/" + name
+// RemoveClient removes a cached client. Called when a tenant cluster is deleted.
+func (m *ClientManager) RemoveClient(namespace, clusterName string) {
 	m.mu.Lock()
-	delete(m.clients, key)
+	delete(m.clients, namespace+"/"+clusterName)
 	m.mu.Unlock()
 }
 
-// RefreshClient forces a client refresh.
-// Called when a kubeconfig secret changes.
-func (m *ClientManager) RefreshClient(ctx context.Context, namespace, name string) (*TenantClient, error) {
-	m.RemoveClient(namespace, name)
-	return m.GetClient(ctx, namespace, name)
+// RefreshClient forces a client refresh. Called when a kubeconfig Secret changes.
+func (m *ClientManager) RefreshClient(ctx context.Context, namespace, clusterName string) (*TenantClient, error) {
+	m.RemoveClient(namespace, clusterName)
+	return m.GetClient(ctx, namespace, clusterName)
 }
