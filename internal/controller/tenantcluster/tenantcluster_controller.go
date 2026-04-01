@@ -2054,9 +2054,25 @@ func (r *Reconciler) handleDeletion(ctx context.Context, tc *butlerv1alpha1.Tena
 		logger.Info("tenant namespace deleted", "namespace", tc.Status.TenantNamespace)
 	}
 
-	controllerutil.RemoveFinalizer(tc, butlerv1alpha1.FinalizerTenantCluster)
-	if err := r.Update(ctx, tc); err != nil {
+	latest := &butlerv1alpha1.TenantCluster{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(tc), latest); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{}, err
+	}
+
+	if controllerutil.ContainsFinalizer(latest, butlerv1alpha1.FinalizerTenantCluster) {
+		controllerutil.RemoveFinalizer(latest, butlerv1alpha1.FinalizerTenantCluster)
+		if err := r.Update(ctx, latest); err != nil {
+			if apierrors.IsNotFound(err) {
+				return ctrl.Result{}, nil
+			}
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, err
+		}
 	}
 
 	logger.Info("TenantCluster deletion complete", "name", tc.Name)
