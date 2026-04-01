@@ -35,7 +35,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -3234,8 +3233,8 @@ func (r *Reconciler) listLBAllocations(ctx context.Context, tc *butlerv1alpha1.T
 }
 
 // countUsedLBIPs counts the number of LoadBalancer services with assigned IPs on a tenant cluster.
-func (r *Reconciler) countUsedLBIPs(ctx context.Context, clientset kubernetes.Interface) (int32, error) {
-	svcList, err := clientset.CoreV1().Services("").List(ctx, metav1.ListOptions{})
+func (r *Reconciler) countUsedLBIPs(ctx context.Context, tc *tenant.TenantClient) (int32, error) {
+	svcList, err := tc.Clientset.CoreV1().Services("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return 0, fmt.Errorf("failed to list services: %w", err)
 	}
@@ -3299,7 +3298,7 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 		return nil
 	}
 
-	usedIPs, err := r.countUsedLBIPs(ctx, tenantClient.Clientset)
+	usedIPs, err := r.countUsedLBIPs(ctx, tenantClient)
 	if err != nil {
 		logger.V(1).Info("cannot count used LB IPs, skipping", "error", err)
 		return nil

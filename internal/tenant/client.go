@@ -16,15 +16,23 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+const defaultTTL = 5 * time.Minute
+
+type cachedEntry struct {
+	client    *TenantClient
+	createdAt time.Time
+}
+
 // ClientManager manages cached Kubernetes clients for tenant clusters.
 // Tenant control planes are hosted in the management cluster via Steward,
 // so connections use the internal ClusterIP service endpoint (admin.svc).
-// Clients are cached by tenant namespace/name to avoid creating new HTTP/2
-// connections on every reconcile cycle.
+// Clients are cached by tenant namespace/name with a TTL to handle
+// kubeconfig rotation (cert renewal, key rotation).
 type ClientManager struct {
 	mu      sync.RWMutex
-	clients map[string]*TenantClient
+	clients map[string]*cachedEntry
 	mgr     client.Client
+	ttl     time.Duration
 }
 
 // TenantClient wraps a cached connection to a tenant cluster.
@@ -33,35 +41,47 @@ type TenantClient struct {
 	Clientset  kubernetes.Interface
 }
 
-// NewClientManager creates a new ClientManager.
+// NewClientManager creates a new ClientManager with the default TTL.
 func NewClientManager(mgr client.Client) *ClientManager {
 	return &ClientManager{
-		clients: make(map[string]*TenantClient),
+		clients: make(map[string]*cachedEntry),
 		mgr:     mgr,
+		ttl:     defaultTTL,
 	}
 }
 
 // GetClient returns a cached client for the specified tenant cluster.
-// On cache miss, it fetches the admin kubeconfig Secret from the tenant
-// namespace, preferring the internal service endpoint (admin.svc) over
-// the external endpoint (admin.conf).
+// On cache miss or TTL expiry, it fetches the admin kubeconfig Secret
+// from the tenant namespace, preferring the internal service endpoint
+// (admin.svc) over the external endpoint (admin.conf).
 func (m *ClientManager) GetClient(ctx context.Context, namespace, clusterName string) (*TenantClient, error) {
 	key := namespace + "/" + clusterName
+	now := time.Now()
 
 	m.mu.RLock()
-	if c, ok := m.clients[key]; ok {
+	if entry, ok := m.clients[key]; ok && now.Sub(entry.createdAt) < m.ttl {
 		m.mu.RUnlock()
-		return c, nil
+		return entry.client, nil
 	}
 	m.mu.RUnlock()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if c, ok := m.clients[key]; ok {
-		return c, nil
+	if entry, ok := m.clients[key]; ok && now.Sub(entry.createdAt) < m.ttl {
+		return entry.client, nil
 	}
 
+	tc, err := m.buildClient(ctx, namespace, clusterName)
+	if err != nil {
+		return nil, err
+	}
+
+	m.clients[key] = &cachedEntry{client: tc, createdAt: now}
+	return tc, nil
+}
+
+func (m *ClientManager) buildClient(ctx context.Context, namespace, clusterName string) (*TenantClient, error) {
 	secretName := clusterName + "-admin-kubeconfig"
 	secret := &corev1.Secret{}
 	if err := m.mgr.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, secret); err != nil {
@@ -69,8 +89,8 @@ func (m *ClientManager) GetClient(ctx context.Context, namespace, clusterName st
 	}
 
 	var kubeconfigData []byte
-	for _, key := range []string{"admin.svc", "admin.conf"} {
-		if data, ok := secret.Data[key]; ok && len(data) > 0 {
+	for _, k := range []string{"admin.svc", "admin.conf"} {
+		if data, ok := secret.Data[k]; ok && len(data) > 0 {
 			kubeconfigData = data
 			break
 		}
@@ -90,12 +110,10 @@ func (m *ClientManager) GetClient(ctx context.Context, namespace, clusterName st
 		return nil, fmt.Errorf("creating clientset for %s/%s: %w", namespace, clusterName, err)
 	}
 
-	tc := &TenantClient{
+	return &TenantClient{
 		RESTConfig: restConfig,
 		Clientset:  clientset,
-	}
-	m.clients[namespace+"/"+clusterName] = tc
-	return tc, nil
+	}, nil
 }
 
 // RemoveClient removes a cached client. Called when a tenant cluster is deleted.
