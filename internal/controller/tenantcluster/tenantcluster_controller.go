@@ -35,8 +35,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -47,6 +45,7 @@ import (
 	"github.com/butlerdotdev/butler-controller/internal/addons"
 	"github.com/butlerdotdev/butler-controller/internal/capi"
 	"github.com/butlerdotdev/butler-controller/internal/talos"
+	"github.com/butlerdotdev/butler-controller/internal/tenant"
 )
 
 const (
@@ -70,8 +69,9 @@ const (
 
 type Reconciler struct {
 	client.Client
-	Scheme    *runtime.Scheme
-	Installer *addons.Installer
+	Scheme        *runtime.Scheme
+	Installer     *addons.Installer
+	ClientManager *tenant.ClientManager
 }
 
 // +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=tenantclusters,verbs=get;list;watch;create;update;patch;delete
@@ -375,8 +375,14 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 				"namespace", resource.GetNamespace())
 
 			if err := r.Create(ctx, resource); err != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to create %s %s: %w",
-					resource.GetKind(), resource.GetName(), err)
+				if apierrors.IsAlreadyExists(err) {
+					logger.V(1).Info("CAPI resource created by concurrent reconcile",
+						"kind", resource.GetKind(),
+						"name", resource.GetName())
+				} else {
+					return ctrl.Result{}, fmt.Errorf("failed to create %s %s: %w",
+						resource.GetKind(), resource.GetName(), err)
+				}
 			}
 		} else if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to get %s %s: %w",
@@ -848,6 +854,18 @@ func (r *Reconciler) getTenantKubeconfig(ctx context.Context, tc *butlerv1alpha1
 	return kubeconfigData, nil
 }
 
+// getTenantClient returns a cached Kubernetes client for the tenant cluster.
+// Falls back to ad-hoc client creation if the ClientManager is not configured.
+func (r *Reconciler) getTenantClient(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (*tenant.TenantClient, error) {
+	if r.ClientManager == nil {
+		return nil, fmt.Errorf("tenant ClientManager not configured")
+	}
+	if tc.Status.TenantNamespace == "" {
+		return nil, fmt.Errorf("tenant namespace not yet assigned")
+	}
+	return r.ClientManager.GetClient(ctx, tc.Status.TenantNamespace, tc.Name)
+}
+
 // getExternalKubeconfig returns the kubeconfig with the external hostname (admin.conf).
 // This is used for Cilium configuration in Ingress/Gateway mode to ensure proper SNI is sent.
 func (r *Reconciler) getExternalKubeconfig(ctx context.Context, tc *butlerv1alpha1.TenantCluster) ([]byte, error) {
@@ -1102,24 +1120,12 @@ func (r *Reconciler) reconcileMachineDeploymentReplicas(ctx context.Context, tc 
 // This is a fallback for when CAPI readyReplicas is unreliable (e.g. no providerID on nodes).
 // Returns 0 without error if the tenant cluster is unreachable (non-fatal).
 func (r *Reconciler) countTenantReadyNodes(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) (int32, error) {
-	kubeconfigData, err := r.getTenantKubeconfig(ctx, tc, butlerConfig)
+	tenantClient, err := r.getTenantClient(ctx, tc)
 	if err != nil {
 		return 0, nil // non-fatal: kubeconfig not available yet
 	}
 
-	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigData)
-	if err != nil {
-		return 0, nil
-	}
-	// Short timeout to avoid blocking reconcile if tenant API is slow
-	restConfig.Timeout = 10 * time.Second
-
-	clientset, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return 0, nil
-	}
-
-	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	nodes, err := tenantClient.Clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return 0, nil // non-fatal: tenant cluster may be unreachable
 	}
@@ -1234,21 +1240,12 @@ func (r *Reconciler) reconcileNodeProviderIDs(ctx context.Context, tc *butlerv1a
 		return nil
 	}
 
-	kubeconfigData, err := r.getTenantKubeconfig(ctx, tc, butlerConfig)
+	tenantClient, err := r.getTenantClient(ctx, tc)
 	if err != nil {
-		return fmt.Errorf("failed to get tenant kubeconfig: %w", err)
-	}
-	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigData)
-	if err != nil {
-		return fmt.Errorf("failed to parse tenant kubeconfig: %w", err)
-	}
-	restConfig.Timeout = 10 * time.Second
-	clientset, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create tenant clientset: %w", err)
+		return fmt.Errorf("failed to get tenant client: %w", err)
 	}
 
-	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	nodes, err := tenantClient.Clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to list tenant nodes: %w", err)
 	}
@@ -1276,7 +1273,7 @@ func (r *Reconciler) reconcileNodeProviderIDs(ctx context.Context, tc *butlerv1a
 		}
 
 		patch := []byte(fmt.Sprintf(`{"spec":{"providerID":%q}}`, providerID))
-		if _, err := clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{}); err != nil {
+		if _, err := tenantClient.Clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{}); err != nil {
 			logger.Info("failed to set providerID on tenant node", "node", node.Name, "providerID", providerID, "error", err)
 			continue
 		}
@@ -1711,12 +1708,12 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 			if currentHost != endpointHost || currentPort != endpointPort {
 				logger.Info("patching Cluster controlPlaneEndpoint", "currentHost", currentHost, "newHost", endpointHost, "currentPort", currentPort, "newPort", endpointPort)
 
-				if err := unstructured.SetNestedField(cluster.Object, endpointHost, "spec", "controlPlaneEndpoint", "host"); err != nil {
-					logger.Error(err, "failed to set controlPlaneEndpoint.host")
-				} else if err := unstructured.SetNestedField(cluster.Object, endpointPort, "spec", "controlPlaneEndpoint", "port"); err != nil {
-					logger.Error(err, "failed to set controlPlaneEndpoint.port")
-				} else if err := r.Update(ctx, cluster); err != nil {
-					logger.Error(err, "failed to update Cluster controlPlaneEndpoint")
+				patch := []byte(fmt.Sprintf(
+					`{"spec":{"controlPlaneEndpoint":{"host":%q,"port":%d}}}`,
+					endpointHost, endpointPort,
+				))
+				if err := r.Patch(ctx, cluster, client.RawPatch(types.MergePatchType, patch)); err != nil {
+					logger.Error(err, "failed to patch Cluster controlPlaneEndpoint")
 				} else {
 					logger.Info("successfully patched Cluster controlPlaneEndpoint", "host", endpointHost, "port", endpointPort)
 					return true, nil
@@ -2036,10 +2033,43 @@ func (r *Reconciler) handleDeletion(ctx context.Context, tc *butlerv1alpha1.Tena
 		}
 	}
 
+	// Evict cached tenant client before cleanup
+	if r.ClientManager != nil && tc.Status.TenantNamespace != "" {
+		r.ClientManager.RemoveClient(tc.Status.TenantNamespace, tc.Name)
+	}
+
 	// Clean up IPAllocations before deleting namespace
 	r.cleanupIPAllocations(ctx, tc)
 
 	if tc.Status.TenantNamespace != "" {
+		// Delete the CAPI Cluster first so the CAPI controller can remove its
+		// finalizer while dependent resources (KubevirtCluster, StewardControlPlane)
+		// still exist. Deleting the namespace first cascade-deletes those resources,
+		// leaving the CAPI Cluster with a finalizer that can never be removed.
+		capiCluster := &unstructured.Unstructured{}
+		capiCluster.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   capi.ClusterAPIGroup,
+			Version: capi.ClusterAPIVersion,
+			Kind:    "Cluster",
+		})
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      tc.Name,
+			Namespace: tc.Status.TenantNamespace,
+		}, capiCluster); err == nil {
+			if capiCluster.GetDeletionTimestamp().IsZero() {
+				logger.Info("deleting CAPI Cluster before namespace", "cluster", tc.Name)
+				if err := r.Delete(ctx, capiCluster); err != nil && !apierrors.IsNotFound(err) {
+					return ctrl.Result{}, err
+				}
+			}
+			// CAPI Cluster still exists (finalizer pending), wait for CAPI controller to clean up
+			logger.V(1).Info("waiting for CAPI Cluster deletion", "cluster", tc.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		} else if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+
+		// CAPI Cluster is gone, safe to delete the namespace
 		ns := &corev1.Namespace{}
 		err := r.Get(ctx, types.NamespacedName{Name: tc.Status.TenantNamespace}, ns)
 		if err == nil {
@@ -2054,9 +2084,25 @@ func (r *Reconciler) handleDeletion(ctx context.Context, tc *butlerv1alpha1.Tena
 		logger.Info("tenant namespace deleted", "namespace", tc.Status.TenantNamespace)
 	}
 
-	controllerutil.RemoveFinalizer(tc, butlerv1alpha1.FinalizerTenantCluster)
-	if err := r.Update(ctx, tc); err != nil {
+	latest := &butlerv1alpha1.TenantCluster{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(tc), latest); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{}, err
+	}
+
+	if controllerutil.ContainsFinalizer(latest, butlerv1alpha1.FinalizerTenantCluster) {
+		controllerutil.RemoveFinalizer(latest, butlerv1alpha1.FinalizerTenantCluster)
+		if err := r.Update(ctx, latest); err != nil {
+			if apierrors.IsNotFound(err) {
+				return ctrl.Result{}, nil
+			}
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, err
+		}
 	}
 
 	logger.Info("TenantCluster deletion complete", "name", tc.Name)
@@ -2545,14 +2591,8 @@ func (r *Reconciler) annotateMachine(ctx context.Context, machineName, namespace
 		return err
 	}
 
-	annotations := machine.GetAnnotations()
-	if annotations == nil {
-		annotations = map[string]string{}
-	}
-	annotations["butler.butlerlabs.dev/talos-config-applied"] = "true"
-	machine.SetAnnotations(annotations)
-
-	return r.Update(ctx, machine)
+	patch := []byte(`{"metadata":{"annotations":{"butler.butlerlabs.dev/talos-config-applied":"true"}}}`)
+	return r.Patch(ctx, machine, client.RawPatch(types.MergePatchType, patch))
 }
 
 // reconcileTalosconfig creates a talosconfig Secret for CLI access to worker nodes.
@@ -2772,28 +2812,17 @@ func (r *Reconciler) reconcileTalosBootstrap(ctx context.Context, tc *butlerv1al
 		logger.Info("using Gateway endpoint for Talos control plane endpoint", "endpoint", controlPlaneEndpoint)
 	}
 
-	// Get tenant admin kubeconfig to create bootstrap token in tenant API server
-	kubeconfigData, err := r.getTenantKubeconfig(ctx, tc, butlerConfig)
+	// Get tenant client to create bootstrap token in tenant API server
+	tenantClient, err := r.getTenantClient(ctx, tc)
 	if err != nil {
-		logger.Info("tenant kubeconfig not available yet, waiting", "error", err)
+		logger.Info("tenant client not available yet, waiting", "error", err)
 		return nil
-	}
-
-	// Create kubernetes client from kubeconfig
-	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigData)
-	if err != nil {
-		return fmt.Errorf("failed to create REST config from kubeconfig: %w", err)
-	}
-
-	tenantClient, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create tenant kubernetes client: %w", err)
 	}
 
 	// Reuse existing bootstrap token if one was created by a previous attempt,
 	// otherwise generate a new one. This ensures idempotency when the reconciler
 	// succeeds in creating the token but fails before creating the bootstrap Secret.
-	bootstrapToken, err := talos.FindExistingBootstrapToken(ctx, tenantClient)
+	bootstrapToken, err := talos.FindExistingBootstrapToken(ctx, tenantClient.Clientset)
 	if err != nil {
 		return fmt.Errorf("failed to check for existing bootstrap token: %w", err)
 	}
@@ -2806,7 +2835,7 @@ func (r *Reconciler) reconcileTalosBootstrap(ctx context.Context, tc *butlerv1al
 			return fmt.Errorf("failed to generate bootstrap token: %w", err)
 		}
 
-		if err := talos.CreateBootstrapTokenSecret(ctx, tenantClient, bootstrapToken); err != nil {
+		if err := talos.CreateBootstrapTokenSecret(ctx, tenantClient.Clientset, bootstrapToken); err != nil {
 			return fmt.Errorf("failed to create bootstrap token in tenant: %w", err)
 		}
 
@@ -3235,18 +3264,8 @@ func (r *Reconciler) listLBAllocations(ctx context.Context, tc *butlerv1alpha1.T
 }
 
 // countUsedLBIPs counts the number of LoadBalancer services with assigned IPs on a tenant cluster.
-func (r *Reconciler) countUsedLBIPs(ctx context.Context, kubeconfig []byte) (int32, error) {
-	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
-	if err != nil {
-		return 0, fmt.Errorf("failed to build REST config: %w", err)
-	}
-
-	clientset, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return 0, fmt.Errorf("failed to create clientset: %w", err)
-	}
-
-	svcList, err := clientset.CoreV1().Services("").List(ctx, metav1.ListOptions{})
+func (r *Reconciler) countUsedLBIPs(ctx context.Context, tc *tenant.TenantClient) (int32, error) {
+	svcList, err := tc.Clientset.CoreV1().Services("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return 0, fmt.Errorf("failed to list services: %w", err)
 	}
@@ -3304,13 +3323,13 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 	}
 
 	// Count used IPs from tenant cluster
-	kubeconfig, err := r.getTenantKubeconfig(ctx, tc, butlerConfig)
+	tenantClient, err := r.getTenantClient(ctx, tc)
 	if err != nil {
-		logger.V(1).Info("cannot get tenant kubeconfig for elastic IPAM, skipping", "error", err)
+		logger.V(1).Info("cannot get tenant client for elastic IPAM, skipping", "error", err)
 		return nil
 	}
 
-	usedIPs, err := r.countUsedLBIPs(ctx, kubeconfig)
+	usedIPs, err := r.countUsedLBIPs(ctx, tenantClient)
 	if err != nil {
 		logger.V(1).Info("cannot count used LB IPs, skipping", "error", err)
 		return nil

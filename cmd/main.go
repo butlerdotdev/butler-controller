@@ -45,6 +45,7 @@ import (
 	"github.com/butlerdotdev/butler-controller/internal/controller/tenantaddon"
 	"github.com/butlerdotdev/butler-controller/internal/controller/tenantcluster"
 	"github.com/butlerdotdev/butler-controller/internal/controller/workspace"
+	"github.com/butlerdotdev/butler-controller/internal/tenant"
 	"github.com/butlerdotdev/butler-controller/internal/webhook"
 )
 
@@ -72,7 +73,7 @@ func main() {
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
+	flag.BoolVar(&enableLeaderElection, "leader-elect", true,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
 	flag.BoolVar(&enableKamajiControllers, "enable-kamaji-controllers", true,
@@ -137,11 +138,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	tenantClientManager := tenant.NewClientManager(mgr.GetClient())
+
 	// TenantCluster controller. Orchestrates CAPI resources
 	if err = (&tenantcluster.Reconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		Installer: addons.NewInstaller(),
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		Installer:     addons.NewInstaller(),
+		ClientManager: tenantClientManager,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "TenantCluster")
 		os.Exit(1)

@@ -81,6 +81,11 @@ func (i *Installer) writeKubeconfig(kubeconfig []byte) (string, func(), error) {
 }
 
 func (i *Installer) runHelm(ctx context.Context, kubeconfigPath string, args ...string) error {
+	_, err := i.runHelmOutput(ctx, kubeconfigPath, args...)
+	return err
+}
+
+func (i *Installer) runHelmOutput(ctx context.Context, kubeconfigPath string, args ...string) (string, error) {
 	var fullArgs []string
 
 	if len(args) > 0 && args[0] == "repo" {
@@ -92,9 +97,67 @@ func (i *Installer) runHelm(ctx context.Context, kubeconfigPath string, args ...
 	cmd := exec.CommandContext(ctx, i.helmPath, fullArgs...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("helm failed: %w, output: %s", err, string(output))
+		return string(output), fmt.Errorf("helm failed: %w, output: %s", err, string(output))
 	}
-	return nil
+	return string(output), nil
+}
+
+// recoverPendingRelease detects Helm releases stuck in pending-install or
+// pending-upgrade state and recovers them. A pending release blocks all
+// subsequent helm upgrade --install calls. This happens when a previous
+// helm invocation was interrupted (controller restart, timeout) or when
+// two reconcile cycles race through addon installation.
+//
+// Recovery strategy:
+//   - pending-install (no prior deployed revision): delete the release via helm uninstall
+//   - pending-upgrade (has a prior deployed revision): rollback to the last deployed revision
+func (i *Installer) recoverPendingRelease(ctx context.Context, kubeconfigPath, releaseName, namespace string) {
+	logger := log.FromContext(ctx)
+
+	output, err := i.runHelmOutput(ctx, kubeconfigPath,
+		"status", releaseName, "--namespace", namespace, "--output", "json")
+	if err != nil {
+		return
+	}
+
+	status := extractHelmStatus(output)
+	if status != "pending-install" && status != "pending-upgrade" {
+		return
+	}
+
+	if status == "pending-install" {
+		logger.Info("recovering stuck pending-install release", "release", releaseName)
+		if err := i.runHelm(ctx, kubeconfigPath, "uninstall", releaseName, "--namespace", namespace); err != nil {
+			logger.Error(err, "helm uninstall failed, deleting release secrets", "release", releaseName)
+			if err := i.runKubectl(ctx, kubeconfigPath,
+				"delete", "secrets",
+				"-n", namespace,
+				"-l", fmt.Sprintf("owner=helm,name=%s", releaseName)); err != nil {
+				logger.Error(err, "failed to delete release secrets", "release", releaseName)
+			}
+		}
+	} else {
+		logger.Info("recovering stuck pending-upgrade release", "release", releaseName)
+		if err := i.runHelm(ctx, kubeconfigPath, "rollback", releaseName, "--namespace", namespace); err != nil {
+			logger.Error(err, "rollback failed", "release", releaseName)
+		}
+	}
+}
+
+func extractHelmStatus(jsonOutput string) string {
+	// Parse {"info":{"status":"pending-install"}} from helm status --output json.
+	// Avoids substring matching on the full JSON which could false-positive on
+	// chart values or resource names containing "pending-install".
+	idx := strings.Index(jsonOutput, `"status":"`)
+	if idx == -1 {
+		return ""
+	}
+	start := idx + len(`"status":"`)
+	end := strings.Index(jsonOutput[start:], `"`)
+	if end == -1 {
+		return ""
+	}
+	return jsonOutput[start : start+end]
 }
 
 func (i *Installer) runKubectl(ctx context.Context, kubeconfigPath string, args ...string) error {
@@ -215,6 +278,8 @@ func (i *Installer) InstallCilium(ctx context.Context, kubeconfig []byte, cfg Ci
 		}
 	} else {
 		// LoadBalancer mode: Standard helm install with --wait
+		i.recoverPendingRelease(ctx, kubeconfigPath, "cilium", "kube-system")
+
 		args := append([]string{"upgrade", "--install", "cilium", "cilium/cilium"}, baseArgs...)
 		args = append(args, "--wait", "--timeout", "10m")
 
@@ -385,6 +450,8 @@ func (i *Installer) InstallCertManager(ctx context.Context, kubeconfig []byte, v
 		logger.V(1).Info("helm repo update failed", "error", err)
 	}
 
+	i.recoverPendingRelease(ctx, kubeconfigPath, "cert-manager", "cert-manager")
+
 	args := []string{
 		"upgrade", "--install", "cert-manager", "jetstack/cert-manager",
 		"--namespace", "cert-manager",
@@ -428,6 +495,8 @@ func (i *Installer) InstallLonghorn(ctx context.Context, kubeconfig []byte, vers
 	if err := i.runHelm(ctx, kubeconfigPath, "repo", "update"); err != nil {
 		logger.V(1).Info("helm repo update failed", "error", err)
 	}
+
+	i.recoverPendingRelease(ctx, kubeconfigPath, "longhorn", "longhorn-system")
 
 	args := []string{
 		"upgrade", "--install", "longhorn", "longhorn/longhorn",
@@ -473,6 +542,8 @@ func (i *Installer) InstallMetalLB(ctx context.Context, kubeconfig []byte, versi
 	if err := i.runHelm(ctx, kubeconfigPath, "repo", "update"); err != nil {
 		logger.V(1).Info("helm repo update failed", "error", err)
 	}
+
+	i.recoverPendingRelease(ctx, kubeconfigPath, "metallb", "metallb-system")
 
 	args := []string{
 		"upgrade", "--install", "metallb", "metallb/metallb",
@@ -610,6 +681,8 @@ func (i *Installer) InstallTraefik(ctx context.Context, kubeconfig []byte, versi
 		logger.V(1).Info("helm repo update failed", "error", err)
 	}
 
+	i.recoverPendingRelease(ctx, kubeconfigPath, "traefik", "traefik")
+
 	args := []string{
 		"upgrade", "--install", "traefik", "traefik/traefik",
 		"--namespace", "traefik",
@@ -660,6 +733,8 @@ func (i *Installer) InstallChart(ctx context.Context, kubeconfig []byte, opts Ch
 	if err := i.runHelm(ctx, kubeconfigPath, "repo", "update"); err != nil {
 		logger.V(1).Info("helm repo update failed", "error", err)
 	}
+
+	i.recoverPendingRelease(ctx, kubeconfigPath, opts.ReleaseName, opts.Namespace)
 
 	// Build args
 	timeout := opts.Timeout
