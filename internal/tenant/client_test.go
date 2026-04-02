@@ -12,7 +12,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/kubernetes/fake"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -122,11 +121,47 @@ func TestGetClient_EmptySecret(t *testing.T) {
 }
 
 func TestGetClient_PrefersAdminSvc(t *testing.T) {
+	svcKubeconfig := []byte(`apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://internal-svc:6443
+    insecure-skip-tls-verify: true
+  name: test
+contexts:
+- context:
+    cluster: test
+    user: test
+  name: test
+current-context: test
+users:
+- name: test
+  user:
+    token: fake-token
+`)
+	confKubeconfig := []byte(`apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://external-lb:6443
+    insecure-skip-tls-verify: true
+  name: test
+contexts:
+- context:
+    cluster: test
+    user: test
+  name: test
+current-context: test
+users:
+- name: test
+  user:
+    token: fake-token
+`)
 	s := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "cluster1-admin-kubeconfig", Namespace: "ns-a"},
 		Data: map[string][]byte{
-			"admin.svc":  kubeconfig(),
-			"admin.conf": kubeconfig(),
+			"admin.svc":  svcKubeconfig,
+			"admin.conf": confKubeconfig,
 		},
 	}
 	cm := newFakeManager(s)
@@ -135,8 +170,8 @@ func TestGetClient_PrefersAdminSvc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetClient: %v", err)
 	}
-	if c.RESTConfig.Host != "https://127.0.0.1:6443" {
-		t.Errorf("unexpected host: %s", c.RESTConfig.Host)
+	if c.RESTConfig.Host != "https://internal-svc:6443" {
+		t.Errorf("expected admin.svc host, got %s", c.RESTConfig.Host)
 	}
 }
 
@@ -225,6 +260,3 @@ func TestGetClient_IsolatedNamespaces(t *testing.T) {
 		t.Error("expected different clients for different namespaces")
 	}
 }
-
-// Verify the fake clientset import compiles (used in test helpers only).
-var _ = fake.NewSimpleClientset

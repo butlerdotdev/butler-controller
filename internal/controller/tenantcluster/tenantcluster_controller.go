@@ -857,10 +857,13 @@ func (r *Reconciler) getTenantKubeconfig(ctx context.Context, tc *butlerv1alpha1
 // getTenantClient returns a cached Kubernetes client for the tenant cluster.
 // Falls back to ad-hoc client creation if the ClientManager is not configured.
 func (r *Reconciler) getTenantClient(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (*tenant.TenantClient, error) {
-	if r.ClientManager != nil && tc.Status.TenantNamespace != "" {
-		return r.ClientManager.GetClient(ctx, tc.Status.TenantNamespace, tc.Name)
+	if r.ClientManager == nil {
+		return nil, fmt.Errorf("tenant ClientManager not configured")
 	}
-	return nil, fmt.Errorf("tenant client not available: no ClientManager or tenant namespace")
+	if tc.Status.TenantNamespace == "" {
+		return nil, fmt.Errorf("tenant namespace not yet assigned")
+	}
+	return r.ClientManager.GetClient(ctx, tc.Status.TenantNamespace, tc.Name)
 }
 
 // getExternalKubeconfig returns the kubeconfig with the external hostname (admin.conf).

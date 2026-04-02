@@ -117,21 +117,24 @@ func (i *Installer) recoverPendingRelease(ctx context.Context, kubeconfigPath, r
 	output, err := i.runHelmOutput(ctx, kubeconfigPath,
 		"status", releaseName, "--namespace", namespace, "--output", "json")
 	if err != nil {
-		return // release doesn't exist yet, nothing to recover
+		return
 	}
 
-	if !strings.Contains(output, "pending-install") && !strings.Contains(output, "pending-upgrade") {
-		return // release is not stuck
+	status := extractHelmStatus(output)
+	if status != "pending-install" && status != "pending-upgrade" {
+		return
 	}
 
-	if strings.Contains(output, "pending-install") {
+	if status == "pending-install" {
 		logger.Info("recovering stuck pending-install release", "release", releaseName)
 		if err := i.runHelm(ctx, kubeconfigPath, "uninstall", releaseName, "--namespace", namespace); err != nil {
-			logger.Error(err, "failed to uninstall pending release, deleting secrets directly", "release", releaseName)
-			_ = i.runKubectl(ctx, kubeconfigPath,
+			logger.Error(err, "helm uninstall failed, deleting release secrets", "release", releaseName)
+			if err := i.runKubectl(ctx, kubeconfigPath,
 				"delete", "secrets",
 				"-n", namespace,
-				"-l", fmt.Sprintf("owner=helm,name=%s", releaseName))
+				"-l", fmt.Sprintf("owner=helm,name=%s", releaseName)); err != nil {
+				logger.Error(err, "failed to delete release secrets", "release", releaseName)
+			}
 		}
 	} else {
 		logger.Info("recovering stuck pending-upgrade release", "release", releaseName)
@@ -139,6 +142,22 @@ func (i *Installer) recoverPendingRelease(ctx context.Context, kubeconfigPath, r
 			logger.Error(err, "rollback failed", "release", releaseName)
 		}
 	}
+}
+
+func extractHelmStatus(jsonOutput string) string {
+	// Parse {"info":{"status":"pending-install"}} from helm status --output json.
+	// Avoids substring matching on the full JSON which could false-positive on
+	// chart values or resource names containing "pending-install".
+	idx := strings.Index(jsonOutput, `"status":"`)
+	if idx == -1 {
+		return ""
+	}
+	start := idx + len(`"status":"`)
+	end := strings.Index(jsonOutput[start:], `"`)
+	if end == -1 {
+		return ""
+	}
+	return jsonOutput[start : start+end]
 }
 
 func (i *Installer) runKubectl(ctx context.Context, kubeconfigPath string, args ...string) error {
