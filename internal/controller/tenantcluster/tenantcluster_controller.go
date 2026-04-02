@@ -2039,6 +2039,34 @@ func (r *Reconciler) handleDeletion(ctx context.Context, tc *butlerv1alpha1.Tena
 	r.cleanupIPAllocations(ctx, tc)
 
 	if tc.Status.TenantNamespace != "" {
+		// Delete the CAPI Cluster first so the CAPI controller can remove its
+		// finalizer while dependent resources (KubevirtCluster, StewardControlPlane)
+		// still exist. Deleting the namespace first cascade-deletes those resources,
+		// leaving the CAPI Cluster with a finalizer that can never be removed.
+		capiCluster := &unstructured.Unstructured{}
+		capiCluster.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   capi.ClusterAPIGroup,
+			Version: capi.ClusterAPIVersion,
+			Kind:    "Cluster",
+		})
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      tc.Name,
+			Namespace: tc.Status.TenantNamespace,
+		}, capiCluster); err == nil {
+			if capiCluster.GetDeletionTimestamp().IsZero() {
+				logger.Info("deleting CAPI Cluster before namespace", "cluster", tc.Name)
+				if err := r.Delete(ctx, capiCluster); err != nil && !apierrors.IsNotFound(err) {
+					return ctrl.Result{}, err
+				}
+			}
+			// CAPI Cluster still exists (finalizer pending), wait for CAPI controller to clean up
+			logger.V(1).Info("waiting for CAPI Cluster deletion", "cluster", tc.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		} else if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+
+		// CAPI Cluster is gone, safe to delete the namespace
 		ns := &corev1.Namespace{}
 		err := r.Get(ctx, types.NamespacedName{Name: tc.Status.TenantNamespace}, ns)
 		if err == nil {
