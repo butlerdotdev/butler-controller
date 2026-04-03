@@ -180,12 +180,21 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, config *butlerv1alpha1
 	}
 	config.Status.TeamCount = int32(len(teamList.Items))
 
-	// Count clusters across all namespaces
+	// Count clusters across all namespaces and update phase metrics
 	clusterList := &butlerv1alpha1.TenantClusterList{}
 	if err := r.List(ctx, clusterList); err != nil {
 		return err
 	}
 	config.Status.ClusterCount = int32(len(clusterList.Items))
+
+	phaseCounts := make(map[string]float64)
+	for i := range clusterList.Items {
+		phase := string(clusterList.Items[i].Status.Phase)
+		phaseCounts[phase]++
+	}
+	for _, p := range []string{"", "Pending", "Provisioning", "Installing", "Ready", "Failed", "Deleting"} {
+		clusterCount.WithLabelValues(p).Set(phaseCounts[p])
+	}
 
 	// Set observed generation
 	config.Status.ObservedGeneration = config.Generation

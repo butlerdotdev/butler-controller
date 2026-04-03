@@ -146,6 +146,7 @@ func main() {
 		Scheme:        mgr.GetScheme(),
 		Installer:     addons.NewInstaller(),
 		ClientManager: tenantClientManager,
+		Recorder:      mgr.GetEventRecorderFor("tenantcluster-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "TenantCluster")
 		os.Exit(1)
