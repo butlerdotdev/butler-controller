@@ -149,16 +149,20 @@ func (r *Reconciler) reconcileIPAllocation(ctx context.Context, tc *butlerv1alph
 }
 
 // reconcileElasticIPAM handles dynamic LB IP allocation growth and shrink for Ready clusters.
-func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) error {
+func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig, providerConfig *butlerv1alpha1.ProviderConfig) error {
 	if tc.Status.Phase != butlerv1alpha1.TenantClusterPhaseReady {
 		return nil
 	}
 
 	logger := log.FromContext(ctx)
 
-	pc, err := r.getProviderConfig(ctx, tc)
-	if err != nil {
-		return nil // Can't get provider, skip silently
+	pc := providerConfig
+	if pc == nil {
+		var err error
+		pc, err = r.getProviderConfig(ctx, tc)
+		if err != nil {
+			return nil
+		}
 	}
 
 	if !r.isElasticIPAM(pc) {

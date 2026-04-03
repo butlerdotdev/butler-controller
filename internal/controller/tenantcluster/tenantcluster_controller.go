@@ -203,7 +203,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 	}
 
-	result, err := r.reconcileInfrastructure(ctx, tc, butlerConfig)
+	result, err := r.reconcileInfrastructure(ctx, tc, butlerConfig, providerConfig)
 	if err != nil {
 		logger.Error(err, "failed to reconcile infrastructure")
 		return r.setFailedStatus(ctx, tc, ReasonCAPIResourceError, err.Error())
@@ -248,7 +248,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		degraded = append(degraded, "machine template sync failed ("+truncateError(err)+")")
 	}
 
-	if err := r.reconcileElasticIPAM(ctx, tc, butlerConfig); err != nil {
+	if err := r.reconcileElasticIPAM(ctx, tc, butlerConfig, providerConfig); err != nil {
 		logger.Error(err, "elastic IPAM reconciliation failed")
 		degraded = append(degraded, "elastic IPAM failed ("+truncateError(err)+")")
 	}
