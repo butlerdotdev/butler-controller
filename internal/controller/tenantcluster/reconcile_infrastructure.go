@@ -153,9 +153,9 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 		logger.Error(err, "failed to check infrastructure status")
 	}
 
-	patched, err := r.handleKamajiHarvesterCompatibility(ctx, tc, butlerConfig)
+	patched, err := r.handleStewardHarvesterCompatibility(ctx, tc, butlerConfig)
 	if err != nil {
-		logger.Error(err, "failed to handle Kamaji compatibility")
+		logger.Error(err, "failed to handle Steward compatibility")
 	}
 	if patched {
 		logger.Info("patched StewardControlPlane status for Harvester compatibility")
@@ -301,7 +301,7 @@ func (r *Reconciler) checkInfrastructureStatus(ctx context.Context, tc *butlerv1
 	return infraReady, cpReady, workersReady, nil
 }
 
-func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) (bool, error) {
+func (r *Reconciler) handleStewardHarvesterCompatibility(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) (bool, error) {
 	logger := log.FromContext(ctx)
 
 	kcp := &unstructured.Unstructured{}
@@ -442,7 +442,7 @@ func (r *Reconciler) handleKamajiHarvesterCompatibility(ctx context.Context, tc 
 		return false, nil
 	}
 
-	logger.Info("detected Kamaji unsupported infrastructure provider error, patching StewardControlPlane status")
+	logger.Info("detected unsupported infrastructure provider error, patching StewardControlPlane status")
 
 	deploymentStatus, deployFound, _ := unstructured.NestedMap(tcp.Object, "status", "kubernetesResources", "deployment")
 	if !deployFound {

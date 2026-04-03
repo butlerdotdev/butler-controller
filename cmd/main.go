@@ -36,8 +36,8 @@ import (
 	"github.com/butlerdotdev/butler-controller/internal/controller/butlerconfig"
 	"github.com/butlerdotdev/butler-controller/internal/controller/imagesync"
 	"github.com/butlerdotdev/butler-controller/internal/controller/ipallocation"
-	"github.com/butlerdotdev/butler-controller/internal/controller/kamajisecret"
-	"github.com/butlerdotdev/butler-controller/internal/controller/kamajistatus"
+	"github.com/butlerdotdev/butler-controller/internal/controller/stewardsecret"
+	"github.com/butlerdotdev/butler-controller/internal/controller/stewardstatus"
 	"github.com/butlerdotdev/butler-controller/internal/controller/managementaddon"
 	"github.com/butlerdotdev/butler-controller/internal/controller/networkpool"
 	"github.com/butlerdotdev/butler-controller/internal/controller/providerconfig"
@@ -68,7 +68,7 @@ func main() {
 	var metricsAddr string
 	var probeAddr string
 	var enableLeaderElection bool
-	var enableKamajiControllers bool
+	var enableStewardControllers bool
 	var enableWebhooks bool
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
@@ -76,9 +76,9 @@ func main() {
 	flag.BoolVar(&enableLeaderElection, "leader-elect", true,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
-	flag.BoolVar(&enableKamajiControllers, "enable-kamaji-controllers", true,
-		"Enable Kamaji integration controllers (KamajiSecret, KamajiStatus). "+
-			"Disable if not using Kamaji for hosted control planes.")
+	flag.BoolVar(&enableStewardControllers, "enable-steward-controllers", true,
+		"Enable Steward integration controllers (StewardSecret, StewardStatus). "+
+			"Disable if not using Steward for hosted control planes.")
 	flag.BoolVar(&enableWebhooks, "enable-webhooks", false,
 		"Enable admission webhooks for TenantCluster, NetworkPool, and ProviderConfig. "+
 			"Requires cert-manager for TLS certificate management.")
@@ -241,28 +241,28 @@ func main() {
 		setupLog.Info("admission webhooks disabled")
 	}
 
-	// Kamaji integration controllers
-	if enableKamajiControllers {
-		// KamajiSecret controller. Translates kubeconfig format
-		if err = (&kamajisecret.Reconciler{
+	// Steward integration controllers
+	if enableStewardControllers {
+		// StewardSecret controller. Translates kubeconfig format
+		if err = (&stewardsecret.Reconciler{
 			Client: mgr.GetClient(),
 			Scheme: mgr.GetScheme(),
 		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "unable to create controller", "controller", "KamajiSecret")
+			setupLog.Error(err, "unable to create controller", "controller", "StewardSecret")
 			os.Exit(1)
 		}
 
-		// KamajiStatus controller
-		if err = (&kamajistatus.Reconciler{
+		// StewardStatus controller
+		if err = (&stewardstatus.Reconciler{
 			Client: mgr.GetClient(),
 			Scheme: mgr.GetScheme(),
 		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "unable to create controller", "controller", "KamajiStatus")
+			setupLog.Error(err, "unable to create controller", "controller", "StewardStatus")
 			os.Exit(1)
 		}
-		setupLog.Info("Kamaji integration controllers enabled")
+		setupLog.Info("Steward integration controllers enabled")
 	} else {
-		setupLog.Info("Kamaji integration controllers disabled")
+		setupLog.Info("Steward integration controllers disabled")
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -275,7 +275,7 @@ func main() {
 	}
 
 	setupLog.Info("starting manager",
-		"controllers", []string{"ButlerConfig", "Team", "TenantCluster", "TenantAddon", "ManagementAddon", "NetworkPool", "IPAllocation", "ImageSync", "ProviderConfig", "Workspace", "KamajiSecret", "KamajiStatus"})
+		"controllers", []string{"ButlerConfig", "Team", "TenantCluster", "TenantAddon", "ManagementAddon", "NetworkPool", "IPAllocation", "ImageSync", "ProviderConfig", "Workspace", "StewardSecret", "StewardStatus"})
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")

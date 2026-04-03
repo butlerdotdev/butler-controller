@@ -237,7 +237,7 @@ func (b *Builder) buildKubevirtCluster(name string) *unstructured.Unstructured {
 			"apiVersion": "v1",
 			"kind":       "Secret",
 		},
-		// Control plane service template - Kamaji handles the actual control plane
+		// Control plane service template - Steward handles the actual control plane
 		// but capk needs this for cluster readiness
 		"controlPlaneServiceTemplate": map[string]interface{}{
 			"spec": map[string]interface{}{
@@ -633,7 +633,7 @@ func (b *Builder) buildKubevirtMachineTemplate(name string) *unstructured.Unstru
 }
 
 // buildNutanixResources constructs CAPI resources for Nutanix provider.
-// Uses CAPX (cluster-api-provider-nutanix) with Kamaji hosted control planes.
+// Uses CAPX (cluster-api-provider-nutanix) with Steward hosted control planes.
 func (b *Builder) buildNutanixResources() (*ResourceSet, error) {
 	// Validate Nutanix credentials are provided
 	if b.nutanixCreds == nil {
@@ -707,7 +707,7 @@ func (b *Builder) buildNutanixCluster(name string) *unstructured.Unstructured {
 	credSecretName := fmt.Sprintf("%s-nutanix-creds", name)
 
 	spec := map[string]interface{}{
-		// Control plane endpoint - will be patched by Kamaji when LoadBalancer gets IP
+		// Control plane endpoint - will be patched by Steward when LoadBalancer gets IP
 		"controlPlaneEndpoint": map[string]interface{}{
 			"host": "",
 			"port": int64(6443),

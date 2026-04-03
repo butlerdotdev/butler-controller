@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package kamajisecret provides a controller that translates Kamaji kubeconfig secrets
+// Package stewardsecret provides a controller that translates Steward kubeconfig secrets
 // to the format expected by Cluster API.
 //
-// Problem: Kamaji creates kubeconfig secrets with key "admin.conf", but CAPI expects "value".
-// Solution: Watch Kamaji secrets and create/update corresponding CAPI-compatible secrets.
-package kamajisecret
+// Problem: Steward creates kubeconfig secrets with key "admin.conf", but CAPI expects "value".
+// Solution: Watch Steward secrets and create/update corresponding CAPI-compatible secrets.
+package stewardsecret
 
 import (
 	"context"
@@ -39,12 +39,12 @@ import (
 )
 
 const (
-	// StewardAdminKubeconfigLabel is the label that identifies Kamaji admin kubeconfig secrets.
+	// StewardAdminKubeconfigLabel is the label that identifies Steward admin kubeconfig secrets.
 	StewardAdminKubeconfigLabel = "steward.butlerlabs.dev/component"
-	KamajiAdminKubeconfigValue = "admin-kubeconfig"
+	StewardAdminKubeconfigValue = "admin-kubeconfig"
 
-	// KamajiSourceKey is the key Kamaji uses for the kubeconfig.
-	KamajiSourceKey = "admin.conf"
+	// StewardSourceKey is the key Steward uses for the kubeconfig.
+	StewardSourceKey = "admin.conf"
 
 	// CAPITargetKey is the key CAPI expects for the kubeconfig.
 	CAPITargetKey = "value"
@@ -56,7 +56,7 @@ const (
 	ButlerManagedLabel = "app.kubernetes.io/managed-by"
 )
 
-// Reconciler watches Kamaji kubeconfig secrets and creates CAPI-compatible versions.
+// Reconciler watches Steward kubeconfig secrets and creates CAPI-compatible versions.
 type Reconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -64,13 +64,13 @@ type Reconciler struct {
 
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
 
-// Reconcile handles Kamaji secret translation.
+// Reconcile handles Steward secret translation.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Get the Kamaji secret
-	kamajiSecret := &corev1.Secret{}
-	if err := r.Get(ctx, req.NamespacedName, kamajiSecret); err != nil {
+	// Get the Steward admin-kubeconfig secret
+	stewardSecret := &corev1.Secret{}
+	if err := r.Get(ctx, req.NamespacedName, stewardSecret); err != nil {
 		if apierrors.IsNotFound(err) {
 			// Secret was deleted, CAPI secret will be garbage collected via owner reference
 			return ctrl.Result{}, nil
@@ -78,22 +78,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
-	// Skip if not a Kamaji admin kubeconfig secret
-	if kamajiSecret.Labels[StewardAdminKubeconfigLabel] != KamajiAdminKubeconfigValue {
+	// Skip if not a Steward admin kubeconfig secret
+	if stewardSecret.Labels[StewardAdminKubeconfigLabel] != StewardAdminKubeconfigValue {
 		return ctrl.Result{}, nil
 	}
 
-	// Extract kubeconfig from Kamaji secret
-	kubeconfigData, ok := kamajiSecret.Data[KamajiSourceKey]
+	// Extract kubeconfig from Steward secret
+	kubeconfigData, ok := stewardSecret.Data[StewardSourceKey]
 	if !ok {
-		logger.V(1).Info("Kamaji secret missing admin.conf key", "secret", req.NamespacedName)
+		logger.V(1).Info("Steward secret missing admin.conf key", "secret", req.NamespacedName)
 		return ctrl.Result{}, nil
 	}
 
 	// Derive cluster name from secret name (format: {cluster-name}-admin-kubeconfig)
-	clusterName := extractClusterName(kamajiSecret.Name)
+	clusterName := extractClusterName(stewardSecret.Name)
 	if clusterName == "" {
-		logger.Info("could not extract cluster name from secret", "secret", kamajiSecret.Name)
+		logger.Info("could not extract cluster name from secret", "secret", stewardSecret.Name)
 		return ctrl.Result{}, nil
 	}
 
@@ -120,9 +120,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			CAPITargetKey: kubeconfigData,
 		}
 
-		// Set owner reference to the original Kamaji secret
-		// This ensures cleanup when the Kamaji secret is deleted
-		return controllerutil.SetOwnerReference(kamajiSecret, capiSecret, r.Scheme)
+		// Set owner reference to the original Steward secret
+		// This ensures cleanup when the Steward secret is deleted
+		return controllerutil.SetOwnerReference(stewardSecret, capiSecret, r.Scheme)
 	})
 
 	if err != nil {
@@ -143,7 +143,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	return ctrl.Result{}, nil
 }
 
-// extractClusterName extracts the cluster name from a Kamaji secret name.
+// extractClusterName extracts the cluster name from a Steward admin-kubeconfig secret name.
 // Format: {cluster-name}-admin-kubeconfig -> cluster-name
 func extractClusterName(secretName string) string {
 	const suffix = "-admin-kubeconfig"
@@ -155,14 +155,14 @@ func extractClusterName(secretName string) string {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// Only watch secrets with the Kamaji admin-kubeconfig label
+	// Only watch secrets with the Steward admin-kubeconfig label
 	labelPredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		labels := obj.GetLabels()
-		return labels[StewardAdminKubeconfigLabel] == KamajiAdminKubeconfigValue
+		return labels[StewardAdminKubeconfigLabel] == StewardAdminKubeconfigValue
 	})
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Secret{}, builder.WithPredicates(labelPredicate)).
-		Named("kamajisecret").
+		Named("stewardsecret").
 		Complete(r)
 }

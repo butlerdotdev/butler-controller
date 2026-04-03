@@ -37,7 +37,7 @@ const (
 )
 
 // Installer handles addon installations on tenant clusters.
-// Tenant clusters use Kamaji hosted control planes, so Cilium must be
+// Tenant clusters use Steward hosted control planes, so Cilium must be
 // configured to reach the API server via kubernetes.default.svc.cluster.local
 // rather than localhost:7445 used on management clusters.
 type Installer struct {
