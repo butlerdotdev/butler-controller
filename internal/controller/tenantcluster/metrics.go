@@ -26,20 +26,12 @@ var (
 		[]string{"namespace", "name", "phase"},
 	)
 
-	clusterCount = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "butler_tenant_clusters",
-			Help: "Total number of TenantClusters by phase.",
-		},
-		[]string{"phase"},
-	)
 )
 
 func init() {
 	metrics.Registry.MustRegister(
 		reconcileDuration,
 		clusterPhase,
-		clusterCount,
 	)
 }
 
