@@ -224,56 +224,71 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return result, nil
 	}
 
-	// Auto-enroll observability agents for Ready clusters
+	// Steady-state operations for Ready and Installing clusters.
+	// Non-fatal: failures are aggregated into a degraded condition rather than
+	// failing the reconcile. The cluster remains Ready but operators can see
+	// which background operations need attention.
+	var degraded []string
+
 	if tc.Status.Phase == butlerv1alpha1.TenantClusterPhaseReady {
 		if err := r.reconcileAutoEnrollObservability(ctx, tc, butlerConfig); err != nil {
 			logger.Error(err, "failed to auto-enroll observability agents")
+			degraded = append(degraded, "observability sync failed ("+truncateError(err)+")")
 		}
 	}
 
-	// Sync MachineDeployment replicas for Ready clusters
-	// This handles scaling operations after initial provisioning
 	if err := r.reconcileMachineDeploymentReplicas(ctx, tc, butlerConfig); err != nil {
 		logger.Error(err, "failed to reconcile MachineDeployment replicas")
-		// Don't fail the reconcile, just log - scaling is not critical path
+		degraded = append(degraded, "replica sync failed ("+truncateError(err)+")")
 	}
 
-	// Patch Node.spec.providerID on tenant nodes to enable CAPI Machine-to-Node matching.
-	// Required for MachineDeployment rolling updates on providers where the kubelet does not
-	// set providerID natively (Talos, Flatcar on KubeVirt/Nutanix).
 	if err := r.reconcileNodeProviderIDs(ctx, tc, butlerConfig); err != nil {
 		logger.Error(err, "failed to reconcile node providerIDs")
+		degraded = append(degraded, "providerID sync failed ("+truncateError(err)+")")
 	}
 
-	// Sync StewardControlPlane spec (K8s version, CP replicas, CP resources)
 	if err := r.reconcileStewardControlPlane(ctx, tc, butlerConfig); err != nil {
 		logger.Error(err, "failed to reconcile StewardControlPlane")
+		degraded = append(degraded, "control plane sync failed ("+truncateError(err)+")")
 	}
 
-	// Detect and apply machineTemplate changes (CPU/memory/disk)
-	// Creates a new immutable template and updates MachineDeployment for rolling update
 	if err := r.reconcileMachineTemplate(ctx, tc); err != nil {
 		logger.Error(err, "failed to reconcile MachineTemplate")
+		degraded = append(degraded, "machine template sync failed ("+truncateError(err)+")")
 	}
 
-	// Elastic IPAM: grow/shrink LB IP allocations for Ready clusters
 	if err := r.reconcileElasticIPAM(ctx, tc, butlerConfig); err != nil {
 		logger.Error(err, "elastic IPAM reconciliation failed")
-		// Non-fatal: don't fail the reconcile
+		degraded = append(degraded, "elastic IPAM failed ("+truncateError(err)+")")
 	}
 
-	// For Talos clusters, run apply-config and talosconfig as a safety net for Ready
-	// clusters (e.g. new workers from scaling). The primary apply-config happens in
-	// reconcileInfrastructure before addon installation.
 	if isTalosCluster(tc) {
 		if err := r.reconcileTalosBootstrap(ctx, tc, butlerConfig); err != nil {
 			logger.Error(err, "failed to reconcile Talos bootstrap")
+			degraded = append(degraded, "talos bootstrap failed ("+truncateError(err)+")")
 		}
 		if _, err := r.reconcileTalosApplyConfig(ctx, tc); err != nil {
 			logger.Error(err, "failed to apply Talos config to workers")
+			degraded = append(degraded, "talos config apply failed ("+truncateError(err)+")")
 		}
 		if err := r.reconcileTalosconfig(ctx, tc); err != nil {
 			logger.Error(err, "failed to create talosconfig Secret")
+			degraded = append(degraded, "talosconfig sync failed ("+truncateError(err)+")")
+		}
+	}
+
+	if tc.Status.Phase == butlerv1alpha1.TenantClusterPhaseReady {
+		if len(degraded) > 0 {
+			msg := fmt.Sprintf("%d operations degraded: %s", len(degraded), strings.Join(degraded, ", "))
+			if len(msg) > 1024 {
+				msg = msg[:1021] + "..."
+			}
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionReady,
+				metav1.ConditionTrue, "ReconcileDegraded", msg)
+			r.Recorder.Eventf(tc, corev1.EventTypeWarning, "ReconcileDegraded", msg)
+		} else {
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionReady,
+				metav1.ConditionTrue, "ReconcileSucceeded", "All operations healthy")
 		}
 	}
 
@@ -2330,6 +2345,14 @@ func (r *Reconciler) setCondition(tc *butlerv1alpha1.TenantCluster, condType str
 		Message:            message,
 		ObservedGeneration: tc.Generation,
 	})
+}
+
+func truncateError(err error) string {
+	s := err.Error()
+	if len(s) > 100 {
+		return s[:97] + "..."
+	}
+	return s
 }
 
 func (r *Reconciler) calculateRequeueInterval(tc *butlerv1alpha1.TenantCluster) time.Duration {
