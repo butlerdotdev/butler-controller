@@ -25,7 +25,6 @@ var (
 		},
 		[]string{"namespace", "name", "phase"},
 	)
-
 )
 
 func init() {
