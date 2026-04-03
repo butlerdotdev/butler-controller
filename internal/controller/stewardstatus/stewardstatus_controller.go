@@ -14,16 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package kamajistatus provides a controller that synchronizes Kamaji TenantControlPlane
+// Package stewardstatus provides a controller that synchronizes Steward TenantControlPlane
 // status to StewardControlPlane for CAPI compatibility.
 //
-// Problem: The Kamaji CAPI provider sometimes fails to properly synchronize status
-// from the Kamaji TenantControlPlane to the StewardControlPlane resource, causing
+// Problem: The capi-steward provider sometimes fails to properly synchronize status
+// from the Steward TenantControlPlane to the StewardControlPlane resource, causing
 // CAPI to not recognize the control plane as ready.
 //
 // Solution: Watch TenantControlPlane resources and patch the corresponding
 // StewardControlPlane status when the TCP is ready.
-package kamajistatus
+package stewardstatus
 
 import (
 	"context"
@@ -53,7 +53,7 @@ var (
 	}
 )
 
-// Reconciler watches Kamaji TenantControlPlane resources and syncs status to StewardControlPlane.
+// Reconciler watches Steward TenantControlPlane resources and syncs status to StewardControlPlane.
 type Reconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -61,8 +61,8 @@ type Reconciler struct {
 
 // +kubebuilder:rbac:groups=steward.butlerlabs.dev,resources=tenantcontrolplanes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=steward.butlerlabs.dev,resources=tenantcontrolplanes/status,verbs=get
-// +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=stewardcontrolplanes,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=stewardcontrolplanes/status,verbs=get;update;patch
 
 // Reconcile handles TenantControlPlane status synchronization.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -212,6 +212,6 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(tcp).
-		Named("kamajistatus").
+		Named("stewardstatus").
 		Complete(r)
 }
