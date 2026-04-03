@@ -25,7 +25,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
-func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) (ctrl.Result, error) {
+func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig, providerConfig *butlerv1alpha1.ProviderConfig) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	// Already ready, nothing to do
@@ -35,11 +35,14 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 
 	logger.Info("reconciling infrastructure", "tenantNamespace", tc.Status.TenantNamespace)
 
-	providerConfig, err := r.getProviderConfig(ctx, tc)
-	if err != nil {
-		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionInfrastructureReady,
-			metav1.ConditionFalse, ReasonProviderConfigNotFound, err.Error())
-		return ctrl.Result{}, err
+	if providerConfig == nil {
+		var err error
+		providerConfig, err = r.getProviderConfig(ctx, tc)
+		if err != nil {
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionInfrastructureReady,
+				metav1.ConditionFalse, ReasonProviderConfigNotFound, err.Error())
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Validate provider scope access
