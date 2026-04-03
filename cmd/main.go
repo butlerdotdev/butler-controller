@@ -79,6 +79,8 @@ func main() {
 	flag.BoolVar(&enableStewardControllers, "enable-steward-controllers", true,
 		"Enable Steward integration controllers (StewardSecret, StewardStatus). "+
 			"Disable if not using Steward for hosted control planes.")
+	flag.BoolVar(&enableStewardControllers, "enable-kamaji-controllers", true,
+		"Deprecated: use --enable-steward-controllers instead.")
 	flag.BoolVar(&enableWebhooks, "enable-webhooks", false,
 		"Enable admission webhooks for TenantCluster, NetworkPool, and ProviderConfig. "+
 			"Requires cert-manager for TLS certificate management.")
