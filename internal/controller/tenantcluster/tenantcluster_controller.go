@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -72,6 +73,7 @@ type Reconciler struct {
 	Scheme        *runtime.Scheme
 	Installer     *addons.Installer
 	ClientManager *tenant.ClientManager
+	Recorder      record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=tenantclusters,verbs=get;list;watch;create;update;patch;delete
@@ -94,9 +96,11 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=harvesterclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=harvestermachinetemplates,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	reconcileStart := time.Now()
 
 	tc := &butlerv1alpha1.TenantCluster{}
 	if err := r.Get(ctx, req.NamespacedName, tc); err != nil {
@@ -105,6 +109,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 		return ctrl.Result{}, err
 	}
+
+	defer func() {
+		reconcileDuration.WithLabelValues(tc.Namespace, tc.Name).Observe(time.Since(reconcileStart).Seconds())
+		recordPhase(tc.Namespace, tc.Name, string(tc.Status.Phase))
+	}()
 
 	logger.Info("reconciling TenantCluster",
 		"name", tc.Name,
@@ -149,6 +158,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	if tc.Status.Phase == butlerv1alpha1.TenantClusterPhasePending {
 		tc.Status.Phase = butlerv1alpha1.TenantClusterPhaseProvisioning
+		r.Recorder.Eventf(tc, corev1.EventTypeNormal, "ClusterProvisioning",
+			"Infrastructure provisioning started for %s", tc.Name)
 		if err := r.Status().Update(ctx, tc); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -642,6 +653,8 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 
 	r.setCondition(tc, butlerv1alpha1.TenantClusterConditionReady,
 		metav1.ConditionTrue, ReasonReady, "Cluster is ready")
+	r.Recorder.Eventf(tc, corev1.EventTypeNormal, "ClusterReady",
+		"Cluster %s is ready with %d workers", tc.Name, tc.Spec.Workers.Replicas)
 
 	logger.Info("TenantCluster is ready", "name", tc.Name)
 
@@ -1108,6 +1121,9 @@ func (r *Reconciler) reconcileMachineDeploymentReplicas(ctx context.Context, tc 
 	if err := r.Patch(ctx, md, client.RawPatch(types.MergePatchType, patch)); err != nil {
 		return fmt.Errorf("failed to patch MachineDeployment replicas: %w", err)
 	}
+
+	r.Recorder.Eventf(tc, corev1.EventTypeNormal, "ClusterScaling",
+		"Scaled workers from %d to %d", currentSpecReplicas, desiredReplicas)
 
 	logger.Info("MachineDeployment scaled successfully",
 		"name", mdName,
@@ -2027,6 +2043,7 @@ func (r *Reconciler) handleDeletion(ctx context.Context, tc *butlerv1alpha1.Tena
 	logger.Info("handling TenantCluster deletion", "name", tc.Name, "namespace", tc.Namespace)
 
 	tc.Status.Phase = butlerv1alpha1.TenantClusterPhaseDeleting
+	r.Recorder.Eventf(tc, corev1.EventTypeNormal, "ClusterDeleting", "Cluster %s deletion started", tc.Name)
 	if err := r.Status().Update(ctx, tc); err != nil {
 		if !apierrors.IsConflict(err) {
 			return ctrl.Result{}, err
@@ -2296,6 +2313,7 @@ func (r *Reconciler) setFailedStatus(ctx context.Context, tc *butlerv1alpha1.Ten
 	tc.Status.LastTransitionTime = &now
 
 	r.setCondition(tc, butlerv1alpha1.TenantClusterConditionReady, metav1.ConditionFalse, reason, message)
+	r.Recorder.Eventf(tc, corev1.EventTypeWarning, "ClusterFailed", "%s: %s", reason, message)
 
 	if err := r.Status().Update(ctx, tc); err != nil {
 		return ctrl.Result{}, err
