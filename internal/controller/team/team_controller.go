@@ -47,8 +47,7 @@ const (
 	// clusterRoleMember is the ClusterRole for member users.
 	clusterRoleMember = "edit"
 
-	// requeueInterval is the default requeue interval for status updates.
-	requeueInterval = 30 * time.Second
+	requeueInterval = 5 * time.Minute
 )
 
 // Reconciler reconciles a Team object.
