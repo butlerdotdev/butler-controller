@@ -45,7 +45,7 @@ import (
 const (
 	workspacesNamespace = "workspaces"
 	sshPort             = 2222
-	requeueInterval     = 30 * time.Second
+	requeueInterval     = 5 * time.Minute
 	requeueShort        = 5 * time.Second
 )
 

@@ -70,6 +70,8 @@ func main() {
 	var enableLeaderElection bool
 	var enableStewardControllers bool
 	var enableWebhooks bool
+	var maxConcurrentTCReconciles int
+	var maxConcurrentAddonReconciles int
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -84,6 +86,10 @@ func main() {
 	flag.BoolVar(&enableWebhooks, "enable-webhooks", false,
 		"Enable admission webhooks for TenantCluster, NetworkPool, and ProviderConfig. "+
 			"Requires cert-manager for TLS certificate management.")
+	flag.IntVar(&maxConcurrentTCReconciles, "max-concurrent-tc-reconciles", 5,
+		"Maximum number of concurrent TenantCluster reconciles.")
+	flag.IntVar(&maxConcurrentAddonReconciles, "max-concurrent-addon-reconciles", 3,
+		"Maximum number of concurrent TenantAddon reconciles.")
 
 	opts := zap.Options{
 		Development: true,
@@ -144,11 +150,12 @@ func main() {
 
 	// TenantCluster controller. Orchestrates CAPI resources
 	if err = (&tenantcluster.Reconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		Installer:     addons.NewInstaller(),
-		ClientManager: tenantClientManager,
-		Recorder:      mgr.GetEventRecorderFor("tenantcluster-controller"),
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Installer:               addons.NewInstaller(),
+		ClientManager:           tenantClientManager,
+		Recorder:                mgr.GetEventRecorderFor("tenantcluster-controller"),
+		MaxConcurrentReconciles: maxConcurrentTCReconciles,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "TenantCluster")
 		os.Exit(1)
@@ -156,10 +163,11 @@ func main() {
 
 	// TenantAddon controller. Installs optional addons via TenantAddon CRs
 	if err = (&tenantaddon.Reconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		Installer: addons.NewInstaller(),
-		APIReader: mgr.GetAPIReader(),
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Installer:               addons.NewInstaller(),
+		APIReader:               mgr.GetAPIReader(),
+		MaxConcurrentReconciles: maxConcurrentAddonReconciles,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "TenantAddon")
 		os.Exit(1)

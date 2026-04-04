@@ -333,13 +333,25 @@ func (r *Reconciler) checkPoolAvailability(ctx context.Context, pc *butlerv1alph
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &butlerv1alpha1.ProviderConfig{},
+		"spec.credentialsRef.name", func(obj client.Object) []string {
+			pc, ok := obj.(*butlerv1alpha1.ProviderConfig)
+			if !ok {
+				return nil
+			}
+			return []string{pc.Spec.CredentialsRef.Name}
+		}); err != nil {
+		return err
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&butlerv1alpha1.ProviderConfig{}).
 		Watches(&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-				// Find ProviderConfigs referencing this secret
 				pcList := &butlerv1alpha1.ProviderConfigList{}
-				if err := mgr.GetClient().List(ctx, pcList); err != nil {
+				if err := mgr.GetClient().List(ctx, pcList,
+					client.MatchingFields{"spec.credentialsRef.name": obj.GetName()},
+				); err != nil {
 					return nil
 				}
 				var requests []reconcile.Request
@@ -348,7 +360,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 					if secretNS == "" {
 						secretNS = pc.Namespace
 					}
-					if obj.GetName() == pc.Spec.CredentialsRef.Name && obj.GetNamespace() == secretNS {
+					if obj.GetNamespace() == secretNS {
 						requests = append(requests, reconcile.Request{
 							NamespacedName: types.NamespacedName{
 								Name:      pc.Name,
