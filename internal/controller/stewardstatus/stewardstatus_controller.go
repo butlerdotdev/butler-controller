@@ -35,8 +35,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
 var (
@@ -211,7 +213,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	tcp.SetGroupVersionKind(TenantControlPlaneGVK)
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(tcp).
+		For(tcp, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("stewardstatus").
 		Complete(r)
 }

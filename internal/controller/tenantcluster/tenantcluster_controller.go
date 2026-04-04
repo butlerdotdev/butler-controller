@@ -30,10 +30,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
 	"github.com/butlerdotdev/butler-controller/internal/addons"
@@ -348,15 +350,12 @@ func (r *Reconciler) calculateRequeueInterval(tc *butlerv1alpha1.TenantCluster) 
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&butlerv1alpha1.TenantCluster{}).
+		For(&butlerv1alpha1.TenantCluster{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&corev1.Namespace{}).
 		Owns(&corev1.Secret{}).
 		Owns(&rbacv1.RoleBinding{}).
 		Named("tenantcluster").
 		WithOptions(controller.Options{
-			// Allow multiple TenantClusters to be reconciled in parallel.
-			// This is critical for multi-tenant scenarios where creating
-			// multiple clusters simultaneously should not block each other.
 			MaxConcurrentReconciles: 5,
 		}).
 		Complete(r)
