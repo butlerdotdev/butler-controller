@@ -63,10 +63,11 @@ const (
 
 type Reconciler struct {
 	client.Client
-	Scheme        *runtime.Scheme
-	Installer     *addons.Installer
-	ClientManager *tenant.ClientManager
-	Recorder      record.EventRecorder
+	Scheme                  *runtime.Scheme
+	Installer               *addons.Installer
+	ClientManager           *tenant.ClientManager
+	Recorder                record.EventRecorder
+	MaxConcurrentReconciles int
 }
 
 // +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=tenantclusters,verbs=get;list;watch;create;update;patch;delete
@@ -356,7 +357,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&rbacv1.RoleBinding{}).
 		Named("tenantcluster").
 		WithOptions(controller.Options{
-			MaxConcurrentReconciles: 5,
+			MaxConcurrentReconciles: r.MaxConcurrentReconciles,
 		}).
 		Complete(r)
 }
