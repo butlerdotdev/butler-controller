@@ -194,14 +194,18 @@ func (v *TeamValidator) isPlatformAdmin(ctx context.Context, user authnv1.UserIn
 			}
 		}
 	}
-	// No matching User CRD; fall back to the K8s authz model via SAR
-	// against the butler-cli-platform-admin ClusterRole's permissions.
+	// No matching User CRD; fall back to the K8s authz model via SAR.
+	// The butler-cli-platform-admin ClusterRole grants enumerated verbs
+	// (get,list,watch,create,update,patch,delete) on teams, not "*", so
+	// the SAR must check a specific representative verb. "update" reflects
+	// the mutation the webhook is actually gating and matches the verb set
+	// of every ClusterRole that legitimately represents platform admin.
 	sar := &authzv1.SubjectAccessReview{
 		Spec: authzv1.SubjectAccessReviewSpec{
 			User:   user.Username,
 			Groups: user.Groups,
 			ResourceAttributes: &authzv1.ResourceAttributes{
-				Verb:     "*",
+				Verb:     "update",
 				Group:    "butler.butlerlabs.dev",
 				Resource: "teams",
 			},
