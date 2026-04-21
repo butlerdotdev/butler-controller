@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	crwebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
 
@@ -70,6 +71,8 @@ func main() {
 	var enableLeaderElection bool
 	var enableStewardControllers bool
 	var enableWebhooks bool
+	var webhookPort int
+	var webhookCertDir string
 	var maxConcurrentTCReconciles int
 	var maxConcurrentAddonReconciles int
 
@@ -86,6 +89,12 @@ func main() {
 	flag.BoolVar(&enableWebhooks, "enable-webhooks", false,
 		"Enable admission webhooks for TenantCluster, NetworkPool, and ProviderConfig. "+
 			"Requires cert-manager for TLS certificate management.")
+	flag.IntVar(&webhookPort, "webhook-port", 9443,
+		"Port the webhook server binds to. Override when the default conflicts "+
+			"(e.g. Rancher Desktop on 9443 during local development).")
+	flag.StringVar(&webhookCertDir, "webhook-cert-dir", "",
+		"Directory containing webhook TLS cert files tls.crt and tls.key. "+
+			"Defaults to controller-runtime's /tmp/k8s-webhook-server/serving-certs.")
 	flag.IntVar(&maxConcurrentTCReconciles, "max-concurrent-tc-reconciles", 5,
 		"Maximum number of concurrent TenantCluster reconciles.")
 	flag.IntVar(&maxConcurrentAddonReconciles, "max-concurrent-addon-reconciles", 3,
@@ -99,6 +108,11 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	webhookOpts := crwebhook.Options{Port: webhookPort}
+	if webhookCertDir != "" {
+		webhookOpts.CertDir = webhookCertDir
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
@@ -107,6 +121,7 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "butler-controller.butlerlabs.dev",
+		WebhookServer:          crwebhook.NewServer(webhookOpts),
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
