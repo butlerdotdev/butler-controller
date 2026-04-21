@@ -39,8 +39,21 @@ import (
 const defaultProviderConfigNamespace = "butler-system"
 
 // TenantClusterValidator validates TenantCluster resources on admission.
+//
+// Client is the cached, manager-backed client used for high-volume reads
+// (TenantCluster list for sibling counts); staleness up to 1s is
+// tolerable because webhook decisions only need approximate counts.
+//
+// APIReader is an uncached reader used for reads whose staleness would
+// flip an admission decision: Team spec (env list, limits, access).
+// controller-runtime's cached client can lag apiserver writes by a
+// reconcile tick, which is enough to miss a just-applied env rename or
+// access-block edit. The Team admission webhook for "resourceLimits
+// changed, needs platform admin" wants the current answer, not a 1s-
+// old one.
 type TenantClusterValidator struct {
-	Client client.Client
+	Client    client.Client
+	APIReader client.Reader
 }
 
 // +kubebuilder:webhook:path=/validate-butler-butlerlabs-dev-v1alpha1-tenantcluster,mutating=false,failurePolicy=fail,sideEffects=None,groups=butler.butlerlabs.dev,resources=tenantclusters,verbs=create;update,versions=v1alpha1,name=vtenantcluster.kb.io,admissionReviewVersions=v1
@@ -68,7 +81,7 @@ func (v *TenantClusterValidator) handleCreate(ctx context.Context, req admission
 	if err := json.Unmarshal(req.Object.Raw, tc); err != nil {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode TenantCluster: %w", err))
 	}
-	if _, err := v.validateCreateUpdate(ctx, tc, req.UserInfo); err != nil {
+	if _, err := v.validateCreateUpdate(ctx, tc, nil, req.UserInfo); err != nil {
 		return admission.Denied(err.Error())
 	}
 	return admission.Allowed("")
@@ -86,7 +99,7 @@ func (v *TenantClusterValidator) handleUpdate(ctx context.Context, req admission
 	if errs := validateEnvironmentLabelImmutability(oldTC, tc); len(errs) > 0 {
 		return admission.Denied(errs.ToAggregate().Error())
 	}
-	if _, err := v.validateCreateUpdate(ctx, tc, req.UserInfo); err != nil {
+	if _, err := v.validateCreateUpdate(ctx, tc, oldTC, req.UserInfo); err != nil {
 		return admission.Denied(err.Error())
 	}
 	return admission.Allowed("")
@@ -126,8 +139,12 @@ func validateEnvironmentLabelImmutability(oldTC, newTC *butlerv1alpha1.TenantClu
 	return errs
 }
 
-// validateCreateUpdate contains shared validation logic for create and update operations.
-func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *butlerv1alpha1.TenantCluster, userInfo authnv1.UserInfo) (admission.Warnings, error) {
+// validateCreateUpdate contains shared validation logic for create and
+// update operations. oldTC is nil on create and non-nil on update; the
+// update path carries it through so validateEnvironment can grandfather
+// pre-existing unlabeled TenantClusters whose team later defined
+// environments (ADR-009 phased migration, phase 2).
+func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc, oldTC *butlerv1alpha1.TenantCluster, userInfo authnv1.UserInfo) (admission.Warnings, error) {
 	var allErrs field.ErrorList
 
 	if tc.Spec.ProviderConfigRef == nil {
@@ -235,7 +252,7 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 	// Enforce team-level CPU, Memory, and Storage quotas.
 	if tc.Spec.TeamRef != nil {
 		team := &butlerv1alpha1.Team{}
-		if err := v.Client.Get(ctx, types.NamespacedName{Name: tc.Spec.TeamRef.Name}, team); err == nil {
+		if err := v.APIReader.Get(ctx, types.NamespacedName{Name: tc.Spec.TeamRef.Name}, team); err == nil {
 			if limits := team.Spec.ResourceLimits; limits != nil {
 				// List existing clusters for resource accounting
 				var tcList butlerv1alpha1.TenantClusterList
@@ -384,7 +401,7 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 
 	// Environment label enforcement and per-env quota checks.
 	if tc.Spec.TeamRef != nil {
-		envErrs, err := v.validateEnvironment(ctx, tc, userInfo)
+		envErrs, err := v.validateEnvironment(ctx, tc, oldTC, userInfo)
 		if err != nil {
 			return nil, err
 		}
@@ -405,11 +422,21 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 // identity, preventing a kubectl-direct caller from claiming another
 // user's cap room. Email comparison is case-insensitive per common
 // MTA practice (RFC 5321 allows CS local-parts but discourages it).
-func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc *butlerv1alpha1.TenantCluster, userInfo authnv1.UserInfo) (field.ErrorList, error) {
+//
+// oldTC is nil on create and non-nil on update. On update, a pre-
+// existing TenantCluster that lacked the env label is grandfathered:
+// operators can continue to scale/update/patch without adding a label,
+// matching the ADR-009 phase-2 contract that existing unlabeled
+// clusters "continue to work" after the team gains environments.
+// Likewise, if the cluster's env label references an env that has
+// since been removed from the team spec, unchanged-label updates are
+// tolerated so the cluster can still be scaled or deleted. Migration
+// to a valid env requires the standard migration-operation annotation.
+func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc, oldTC *butlerv1alpha1.TenantCluster, userInfo authnv1.UserInfo) (field.ErrorList, error) {
 	var allErrs field.ErrorList
 
 	team := &butlerv1alpha1.Team{}
-	if err := v.Client.Get(ctx, types.NamespacedName{Name: tc.Spec.TeamRef.Name}, team); err != nil {
+	if err := v.APIReader.Get(ctx, types.NamespacedName{Name: tc.Spec.TeamRef.Name}, team); err != nil {
 		if apierrors.IsNotFound(err) {
 			return allErrs, nil
 		}
@@ -426,8 +453,13 @@ func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc *bu
 		envLabel = tc.Labels[butlerv1alpha1.LabelEnvironment]
 	}
 
-	// Phase 2: team has environments; label is required and must match.
+	// Phase 2: team has environments; label is required on create and
+	// must match a team env. On update, a TenantCluster that was
+	// unlabeled before the team gained environments is grandfathered.
 	if envLabel == "" {
+		if oldTC != nil && (oldTC.Labels == nil || oldTC.Labels[butlerv1alpha1.LabelEnvironment] == "") {
+			return allErrs, nil
+		}
 		allErrs = append(allErrs, field.Required(
 			field.NewPath("metadata", "labels").Key(butlerv1alpha1.LabelEnvironment),
 			fmt.Sprintf("team %q defines environments; TenantClusters must carry this label set to one of the team's env names", team.Name),
@@ -443,6 +475,14 @@ func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc *bu
 		}
 	}
 	if targetEnv == nil {
+		// On update with unchanged env label, tolerate a dangling
+		// reference so operators can still scale or delete clusters
+		// whose env was removed from the team. A changed label is
+		// gated by the immutability check above plus the migration
+		// annotation, so this tolerance does not enable bypass.
+		if oldTC != nil && oldTC.Labels[butlerv1alpha1.LabelEnvironment] == envLabel {
+			return allErrs, nil
+		}
 		names := make([]string, 0, len(team.Spec.Environments))
 		for i := range team.Spec.Environments {
 			names = append(names, team.Spec.Environments[i].Name)
@@ -563,6 +603,7 @@ func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc *bu
 // against the requesting identity.
 func (v *TenantClusterValidator) SetupWebhookWithManager(mgr ctrl.Manager) error {
 	v.Client = mgr.GetClient()
+	v.APIReader = mgr.GetAPIReader()
 	mgr.GetWebhookServer().Register(
 		"/validate-butler-butlerlabs-dev-v1alpha1-tenantcluster",
 		&admission.Webhook{Handler: v},

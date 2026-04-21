@@ -171,7 +171,7 @@ func regularUser(email string) butlerv1alpha1.User {
 func TestTeamWebhook_CreateWithoutLimits_Allowed(t *testing.T) {
 	s := teamScheme(t)
 	c := clientWithUsers(s, []butlerv1alpha1.User{regularUser("team-admin@example.com")})
-	v := &TeamValidator{Client: c}
+	v := &TeamValidator{Client: c, APIReader: c}
 
 	team := &butlerv1alpha1.Team{ObjectMeta: metav1.ObjectMeta{Name: "acme"}}
 	req := newAdmissionRequest(t, admissionv1.Create, "team-admin@example.com", nil, team, nil)
@@ -182,7 +182,7 @@ func TestTeamWebhook_CreateWithoutLimits_Allowed(t *testing.T) {
 func TestTeamWebhook_CreateWithResourceLimits_PlatformAdmin_Allowed(t *testing.T) {
 	s := teamScheme(t)
 	c := clientWithUsers(s, []butlerv1alpha1.User{platformAdminUser()})
-	v := &TeamValidator{Client: c}
+	v := &TeamValidator{Client: c, APIReader: c}
 
 	maxClusters := int32(20)
 	team := &butlerv1alpha1.Team{
@@ -201,7 +201,7 @@ func TestTeamWebhook_CreateWithResourceLimits_PlatformAdmin_Allowed(t *testing.T
 func TestTeamWebhook_CreateWithResourceLimits_NonPlatformAdmin_Denied(t *testing.T) {
 	s := teamScheme(t)
 	c := clientWithUsers(s, []butlerv1alpha1.User{regularUser("bob@example.com")})
-	v := &TeamValidator{Client: c}
+	v := &TeamValidator{Client: c, APIReader: c}
 
 	maxClusters := int32(20)
 	team := &butlerv1alpha1.Team{
@@ -220,7 +220,7 @@ func TestTeamWebhook_CreateWithResourceLimits_NonPlatformAdmin_Denied(t *testing
 func TestTeamWebhook_CreateWithEnvLimits_NonPlatformAdmin_Denied(t *testing.T) {
 	s := teamScheme(t)
 	c := clientWithUsers(s, []butlerv1alpha1.User{regularUser("bob@example.com")})
-	v := &TeamValidator{Client: c}
+	v := &TeamValidator{Client: c, APIReader: c}
 
 	maxClusters := int32(5)
 	team := &butlerv1alpha1.Team{
@@ -247,7 +247,7 @@ func TestTeamWebhook_CreateWithEnvLimits_NonPlatformAdmin_Denied(t *testing.T) {
 func TestTeamWebhook_UpdateResourceLimits_TeamAdmin_Denied(t *testing.T) {
 	s := teamScheme(t)
 	c := clientWithUsers(s, []butlerv1alpha1.User{regularUser("team-admin@example.com")})
-	v := &TeamValidator{Client: c}
+	v := &TeamValidator{Client: c, APIReader: c}
 
 	oldMax := int32(10)
 	newMax := int32(20)
@@ -265,7 +265,7 @@ func TestTeamWebhook_UpdateResourceLimits_TeamAdmin_Denied(t *testing.T) {
 func TestTeamWebhook_UpdateEnvLimits_TeamAdmin_Allowed(t *testing.T) {
 	s := teamScheme(t)
 	c := clientWithUsers(s, []butlerv1alpha1.User{regularUser("team-admin@example.com")})
-	v := &TeamValidator{Client: c}
+	v := &TeamValidator{Client: c, APIReader: c}
 
 	oldMax := int32(10)
 	newMax := int32(15)
@@ -287,7 +287,7 @@ func TestTeamWebhook_UpdateEnvLimits_TeamAdmin_Allowed(t *testing.T) {
 func TestTeamWebhook_UpdateEnvLimits_TeamOperator_Denied(t *testing.T) {
 	s := teamScheme(t)
 	c := clientWithUsers(s, []butlerv1alpha1.User{regularUser("team-operator@example.com")})
-	v := &TeamValidator{Client: c}
+	v := &TeamValidator{Client: c, APIReader: c}
 
 	oldMax := int32(10)
 	newMax := int32(15)
@@ -309,7 +309,7 @@ func TestTeamWebhook_UpdateEnvLimits_TeamOperator_Denied(t *testing.T) {
 func TestTeamWebhook_UpdateBothAsPlatformAdmin_Allowed(t *testing.T) {
 	s := teamScheme(t)
 	c := clientWithUsers(s, []butlerv1alpha1.User{platformAdminUser()})
-	v := &TeamValidator{Client: c}
+	v := &TeamValidator{Client: c, APIReader: c}
 
 	oldTeamMax := int32(10)
 	newTeamMax := int32(25)
@@ -338,7 +338,7 @@ func TestTeamWebhook_UpdateBothAsPlatformAdmin_Allowed(t *testing.T) {
 func TestTeamWebhook_UpdateNoLimitsChange_Allowed(t *testing.T) {
 	s := teamScheme(t)
 	c := clientWithUsers(s, []butlerv1alpha1.User{regularUser("team-operator@example.com")})
-	v := &TeamValidator{Client: c}
+	v := &TeamValidator{Client: c, APIReader: c}
 
 	oldTeam := newTeamWithEnvs("acme")
 	oldTeam.Spec.DisplayName = "Acme Corp"
@@ -437,7 +437,7 @@ func TestTeamWebhook_UserListError_Surfaced(t *testing.T) {
 			},
 		}).
 		Build()
-	v := &TeamValidator{Client: c}
+	v := &TeamValidator{Client: c, APIReader: c}
 
 	maxClusters := int32(20)
 	team := &butlerv1alpha1.Team{
@@ -468,7 +468,7 @@ func TestTeamWebhook_UserListError_Surfaced(t *testing.T) {
 func TestTeamWebhook_EnvAccessUser_MatchesTeam_Allowed(t *testing.T) {
 	s := teamScheme(t)
 	c := clientWithUsers(s, []butlerv1alpha1.User{platformAdminUser()})
-	v := &TeamValidator{Client: c}
+	v := &TeamValidator{Client: c, APIReader: c}
 
 	team := &butlerv1alpha1.Team{
 		ObjectMeta: metav1.ObjectMeta{Name: "acme"},
@@ -497,7 +497,7 @@ func TestTeamWebhook_EnvAccessUser_MatchesTeam_Allowed(t *testing.T) {
 func TestTeamWebhook_EnvAccessUser_NotInTeam_Denied(t *testing.T) {
 	s := teamScheme(t)
 	c := clientWithUsers(s, []butlerv1alpha1.User{platformAdminUser()})
-	v := &TeamValidator{Client: c}
+	v := &TeamValidator{Client: c, APIReader: c}
 
 	team := &butlerv1alpha1.Team{
 		ObjectMeta: metav1.ObjectMeta{Name: "acme"},
@@ -526,7 +526,7 @@ func TestTeamWebhook_EnvAccessUser_NotInTeam_Denied(t *testing.T) {
 func TestTeamWebhook_EnvAccessGroup_NotInTeam_Denied(t *testing.T) {
 	s := teamScheme(t)
 	c := clientWithUsers(s, []butlerv1alpha1.User{platformAdminUser()})
-	v := &TeamValidator{Client: c}
+	v := &TeamValidator{Client: c, APIReader: c}
 
 	team := &butlerv1alpha1.Team{
 		ObjectMeta: metav1.ObjectMeta{Name: "acme"},
@@ -555,7 +555,7 @@ func TestTeamWebhook_EnvAccessGroup_NotInTeam_Denied(t *testing.T) {
 func TestTeamWebhook_EnvAccessUser_CaseInsensitive_Allowed(t *testing.T) {
 	s := teamScheme(t)
 	c := clientWithUsers(s, []butlerv1alpha1.User{platformAdminUser()})
-	v := &TeamValidator{Client: c}
+	v := &TeamValidator{Client: c, APIReader: c}
 
 	team := &butlerv1alpha1.Team{
 		ObjectMeta: metav1.ObjectMeta{Name: "acme"},

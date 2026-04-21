@@ -56,13 +56,13 @@ func buildTC(name, namespace, envLabel, owner string, replicas int32) *butlerv1a
 
 func validateEnvOnly(t *testing.T, c client.Client, tc *butlerv1alpha1.TenantCluster) error {
 	t.Helper()
-	return validateEnvAs(t, c, tc, authnv1.UserInfo{})
+	return validateEnvAs(t, c, tc, nil, authnv1.UserInfo{})
 }
 
-func validateEnvAs(t *testing.T, c client.Client, tc *butlerv1alpha1.TenantCluster, user authnv1.UserInfo) error {
+func validateEnvAs(t *testing.T, c client.Client, tc, oldTC *butlerv1alpha1.TenantCluster, user authnv1.UserInfo) error {
 	t.Helper()
-	v := &TenantClusterValidator{Client: c}
-	errs, err := v.validateEnvironment(context.Background(), tc, user)
+	v := &TenantClusterValidator{Client: c, APIReader: c}
+	errs, err := v.validateEnvironment(context.Background(), tc, oldTC, user)
 	if err != nil {
 		return err
 	}
@@ -201,7 +201,7 @@ func TestTCWebhook_MaxClustersPerMember_AlreadyAtCap_Denied(t *testing.T) {
 	tc.Annotations = map[string]string{
 		butlerv1alpha1.AnnotationCreatorEmail: "alice@example.com",
 	}
-	err := validateEnvAs(t, c, tc, authnv1.UserInfo{Username: "alice@example.com"})
+	err := validateEnvAs(t, c, tc, nil, authnv1.UserInfo{Username: "alice@example.com"})
 	if err == nil || !strings.Contains(err.Error(), "per member") {
 		t.Fatalf("expected per-member cap denial, got %v", err)
 	}
@@ -226,7 +226,7 @@ func TestTCWebhook_MaxClustersPerMember_UnderCap_Allowed(t *testing.T) {
 	tc.Annotations = map[string]string{
 		butlerv1alpha1.AnnotationCreatorEmail: "alice@example.com",
 	}
-	if err := validateEnvAs(t, c, tc, authnv1.UserInfo{Username: "alice@example.com"}); err != nil {
+	if err := validateEnvAs(t, c, tc, nil, authnv1.UserInfo{Username: "alice@example.com"}); err != nil {
 		t.Fatalf("expected allowed, got error: %v", err)
 	}
 }
@@ -248,7 +248,7 @@ func TestTCWebhook_CreatorEmailSpoof_Denied(t *testing.T) {
 	tc.Annotations = map[string]string{
 		butlerv1alpha1.AnnotationCreatorEmail: "victim@example.com",
 	}
-	err := validateEnvAs(t, c, tc, authnv1.UserInfo{Username: "attacker@example.com"})
+	err := validateEnvAs(t, c, tc, nil, authnv1.UserInfo{Username: "attacker@example.com"})
 	if err == nil || !strings.Contains(err.Error(), "must match") {
 		t.Fatalf("expected spoof denial, got %v", err)
 	}
@@ -269,7 +269,7 @@ func TestTCWebhook_CreatorEmailCaseInsensitive_Allowed(t *testing.T) {
 	tc.Annotations = map[string]string{
 		butlerv1alpha1.AnnotationCreatorEmail: "Alice@Example.COM",
 	}
-	if err := validateEnvAs(t, c, tc, authnv1.UserInfo{Username: "alice@example.com"}); err != nil {
+	if err := validateEnvAs(t, c, tc, nil, authnv1.UserInfo{Username: "alice@example.com"}); err != nil {
 		t.Fatalf("expected case-insensitive match to allow, got %v", err)
 	}
 }
@@ -288,7 +288,7 @@ func TestTCWebhook_CreatorEmailAnnotationIgnored_NoPerMemberCap(t *testing.T) {
 	}
 	// Per-member cap not engaged, so the annotation-identity match is not
 	// checked. Mismatched annotation passes through.
-	if err := validateEnvAs(t, c, tc, authnv1.UserInfo{Username: "someone@example.com"}); err != nil {
+	if err := validateEnvAs(t, c, tc, nil, authnv1.UserInfo{Username: "someone@example.com"}); err != nil {
 		t.Fatalf("expected allowed when MaxClustersPerMember is unset, got %v", err)
 	}
 }
@@ -360,5 +360,59 @@ func TestEnvLabelImmutability_Added_WithAnnotation_Allowed(t *testing.T) {
 	errs := validateEnvironmentLabelImmutability(old, new)
 	if len(errs) != 0 {
 		t.Fatalf("expected allowed migration-path add, got: %v", errs.ToAggregate())
+	}
+}
+
+// --- Phase-2 grandfathering + env-deletion tolerance (fresh-review findings) ---
+
+func TestTCWebhook_Phase2_PreExistingUnlabeled_UpdateAllowed(t *testing.T) {
+	s := teamScheme(t)
+	team := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{Name: "prod"})
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(team).Build()
+
+	// TC pre-dates the env addition: old and new both carry no env label.
+	oldTC := buildTC("legacy", "team-acme", "", "", 3)
+	newTC := buildTC("legacy", "team-acme", "", "", 5) // scaled workers
+	if err := validateEnvAs(t, c, newTC, oldTC, authnv1.UserInfo{}); err != nil {
+		t.Fatalf("expected grandfathered update to pass, got %v", err)
+	}
+}
+
+func TestTCWebhook_Phase2_PreExistingUnlabeled_CreateDenied(t *testing.T) {
+	s := teamScheme(t)
+	team := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{Name: "prod"})
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(team).Build()
+
+	// A brand-new TC without the label is rejected even after envs exist.
+	tc := buildTC("new-no-label", "team-acme", "", "", 3)
+	err := validateEnvAs(t, c, tc, nil, authnv1.UserInfo{})
+	if err == nil || !strings.Contains(err.Error(), "defines environments") {
+		t.Fatalf("expected new-create denial, got %v", err)
+	}
+}
+
+func TestTCWebhook_EnvRemoved_UnchangedLabelUpdate_Allowed(t *testing.T) {
+	s := teamScheme(t)
+	// Team has "dev" but no longer has "prod"; a TC carrying env=prod
+	// survives an unchanged-label update so it can be scaled or deleted.
+	team := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{Name: "dev"})
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(team).Build()
+
+	oldTC := buildTC("orphan", "team-acme", "prod", "", 3)
+	newTC := buildTC("orphan", "team-acme", "prod", "", 5) // scale
+	if err := validateEnvAs(t, c, newTC, oldTC, authnv1.UserInfo{}); err != nil {
+		t.Fatalf("expected dangling-env update tolerated, got %v", err)
+	}
+}
+
+func TestTCWebhook_EnvRemoved_NewCreate_Denied(t *testing.T) {
+	s := teamScheme(t)
+	team := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{Name: "dev"})
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(team).Build()
+
+	tc := buildTC("new-prod", "team-acme", "prod", "", 3)
+	err := validateEnvAs(t, c, tc, nil, authnv1.UserInfo{})
+	if err == nil {
+		t.Fatal("expected denial for new create referencing removed env")
 	}
 }

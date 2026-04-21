@@ -52,8 +52,13 @@ const PlatformAdminClusterRole = "butler-cli-platform-admin"
 // The check runs on both create and update. On create, any resourceLimits or
 // env-limits present on the incoming Team require platform admin, because no
 // team admin can exist for a team that does not yet exist.
+//
+// Client is the cached manager client; APIReader is uncached. User CRDs
+// are read via the uncached reader so a recent isPlatformAdmin flip is
+// observed immediately rather than after a cache tick.
 type TeamValidator struct {
-	Client client.Client
+	Client    client.Client
+	APIReader client.Reader
 }
 
 // +kubebuilder:webhook:path=/validate-butler-butlerlabs-dev-v1alpha1-team,mutating=false,failurePolicy=fail,sideEffects=None,groups=butler.butlerlabs.dev,resources=teams,verbs=create;update,versions=v1alpha1,name=vteam.kb.io,admissionReviewVersions=v1
@@ -240,7 +245,7 @@ func environmentLimitsChanged(old, new []butlerv1alpha1.EnvironmentSpec) bool {
 // admin whose only proof of privilege is the User CRD.
 func (v *TeamValidator) isPlatformAdmin(ctx context.Context, user authnv1.UserInfo) (bool, error) {
 	userList := &butlerv1alpha1.UserList{}
-	if err := v.Client.List(ctx, userList); err != nil {
+	if err := v.APIReader.List(ctx, userList); err != nil {
 		return false, fmt.Errorf("list users for platform-admin check: %w", err)
 	}
 	for i := range userList.Items {
@@ -308,6 +313,7 @@ func (v *TeamValidator) isTeamAdminOrPlatformAdmin(ctx context.Context, user aut
 // handler can read UserInfo from the admission request.
 func (v *TeamValidator) SetupWebhookWithManager(mgr ctrl.Manager) error {
 	v.Client = mgr.GetClient()
+	v.APIReader = mgr.GetAPIReader()
 	mgr.GetWebhookServer().Register(
 		"/validate-butler-butlerlabs-dev-v1alpha1-team",
 		&admission.Webhook{Handler: v},
