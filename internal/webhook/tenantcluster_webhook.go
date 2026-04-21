@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
@@ -66,6 +67,13 @@ type TenantClusterValidator struct {
 // the only defense against a kubectl-direct caller spoofing another
 // user's MaxClustersPerMember cap by claiming a different email.
 func (v *TenantClusterValidator) Handle(ctx context.Context, req admission.Request) admission.Response {
+	log.FromContext(ctx).Info("admission request received",
+		"op", string(req.Operation),
+		"namespace", req.Namespace,
+		"name", req.Name,
+		"userInfoUsername", req.UserInfo.Username,
+		"userInfoGroups", req.UserInfo.Groups,
+	)
 	switch req.Operation {
 	case admissionv1.Create:
 		return v.handleCreate(ctx, req)
