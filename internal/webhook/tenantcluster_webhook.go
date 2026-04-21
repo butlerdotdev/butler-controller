@@ -18,11 +18,15 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"strings"
 
+	admissionv1 "k8s.io/api/admission/v1"
+	authnv1 "k8s.io/api/authentication/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -41,32 +45,51 @@ type TenantClusterValidator struct {
 
 // +kubebuilder:webhook:path=/validate-butler-butlerlabs-dev-v1alpha1-tenantcluster,mutating=false,failurePolicy=fail,sideEffects=None,groups=butler.butlerlabs.dev,resources=tenantclusters,verbs=create;update,versions=v1alpha1,name=vtenantcluster.kb.io,admissionReviewVersions=v1
 
-// ValidateCreate validates a TenantCluster on creation.
-func (v *TenantClusterValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	tc, ok := obj.(*butlerv1alpha1.TenantCluster)
-	if !ok {
-		return nil, fmt.Errorf("expected TenantCluster, got %T", obj)
+// Handle implements admission.Handler. Dispatches to handleCreate or
+// handleUpdate based on the operation. Uses the raw admission.Handler
+// pattern (not CustomValidator) so the handler can read UserInfo from
+// the admission request. UserInfo is required to validate that the
+// creator-email annotation matches the requesting identity; this is
+// the only defense against a kubectl-direct caller spoofing another
+// user's MaxClustersPerMember cap by claiming a different email.
+func (v *TenantClusterValidator) Handle(ctx context.Context, req admission.Request) admission.Response {
+	switch req.Operation {
+	case admissionv1.Create:
+		return v.handleCreate(ctx, req)
+	case admissionv1.Update:
+		return v.handleUpdate(ctx, req)
+	default:
+		return admission.Allowed("")
 	}
-
-	return v.validateCreateUpdate(ctx, tc)
 }
 
-// ValidateUpdate validates a TenantCluster on update.
-func (v *TenantClusterValidator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
-	oldTC, ok := oldObj.(*butlerv1alpha1.TenantCluster)
-	if !ok {
-		return nil, fmt.Errorf("expected TenantCluster, got %T", oldObj)
+func (v *TenantClusterValidator) handleCreate(ctx context.Context, req admission.Request) admission.Response {
+	tc := &butlerv1alpha1.TenantCluster{}
+	if err := json.Unmarshal(req.Object.Raw, tc); err != nil {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode TenantCluster: %w", err))
 	}
-	tc, ok := newObj.(*butlerv1alpha1.TenantCluster)
-	if !ok {
-		return nil, fmt.Errorf("expected TenantCluster, got %T", newObj)
+	if _, err := v.validateCreateUpdate(ctx, tc, req.UserInfo); err != nil {
+		return admission.Denied(err.Error())
 	}
+	return admission.Allowed("")
+}
 
+func (v *TenantClusterValidator) handleUpdate(ctx context.Context, req admission.Request) admission.Response {
+	oldTC := &butlerv1alpha1.TenantCluster{}
+	if err := json.Unmarshal(req.OldObject.Raw, oldTC); err != nil {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode old TenantCluster: %w", err))
+	}
+	tc := &butlerv1alpha1.TenantCluster{}
+	if err := json.Unmarshal(req.Object.Raw, tc); err != nil {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode new TenantCluster: %w", err))
+	}
 	if errs := validateEnvironmentLabelImmutability(oldTC, tc); len(errs) > 0 {
-		return nil, errs.ToAggregate()
+		return admission.Denied(errs.ToAggregate().Error())
 	}
-
-	return v.validateCreateUpdate(ctx, tc)
+	if _, err := v.validateCreateUpdate(ctx, tc, req.UserInfo); err != nil {
+		return admission.Denied(err.Error())
+	}
+	return admission.Allowed("")
 }
 
 // validateEnvironmentLabelImmutability enforces that an env-label change
@@ -103,13 +126,8 @@ func validateEnvironmentLabelImmutability(oldTC, newTC *butlerv1alpha1.TenantClu
 	return errs
 }
 
-// ValidateDelete validates a TenantCluster on deletion.
-func (v *TenantClusterValidator) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
-	return nil, nil
-}
-
 // validateCreateUpdate contains shared validation logic for create and update operations.
-func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (admission.Warnings, error) {
+func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *butlerv1alpha1.TenantCluster, userInfo authnv1.UserInfo) (admission.Warnings, error) {
 	var allErrs field.ErrorList
 
 	if tc.Spec.ProviderConfigRef == nil {
@@ -366,7 +384,7 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 
 	// Environment label enforcement and per-env quota checks.
 	if tc.Spec.TeamRef != nil {
-		envErrs, err := v.validateEnvironment(ctx, tc)
+		envErrs, err := v.validateEnvironment(ctx, tc, userInfo)
 		if err != nil {
 			return nil, err
 		}
@@ -382,7 +400,12 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 
 // validateEnvironment applies the environment-label, per-env quota, and
 // MaxClustersPerMember rules. Called only when tc.Spec.TeamRef is set.
-func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (field.ErrorList, error) {
+// userInfo is used to validate that the creator-email annotation (when
+// present and MaxClustersPerMember is engaged) matches the requesting
+// identity, preventing a kubectl-direct caller from claiming another
+// user's cap room. Email comparison is case-insensitive per common
+// MTA practice (RFC 5321 allows CS local-parts but discourages it).
+func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc *butlerv1alpha1.TenantCluster, userInfo authnv1.UserInfo) (field.ErrorList, error) {
 	var allErrs field.ErrorList
 
 	team := &butlerv1alpha1.Team{}
@@ -562,9 +585,9 @@ func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc *bu
 
 	// MaxClustersPerMember enforcement. The creator's email is carried on
 	// the incoming TenantCluster via the AnnotationCreatorEmail annotation
-	// set by butler-server on API-path creates. kubectl-direct creates
-	// without the annotation are rejected when the env sets this cap,
-	// preserving accounting integrity.
+	// set by butler-server on API-path creates. The annotation must match
+	// the requesting identity; without the match, kubectl-direct callers
+	// could spoof another user's cap by claiming a different email.
 	if lim.MaxClustersPerMember != nil && *lim.MaxClustersPerMember > 0 {
 		creator := ""
 		if tc.Annotations != nil {
@@ -576,6 +599,15 @@ func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc *bu
 				fmt.Sprintf(
 					"environment %q sets maxClustersPerMember; TenantClusters must carry the %s annotation (set automatically by butler-server; kubectl-direct creates must supply it explicitly)",
 					envLabel, butlerv1alpha1.AnnotationCreatorEmail,
+				),
+			))
+		} else if !strings.EqualFold(creator, userInfo.Username) {
+			allErrs = append(allErrs, field.Invalid(
+				field.NewPath("metadata", "annotations").Key(butlerv1alpha1.AnnotationCreatorEmail),
+				creator,
+				fmt.Sprintf(
+					"%s must match the requesting identity %q; environment %q enforces per-member caps and cannot accept an annotation claiming a different user",
+					butlerv1alpha1.AnnotationCreatorEmail, userInfo.Username, envLabel,
 				),
 			))
 		} else {
@@ -607,11 +639,16 @@ func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc *bu
 	return allErrs, nil
 }
 
-// SetupWebhookWithManager registers the TenantCluster validating webhook with the manager.
+// SetupWebhookWithManager registers the TenantCluster validating webhook
+// with the manager. Uses the raw admission.Handler path (not
+// CustomValidator) so the handler can read UserInfo from the admission
+// request; this is required to verify the creator-email annotation
+// against the requesting identity.
 func (v *TenantClusterValidator) SetupWebhookWithManager(mgr ctrl.Manager) error {
 	v.Client = mgr.GetClient()
-	return ctrl.NewWebhookManagedBy(mgr).
-		For(&butlerv1alpha1.TenantCluster{}).
-		WithValidator(v).
-		Complete()
+	mgr.GetWebhookServer().Register(
+		"/validate-butler-butlerlabs-dev-v1alpha1-tenantcluster",
+		&admission.Webhook{Handler: v},
+	)
+	return nil
 }

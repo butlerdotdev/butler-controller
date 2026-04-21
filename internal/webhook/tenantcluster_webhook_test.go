@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	authnv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -54,8 +55,13 @@ func buildTC(name, namespace, envLabel, owner string, replicas int32) *butlerv1a
 
 func validateEnvOnly(t *testing.T, c client.Client, tc *butlerv1alpha1.TenantCluster) error {
 	t.Helper()
+	return validateEnvAs(t, c, tc, authnv1.UserInfo{})
+}
+
+func validateEnvAs(t *testing.T, c client.Client, tc *butlerv1alpha1.TenantCluster, user authnv1.UserInfo) error {
+	t.Helper()
 	v := &TenantClusterValidator{Client: c}
-	errs, err := v.validateEnvironment(context.Background(), tc)
+	errs, err := v.validateEnvironment(context.Background(), tc, user)
 	if err != nil {
 		return err
 	}
@@ -194,7 +200,7 @@ func TestTCWebhook_MaxClustersPerMember_AlreadyAtCap_Denied(t *testing.T) {
 	tc.Annotations = map[string]string{
 		butlerv1alpha1.AnnotationCreatorEmail: "alice@example.com",
 	}
-	err := validateEnvOnly(t, c, tc)
+	err := validateEnvAs(t, c, tc, authnv1.UserInfo{Username: "alice@example.com"})
 	if err == nil || !strings.Contains(err.Error(), "per member") {
 		t.Fatalf("expected per-member cap denial, got %v", err)
 	}
@@ -219,8 +225,70 @@ func TestTCWebhook_MaxClustersPerMember_UnderCap_Allowed(t *testing.T) {
 	tc.Annotations = map[string]string{
 		butlerv1alpha1.AnnotationCreatorEmail: "alice@example.com",
 	}
-	if err := validateEnvOnly(t, c, tc); err != nil {
+	if err := validateEnvAs(t, c, tc, authnv1.UserInfo{Username: "alice@example.com"}); err != nil {
 		t.Fatalf("expected allowed, got error: %v", err)
+	}
+}
+
+// --- Creator-email spoof defense (finding #2) ---
+
+func TestTCWebhook_CreatorEmailSpoof_Denied(t *testing.T) {
+	s := teamScheme(t)
+	maxPerMember := int32(1)
+	team := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{
+		Name: "sandbox",
+		Limits: &butlerv1alpha1.EnvironmentLimits{
+			MaxClustersPerMember: &maxPerMember,
+		},
+	})
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(team).Build()
+
+	tc := buildTC("sb-2", "team-acme", "sandbox", "", 1)
+	tc.Annotations = map[string]string{
+		butlerv1alpha1.AnnotationCreatorEmail: "victim@example.com",
+	}
+	err := validateEnvAs(t, c, tc, authnv1.UserInfo{Username: "attacker@example.com"})
+	if err == nil || !strings.Contains(err.Error(), "must match") {
+		t.Fatalf("expected spoof denial, got %v", err)
+	}
+}
+
+func TestTCWebhook_CreatorEmailCaseInsensitive_Allowed(t *testing.T) {
+	s := teamScheme(t)
+	maxPerMember := int32(2)
+	team := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{
+		Name: "sandbox",
+		Limits: &butlerv1alpha1.EnvironmentLimits{
+			MaxClustersPerMember: &maxPerMember,
+		},
+	})
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(team).Build()
+
+	tc := buildTC("sb-1", "team-acme", "sandbox", "", 1)
+	tc.Annotations = map[string]string{
+		butlerv1alpha1.AnnotationCreatorEmail: "Alice@Example.COM",
+	}
+	if err := validateEnvAs(t, c, tc, authnv1.UserInfo{Username: "alice@example.com"}); err != nil {
+		t.Fatalf("expected case-insensitive match to allow, got %v", err)
+	}
+}
+
+func TestTCWebhook_CreatorEmailAnnotationIgnored_NoPerMemberCap(t *testing.T) {
+	s := teamScheme(t)
+	team := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{
+		Name:   "sandbox",
+		Limits: &butlerv1alpha1.EnvironmentLimits{}, // no MaxClustersPerMember
+	})
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(team).Build()
+
+	tc := buildTC("sb-1", "team-acme", "sandbox", "", 1)
+	tc.Annotations = map[string]string{
+		butlerv1alpha1.AnnotationCreatorEmail: "does-not-match@elsewhere.com",
+	}
+	// Per-member cap not engaged, so the annotation-identity match is not
+	// checked. Mismatched annotation passes through.
+	if err := validateEnvAs(t, c, tc, authnv1.UserInfo{Username: "someone@example.com"}); err != nil {
+		t.Fatalf("expected allowed when MaxClustersPerMember is unset, got %v", err)
 	}
 }
 
