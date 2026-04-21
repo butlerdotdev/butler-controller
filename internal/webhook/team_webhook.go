@@ -146,8 +146,12 @@ func (v *TeamValidator) handleUpdate(ctx context.Context, req admission.Request)
 	}
 
 	// Environments[].Limits diff: team admin on this team, or platform admin.
+	// Read admin status from the OLD Team so a caller with "update teams"
+	// RBAC cannot combine self-promotion to team admin with a limits
+	// change in the same PATCH (the newTeam would already list them as
+	// admin, defeating the check). The pre-edit state is authoritative.
 	if environmentLimitsChanged(oldTeam.Spec.Environments, newTeam.Spec.Environments) {
-		ok, err := v.isTeamAdminOrPlatformAdmin(ctx, req.UserInfo, newTeam)
+		ok, err := v.isTeamAdminOrPlatformAdmin(ctx, req.UserInfo, oldTeam)
 		if err != nil {
 			return admission.Errored(http.StatusInternalServerError, fmt.Errorf("resolve team admin: %w", err))
 		}

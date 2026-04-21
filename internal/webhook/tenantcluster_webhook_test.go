@@ -18,13 +18,17 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
+	admissionv1 "k8s.io/api/admission/v1"
 	authnv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
 )
@@ -415,4 +419,196 @@ func TestTCWebhook_EnvRemoved_NewCreate_Denied(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected denial for new create referencing removed env")
 	}
+}
+
+// --- Admission-entrypoint tests (fix for review-round-3 finding 2) ---
+//
+// Prior tests invoked validateEnvironment / validateEnvironmentLabelImmutability
+// directly, skipping the Handle() dispatch, JSON decode, create-vs-update
+// branching, and validateCreateUpdate's ProviderConfigRef gating. Round 2's
+// live-validation finding (env short-circuited on missing providerConfigRef)
+// and round 3's deadlock finding (per-member cap on UPDATE) both slipped
+// past unit tests because of this gap. These tests go through v.Handle with
+// full admission.Request payloads.
+
+func newTCAdmissionRequest(t *testing.T, op admissionv1.Operation, username string, newTC, oldTC *butlerv1alpha1.TenantCluster) admission.Request {
+	t.Helper()
+	newRaw, err := json.Marshal(newTC)
+	if err != nil {
+		t.Fatalf("marshal newTC: %v", err)
+	}
+	req := admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Operation: op,
+			UserInfo:  authnv1.UserInfo{Username: username},
+			Object:    runtime.RawExtension{Raw: newRaw},
+		},
+	}
+	if oldTC != nil {
+		oldRaw, err := json.Marshal(oldTC)
+		if err != nil {
+			t.Fatalf("marshal oldTC: %v", err)
+		}
+		req.OldObject = runtime.RawExtension{Raw: oldRaw}
+	}
+	return req
+}
+
+// The deadlock fix: reducing per-member cap below current ownership must not
+// block updates to existing resources. Without the isCreate gate, this test
+// fails because ownedByCreator+1 > cap rejects the update.
+func TestTCWebhook_Handle_UpdateAfterPerMemberCapReduced_Allowed(t *testing.T) {
+	s := teamScheme(t)
+	maxPerMember := int32(1)
+	team := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{
+		Name: "sandbox",
+		Limits: &butlerv1alpha1.EnvironmentLimits{
+			MaxClustersPerMember: &maxPerMember,
+		},
+	})
+	// Alice already owns two TCs in sandbox (from before cap was reduced).
+	a1 := buildTC("sb-a1", "team-acme", "sandbox", "alice@example.com", 1)
+	a1.Annotations[butlerv1alpha1.AnnotationCreatorEmail] = "alice@example.com"
+	a2 := buildTC("sb-a2", "team-acme", "sandbox", "alice@example.com", 1)
+	a2.Annotations[butlerv1alpha1.AnnotationCreatorEmail] = "alice@example.com"
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(team, a1, a2).Build()
+	v := &TenantClusterValidator{Client: c, APIReader: c}
+
+	// Routine update: scale sb-a1 workers from 1 to 3 (no label/annotation
+	// change; per-cluster and per-member identities stay as-is).
+	newA1 := a1.DeepCopy()
+	newA1.Spec.Workers.Replicas = 3
+
+	req := newTCAdmissionRequest(t, admissionv1.Update, "alice@example.com", newA1, a1)
+	assertAllowed(t, v.Handle(context.Background(), req))
+}
+
+// The deletion chain: apiserver converts DELETE-with-finalizer into an
+// UPDATE that sets deletionTimestamp, and the controller's finalizer
+// removal is another UPDATE. Neither can be rejected by a cap simulation
+// even if the cap has been reduced below current usage.
+func TestTCWebhook_Handle_FinalizerRemovalUnderReducedCap_Allowed(t *testing.T) {
+	s := teamScheme(t)
+	maxPerMember := int32(1)
+	team := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{
+		Name: "sandbox",
+		Limits: &butlerv1alpha1.EnvironmentLimits{
+			MaxClustersPerMember: &maxPerMember,
+		},
+	})
+	a1 := buildTC("sb-a1", "team-acme", "sandbox", "alice@example.com", 1)
+	a1.Annotations[butlerv1alpha1.AnnotationCreatorEmail] = "alice@example.com"
+	a1.Finalizers = []string{"butler.butlerlabs.dev/tenantcluster"}
+	a2 := buildTC("sb-a2", "team-acme", "sandbox", "alice@example.com", 1)
+	a2.Annotations[butlerv1alpha1.AnnotationCreatorEmail] = "alice@example.com"
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(team, a1, a2).Build()
+	v := &TenantClusterValidator{Client: c, APIReader: c}
+
+	// Controller removes the finalizer; reconciler's update call runs as
+	// the controller SA, which is not alice but still must succeed.
+	newA1 := a1.DeepCopy()
+	newA1.Finalizers = nil
+
+	req := newTCAdmissionRequest(t, admissionv1.Update, "system:serviceaccount:butler-system:butler-controller", newA1, a1)
+	assertAllowed(t, v.Handle(context.Background(), req))
+}
+
+// Env cluster-count cap must also skip on update; same deadlock shape.
+func TestTCWebhook_Handle_UpdateAfterEnvClusterCapReduced_Allowed(t *testing.T) {
+	s := teamScheme(t)
+	maxClusters := int32(1)
+	team := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{
+		Name: "prod",
+		Limits: &butlerv1alpha1.EnvironmentLimits{
+			MaxClusters: &maxClusters,
+		},
+	})
+	existing1 := buildTC("p1", "team-acme", "prod", "u1", 1)
+	existing2 := buildTC("p2", "team-acme", "prod", "u2", 1)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(team, existing1, existing2).Build()
+	v := &TenantClusterValidator{Client: c, APIReader: c}
+
+	// Scale existing1; env now has 2 clusters against a cap of 1.
+	newEx := existing1.DeepCopy()
+	newEx.Spec.Workers.Replicas = 3
+	req := newTCAdmissionRequest(t, admissionv1.Update, "anyone@example.com", newEx, existing1)
+	assertAllowed(t, v.Handle(context.Background(), req))
+}
+
+// Create path still denies spoofed creator-email. Goes through Handle so
+// admission.Request parsing + validateCreateUpdate dispatch are exercised.
+func TestTCWebhook_Handle_Create_SpoofedCreatorEmail_Denied(t *testing.T) {
+	s := teamScheme(t)
+	maxPerMember := int32(1)
+	team := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{
+		Name: "sandbox",
+		Limits: &butlerv1alpha1.EnvironmentLimits{
+			MaxClustersPerMember: &maxPerMember,
+		},
+	})
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(team).Build()
+	v := &TenantClusterValidator{Client: c, APIReader: c}
+
+	tc := buildTC("sb-x", "team-acme", "sandbox", "", 1)
+	tc.Annotations[butlerv1alpha1.AnnotationCreatorEmail] = "victim@example.com"
+	req := newTCAdmissionRequest(t, admissionv1.Create, "attacker@example.com", tc, nil)
+	assertDenied(t, v.Handle(context.Background(), req), "must match")
+}
+
+// Env label immutability on a label-change UPDATE without the migration
+// annotation. Round 2 tested this via the helper directly; the entrypoint
+// path adds the JSON decode and handleUpdate dispatch.
+func TestTCWebhook_Handle_Update_EnvLabelChangedNoMigration_Denied(t *testing.T) {
+	s := teamScheme(t)
+	team := newTeamWithEnvs("acme",
+		butlerv1alpha1.EnvironmentSpec{Name: "prod"},
+		butlerv1alpha1.EnvironmentSpec{Name: "dev"},
+	)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(team).Build()
+	v := &TenantClusterValidator{Client: c, APIReader: c}
+
+	old := buildTC("tc", "team-acme", "prod", "", 1)
+	new := buildTC("tc", "team-acme", "dev", "", 1)
+	req := newTCAdmissionRequest(t, admissionv1.Update, "any@example.com", new, old)
+	assertDenied(t, v.Handle(context.Background(), req), "migration-operation")
+}
+
+// TC without providerConfigRef must still run env validation; the
+// create path must not short-circuit before reaching the env-label
+// check. Caught in round 2 by live validation; now covered at unit level.
+func TestTCWebhook_Handle_Create_NoProviderConfig_MissingEnvLabel_Denied(t *testing.T) {
+	s := teamScheme(t)
+	team := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{Name: "prod"})
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(team).Build()
+	v := &TenantClusterValidator{Client: c, APIReader: c}
+
+	tc := &butlerv1alpha1.TenantCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "no-pc", Namespace: "team-acme",
+			Labels: map[string]string{}, Annotations: map[string]string{},
+		},
+		Spec: butlerv1alpha1.TenantClusterSpec{
+			TeamRef: &butlerv1alpha1.LocalObjectReference{Name: "acme"},
+			Workers: butlerv1alpha1.WorkersSpec{Replicas: 1},
+		},
+	}
+	req := newTCAdmissionRequest(t, admissionv1.Create, "any@example.com", tc, nil)
+	assertDenied(t, v.Handle(context.Background(), req), "defines environments")
+}
+
+// MaxClusters=0 must be treated as "no cap", matching MaxClustersPerMember.
+func TestTCWebhook_Handle_Create_EnvMaxClustersZero_Allowed(t *testing.T) {
+	s := teamScheme(t)
+	zero := int32(0)
+	team := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{
+		Name:   "prod",
+		Limits: &butlerv1alpha1.EnvironmentLimits{MaxClusters: &zero},
+	})
+	existing := buildTC("p1", "team-acme", "prod", "", 1)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(team, existing).Build()
+	v := &TenantClusterValidator{Client: c, APIReader: c}
+
+	tc := buildTC("p2", "team-acme", "prod", "", 1)
+	req := newTCAdmissionRequest(t, admissionv1.Create, "any@example.com", tc, nil)
+	assertAllowed(t, v.Handle(context.Background(), req))
 }

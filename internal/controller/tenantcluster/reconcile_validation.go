@@ -230,7 +230,16 @@ func (r *Reconciler) validateProviderLimits(ctx context.Context, tc *butlerv1alp
 	}
 
 	// Check team-level resource quotas (defense-in-depth when webhooks are disabled)
-	return r.validateTeamQuotas(ctx, tc)
+	if err := r.validateTeamQuotas(ctx, tc); err != nil {
+		return err
+	}
+
+	// All quota paths passed: record a positive condition so operators
+	// can observe the current quota state. A lingering False from a
+	// prior reconcile would otherwise persist until overwritten.
+	r.setCondition(tc, butlerv1alpha1.TenantClusterConditionQuotaSatisfied,
+		metav1.ConditionTrue, butlerv1alpha1.ReasonReady, "within all quotas")
+	return nil
 }
 
 // validateTeamQuotas checks Team.spec.resourceLimits for maxClusters, maxTotalNodes,
@@ -345,7 +354,7 @@ func (r *Reconciler) validateEnvironmentQuotas(ctx context.Context, tc *butlerv1
 		}
 	}
 
-	if env.Limits.MaxClusters != nil {
+	if env.Limits.MaxClusters != nil && *env.Limits.MaxClusters > 0 {
 		if int32(len(envSiblings))+1 > *env.Limits.MaxClusters {
 			msg := fmt.Sprintf("environment %q has %d cluster(s), env quota limits to %d",
 				envName, len(envSiblings), *env.Limits.MaxClusters)

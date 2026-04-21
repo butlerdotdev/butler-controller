@@ -147,6 +147,18 @@ func validateEnvironmentLabelImmutability(oldTC, newTC *butlerv1alpha1.TenantClu
 func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc, oldTC *butlerv1alpha1.TenantCluster, userInfo authnv1.UserInfo) (admission.Warnings, error) {
 	var allErrs field.ErrorList
 
+	// Aggregate (count- and sum-based) quota gates are create-time
+	// guards that simulate adding this TC to the namespace total. On
+	// update the cluster already exists and the admitted count is
+	// stable; re-running the simulation treats the update as an extra
+	// addition and deadlocks routine operations (scale, annotate,
+	// deletionTimestamp propagation, finalizer removal) after a quota
+	// reduction. Per-cluster caps (MaxNodesPerCluster) remain on both
+	// paths because they gate THIS TC's own spec and are legitimate
+	// to re-check on scale. See ADR-009: "Cluster creation validates
+	// three gates in order."
+	isCreate := oldTC == nil
+
 	// Environment label and per-env checks are independent of
 	// providerConfigRef; a TC without a provider config still belongs
 	// to a team and a team may define environments. Run env validation
@@ -209,8 +221,10 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc, o
 		}
 	}
 
-	// Enforce per-team cluster limit.
-	if pc.Spec.Limits != nil && pc.Spec.Limits.MaxClustersPerTeam != nil {
+	// Enforce per-team cluster limit. Create-only: on update the TC is
+	// already counted and re-simulation would deadlock operations when
+	// the cap is reduced below existing usage.
+	if isCreate && pc.Spec.Limits != nil && pc.Spec.Limits.MaxClustersPerTeam != nil {
 		maxClusters := *pc.Spec.Limits.MaxClustersPerTeam
 
 		var tcList butlerv1alpha1.TenantClusterList
@@ -237,8 +251,9 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc, o
 		}
 	}
 
-	// Enforce per-team node limit.
-	if pc.Spec.Limits != nil && pc.Spec.Limits.MaxNodesPerTeam != nil {
+	// Enforce per-team node limit. Create-only (aggregate, see comment
+	// on MaxClustersPerTeam above).
+	if isCreate && pc.Spec.Limits != nil && pc.Spec.Limits.MaxNodesPerTeam != nil {
 		maxNodes := *pc.Spec.Limits.MaxNodesPerTeam
 
 		var tcList butlerv1alpha1.TenantClusterList
@@ -276,8 +291,10 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc, o
 					mt := tc.Spec.Workers.MachineTemplate
 					replicas := tc.Spec.Workers.Replicas
 
-					// Cluster count check
-					if limits.MaxClusters != nil {
+					// Cluster count check (create-only; on update the TC is
+					// already counted and re-simulation deadlocks on quota
+					// reduction).
+					if isCreate && limits.MaxClusters != nil {
 						existingCount := int32(0)
 						for i := range tcList.Items {
 							if tcList.Items[i].Name != tc.Name {
@@ -296,8 +313,8 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc, o
 						}
 					}
 
-					// Total nodes check
-					if limits.MaxTotalNodes != nil {
+					// Total nodes check (create-only, aggregate)
+					if isCreate && limits.MaxTotalNodes != nil {
 						totalNodes := replicas
 						for i := range tcList.Items {
 							if tcList.Items[i].Name != tc.Name {
@@ -328,8 +345,8 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc, o
 						}
 					}
 
-					// CPU quota check
-					if limits.MaxCPUCores != nil && !limits.MaxCPUCores.IsZero() {
+					// CPU quota check (create-only, aggregate)
+					if isCreate && limits.MaxCPUCores != nil && !limits.MaxCPUCores.IsZero() {
 						requestedCPU := resource.NewQuantity(int64(mt.CPU)*int64(replicas), resource.DecimalSI)
 						currentCPU := resource.NewQuantity(0, resource.DecimalSI)
 						for i := range tcList.Items {
@@ -355,8 +372,8 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc, o
 						}
 					}
 
-					// Memory quota check
-					if limits.MaxMemory != nil && !limits.MaxMemory.IsZero() {
+					// Memory quota check (create-only, aggregate)
+					if isCreate && limits.MaxMemory != nil && !limits.MaxMemory.IsZero() {
 						requestedMemory := resource.NewQuantity(0, resource.BinarySI)
 						for i := int32(0); i < replicas; i++ {
 							requestedMemory.Add(mt.Memory)
@@ -383,8 +400,8 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc, o
 						}
 					}
 
-					// Storage quota check
-					if limits.MaxStorage != nil && !limits.MaxStorage.IsZero() {
+					// Storage quota check (create-only, aggregate)
+					if isCreate && limits.MaxStorage != nil && !limits.MaxStorage.IsZero() {
 						requestedStorage := resource.NewQuantity(0, resource.BinarySI)
 						for i := int32(0); i < replicas; i++ {
 							requestedStorage.Add(mt.DiskSize)
@@ -529,8 +546,14 @@ func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc, ol
 	}
 
 	lim := targetEnv.Limits
+	isCreate := oldTC == nil
 
-	if lim.MaxClusters != nil && sameEnvCount+1 > *lim.MaxClusters {
+	// Env cluster-count cap. Create-only: the TC already counts in
+	// same-env siblings after admission; re-simulating on update would
+	// deadlock operations (scale, annotate, deletionTimestamp, finalizer
+	// removal) when an admin reduces the cap below current usage. Zero
+	// means no cap (aligned with MaxClustersPerMember semantics).
+	if isCreate && lim.MaxClusters != nil && *lim.MaxClusters > 0 && sameEnvCount+1 > *lim.MaxClusters {
 		allErrs = append(allErrs, field.Forbidden(
 			field.NewPath("spec"),
 			fmt.Sprintf(
@@ -544,16 +567,16 @@ func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc, ol
 	// the incoming TenantCluster via the AnnotationCreatorEmail annotation
 	// set by butler-server on API-path creates. On CREATE the annotation
 	// must match the requesting identity; on UPDATE the annotation was
-	// already vetted at create time and must stay unchanged (covered by
-	// immutability below), so re-running the identity match on every
-	// update would also block finalizer removals by callers other than
-	// the original creator. Identity match is create-only.
+	// already vetted at create time and must stay unchanged (immutability
+	// check below). The cap simulation (ownedByCreator+1 > max) is
+	// create-only for the same reason as the env cluster cap above;
+	// update-path identity match is also skipped and replaced by
+	// annotation immutability.
 	if lim.MaxClustersPerMember != nil && *lim.MaxClustersPerMember > 0 {
 		creator := ""
 		if tc.Annotations != nil {
 			creator = tc.Annotations[butlerv1alpha1.AnnotationCreatorEmail]
 		}
-		isCreate := oldTC == nil
 		oldCreator := ""
 		if !isCreate && oldTC.Annotations != nil {
 			oldCreator = oldTC.Annotations[butlerv1alpha1.AnnotationCreatorEmail]
@@ -583,7 +606,7 @@ func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc, ol
 					butlerv1alpha1.AnnotationCreatorEmail, oldCreator, creator,
 				),
 			))
-		} else {
+		} else if isCreate {
 			ownedByCreator := int32(0)
 			for i := range tcList.Items {
 				other := &tcList.Items[i]
