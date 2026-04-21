@@ -151,3 +151,47 @@ func TestApplyClusterDefaults_NilDefaults(t *testing.T) {
 		t.Errorf("expected spec unchanged when defaults are nil")
 	}
 }
+
+func TestMergeClusterDefaults_DefaultAddonsAppendDedupe(t *testing.T) {
+	team := &butlerv1alpha1.Team{
+		Spec: butlerv1alpha1.TeamSpec{
+			ClusterDefaults: &butlerv1alpha1.ClusterDefaults{
+				DefaultAddons: []string{"cilium", "cert-manager", "traefik"},
+			},
+			Environments: []butlerv1alpha1.EnvironmentSpec{
+				{
+					Name: "prod",
+					ClusterDefaults: &butlerv1alpha1.ClusterDefaults{
+						DefaultAddons: []string{"traefik", "grafana", "loki"},
+					},
+				},
+			},
+		},
+	}
+
+	merged := mergeClusterDefaults(team, "prod")
+	if merged == nil {
+		t.Fatal("expected non-nil merged defaults")
+	}
+	want := []string{"cilium", "cert-manager", "traefik", "grafana", "loki"}
+	if len(merged.DefaultAddons) != len(want) {
+		t.Fatalf("expected %d addons, got %d: %v", len(want), len(merged.DefaultAddons), merged.DefaultAddons)
+	}
+	for i, name := range want {
+		if merged.DefaultAddons[i] != name {
+			t.Errorf("addon %d: want %q, got %q", i, name, merged.DefaultAddons[i])
+		}
+	}
+}
+
+func TestMergeAddons_EmptyInputs(t *testing.T) {
+	if got := mergeAddons(nil, nil); got != nil {
+		t.Errorf("expected nil for empty inputs, got %v", got)
+	}
+	if got := mergeAddons([]string{"a"}, nil); len(got) != 1 || got[0] != "a" {
+		t.Errorf("expected [a], got %v", got)
+	}
+	if got := mergeAddons(nil, []string{"b"}); len(got) != 1 || got[0] != "b" {
+		t.Errorf("expected [b], got %v", got)
+	}
+}

@@ -168,7 +168,7 @@ func (b *Builder) buildCluster(name string, infraRef, cpRef *unstructured.Unstru
 	cluster.SetKind("Cluster")
 	cluster.SetName(name)
 	cluster.SetNamespace(b.namespace)
-	cluster.SetLabels(b.commonLabels())
+	b.applyCommonMetadata(cluster)
 
 	// Get network CIDRs from spec or use defaults
 	podCIDR := "10.244.0.0/16"
@@ -215,7 +215,7 @@ func (b *Builder) buildKubevirtCluster(name string) *unstructured.Unstructured {
 	kvCluster.SetKind("KubevirtCluster")
 	kvCluster.SetName(name)
 	kvCluster.SetNamespace(b.namespace)
-	kvCluster.SetLabels(b.commonLabels())
+	b.applyCommonMetadata(kvCluster)
 
 	// Get credentials reference namespace, default to butler-system
 	credsNS := b.providerConfig.Spec.CredentialsRef.Namespace
@@ -257,7 +257,7 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 	kcp.SetKind("StewardControlPlane")
 	kcp.SetName(name)
 	kcp.SetNamespace(b.namespace)
-	kcp.SetLabels(b.commonLabels())
+	b.applyCommonMetadata(kcp)
 
 	// Get control plane replicas from spec
 	replicas := int64(1)
@@ -452,7 +452,7 @@ func (b *Builder) buildKubevirtMachineTemplate(name string) *unstructured.Unstru
 	kvmt.SetKind("KubevirtMachineTemplate")
 	kvmt.SetName(fmt.Sprintf("%s-worker", name))
 	kvmt.SetNamespace(b.namespace)
-	kvmt.SetLabels(b.commonLabels())
+	b.applyCommonMetadata(kvmt)
 
 	harvesterSpec := b.providerConfig.Spec.Harvester
 
@@ -688,7 +688,7 @@ func (b *Builder) buildNutanixCluster(name string) *unstructured.Unstructured {
 	nxCluster.SetKind("NutanixCluster")
 	nxCluster.SetName(name)
 	nxCluster.SetNamespace(b.namespace)
-	nxCluster.SetLabels(b.commonLabels())
+	b.applyCommonMetadata(nxCluster)
 
 	nutanixSpec := b.providerConfig.Spec.Nutanix
 
@@ -737,7 +737,7 @@ func (b *Builder) buildNutanixMachineTemplate(name string) *unstructured.Unstruc
 	nxmt.SetKind("NutanixMachineTemplate")
 	nxmt.SetName(fmt.Sprintf("%s-worker", name))
 	nxmt.SetNamespace(b.namespace)
-	nxmt.SetLabels(b.commonLabels())
+	b.applyCommonMetadata(nxmt)
 
 	nutanixSpec := b.providerConfig.Spec.Nutanix
 
@@ -799,7 +799,7 @@ func (b *Builder) buildNutanixCredentialSecret(name string) *unstructured.Unstru
 	secret.SetKind("Secret")
 	secret.SetName(fmt.Sprintf("%s-nutanix-creds", name))
 	secret.SetNamespace(b.namespace)
-	secret.SetLabels(b.commonLabels())
+	b.applyCommonMetadata(secret)
 
 	// CAPX expects credentials in this specific JSON format
 	credentialsJSON := fmt.Sprintf(`[{"type":"basic_auth","data":{"prismCentral":{"username":"%s","password":"%s"}}}]`,
@@ -877,7 +877,7 @@ func (b *Builder) buildKubeadmConfigTemplate(name string) *unstructured.Unstruct
 	kct.SetKind("KubeadmConfigTemplate")
 	kct.SetName(fmt.Sprintf("%s-worker", name))
 	kct.SetNamespace(b.namespace)
-	kct.SetLabels(b.commonLabels())
+	b.applyCommonMetadata(kct)
 
 	k8sVersion := b.tc.Spec.KubernetesVersion
 	k8sMinorVersion := extractMinorVersion(k8sVersion)
@@ -1104,7 +1104,7 @@ func (b *Builder) buildMachineDeployment(name string, machineTemplate, bootstrap
 	md.SetKind("MachineDeployment")
 	md.SetName(fmt.Sprintf("%s-workers", name))
 	md.SetNamespace(b.namespace)
-	md.SetLabels(b.commonLabels())
+	b.applyCommonMetadata(md)
 
 	replicas := int64(b.tc.Spec.Workers.Replicas)
 	if replicas < 1 {
@@ -1164,6 +1164,17 @@ func (b *Builder) buildMachineDeployment(name string, machineTemplate, bootstrap
 	return md
 }
 
+// applyCommonMetadata sets the common labels and common annotations
+// on a CAPI resource. Owner identity (email) is stored on the
+// AnnotationOwner annotation rather than a label because email values
+// violate the Kubernetes label-value character class.
+func (b *Builder) applyCommonMetadata(obj *unstructured.Unstructured) {
+	obj.SetLabels(b.commonLabels())
+	if ann := b.commonAnnotations(); len(ann) > 0 {
+		obj.SetAnnotations(ann)
+	}
+}
+
 // commonLabels returns labels applied to all CAPI resources.
 func (b *Builder) commonLabels() map[string]string {
 	labels := map[string]string{
@@ -1182,11 +1193,24 @@ func (b *Builder) commonLabels() map[string]string {
 		labels[butlerv1alpha1.LabelEnvironment] = env
 	}
 
-	if owner := b.tc.Labels[butlerv1alpha1.LabelOwner]; owner != "" {
-		labels[butlerv1alpha1.LabelOwner] = owner
-	}
-
 	return labels
+}
+
+// commonAnnotations returns annotations applied to all CAPI resources
+// whose values cannot fit in a label (for example email addresses,
+// which contain "@" and fail label-value validation). The owner
+// annotation is read from the TenantCluster's own annotations; the
+// reconciler sets it from the creator-email annotation before CAPI
+// resources are built.
+func (b *Builder) commonAnnotations() map[string]string {
+	if b.tc.Annotations == nil {
+		return nil
+	}
+	owner := b.tc.Annotations[butlerv1alpha1.AnnotationOwner]
+	if owner == "" {
+		return nil
+	}
+	return map[string]string{butlerv1alpha1.AnnotationOwner: owner}
 }
 
 // extractMinorVersion extracts the minor version from a Kubernetes version string.

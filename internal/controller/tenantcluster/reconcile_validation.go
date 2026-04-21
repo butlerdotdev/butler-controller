@@ -6,6 +6,7 @@ package tenantcluster
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -15,6 +16,21 @@ import (
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
 )
+
+// ownerIdentity returns the authoritative owner email for a
+// TenantCluster. AnnotationOwner (set by the controller) is preferred;
+// AnnotationCreatorEmail (set by butler-server) is a fallback that
+// closes the race between webhook admission and controller reconcile
+// when sibling counts would otherwise miss a just-created cluster.
+func ownerIdentity(tc *butlerv1alpha1.TenantCluster) string {
+	if tc.Annotations == nil {
+		return ""
+	}
+	if v := tc.Annotations[butlerv1alpha1.AnnotationOwner]; v != "" {
+		return v
+	}
+	return tc.Annotations[butlerv1alpha1.AnnotationCreatorEmail]
+}
 
 func (r *Reconciler) validateTenantCluster(ctx context.Context, tc *butlerv1alpha1.TenantCluster, config *butlerv1alpha1.ButlerConfig) error {
 	logger := log.FromContext(ctx)
@@ -183,7 +199,7 @@ func (r *Reconciler) validateProviderLimits(ctx context.Context, tc *butlerv1alp
 			if existingCount >= maxClusters {
 				msg := fmt.Sprintf("team namespace %q has %d cluster(s), provider %q limits to %d",
 					tc.Namespace, existingCount, pc.Name, maxClusters)
-				r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+				r.setCondition(tc, butlerv1alpha1.TenantClusterConditionQuotaSatisfied,
 					metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
 				return fmt.Errorf("quota exceeded: %s", msg)
 			}
@@ -206,7 +222,7 @@ func (r *Reconciler) validateProviderLimits(ctx context.Context, tc *butlerv1alp
 			if totalNodes > maxNodes {
 				msg := fmt.Sprintf("total worker replicas (%d) exceeds provider %q per-team limit (%d)",
 					totalNodes, pc.Name, maxNodes)
-				r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+				r.setCondition(tc, butlerv1alpha1.TenantClusterConditionQuotaSatisfied,
 					metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
 				return fmt.Errorf("quota exceeded: %s", msg)
 			}
@@ -242,7 +258,7 @@ func (r *Reconciler) validateTeamQuotas(ctx context.Context, tc *butlerv1alpha1.
 		if tc.Spec.Workers.Replicas > *limits.MaxNodesPerCluster {
 			msg := fmt.Sprintf("worker replicas (%d) exceeds team %q per-cluster node limit (%d)",
 				tc.Spec.Workers.Replicas, team.Name, *limits.MaxNodesPerCluster)
-			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionQuotaSatisfied,
 				metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
 			return fmt.Errorf("quota exceeded: %s", msg)
 		}
@@ -264,7 +280,7 @@ func (r *Reconciler) validateTeamQuotas(ctx context.Context, tc *butlerv1alpha1.
 		if existingCount+1 > *limits.MaxClusters {
 			msg := fmt.Sprintf("team %q has %d cluster(s), team quota limits to %d",
 				team.Name, existingCount, *limits.MaxClusters)
-			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionQuotaSatisfied,
 				metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
 			return fmt.Errorf("quota exceeded: %s", msg)
 		}
@@ -281,7 +297,7 @@ func (r *Reconciler) validateTeamQuotas(ctx context.Context, tc *butlerv1alpha1.
 		if totalNodes > *limits.MaxTotalNodes {
 			msg := fmt.Sprintf("total worker nodes (%d) would exceed team %q node quota (%d)",
 				totalNodes, team.Name, *limits.MaxTotalNodes)
-			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionQuotaSatisfied,
 				metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
 			return fmt.Errorf("quota exceeded: %s", msg)
 		}
@@ -340,15 +356,15 @@ func (r *Reconciler) validateEnvironmentQuotas(ctx context.Context, tc *butlerv1
 	}
 
 	if env.Limits.MaxClustersPerMember != nil && *env.Limits.MaxClustersPerMember > 0 {
-		owner := tc.Labels[butlerv1alpha1.LabelOwner]
+		owner := ownerIdentity(tc)
 		if owner == "" {
-			logger.V(1).Info("per-member cap set but TenantCluster has no owner label; skipping cap enforcement",
+			logger.V(1).Info("per-member cap set but TenantCluster has no owner annotation; skipping cap enforcement",
 				"env", envName, "tc", tc.Name)
 			return nil
 		}
 		var ownerCount int32
 		for i := range envSiblings {
-			if envSiblings[i].Labels[butlerv1alpha1.LabelOwner] == owner {
+			if strings.EqualFold(ownerIdentity(&envSiblings[i]), owner) {
 				ownerCount++
 			}
 		}

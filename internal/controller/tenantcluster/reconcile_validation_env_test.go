@@ -27,9 +27,10 @@ func envValidationScheme(t *testing.T) *runtime.Scheme {
 func buildEnvTC(name, ns, env, owner string, replicas int32) *butlerv1alpha1.TenantCluster {
 	tc := &butlerv1alpha1.TenantCluster{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: ns,
-			Labels:    map[string]string{},
+			Name:        name,
+			Namespace:   ns,
+			Labels:      map[string]string{},
+			Annotations: map[string]string{},
 		},
 		Spec: butlerv1alpha1.TenantClusterSpec{
 			TeamRef: &butlerv1alpha1.LocalObjectReference{Name: "acme"},
@@ -40,7 +41,7 @@ func buildEnvTC(name, ns, env, owner string, replicas int32) *butlerv1alpha1.Ten
 		tc.Labels[butlerv1alpha1.LabelEnvironment] = env
 	}
 	if owner != "" {
-		tc.Labels[butlerv1alpha1.LabelOwner] = owner
+		tc.Annotations[butlerv1alpha1.AnnotationOwner] = owner
 	}
 	return tc
 }

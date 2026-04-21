@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	authzv1 "k8s.io/api/authorization/v1"
@@ -183,15 +184,19 @@ func environmentLimitsChanged(old, new []butlerv1alpha1.EnvironmentSpec) bool {
 // matching User's Spec.IsPlatformAdmin is the authoritative answer. The
 // SAR fallback fires only when no User CRD matches the caller's username,
 // which is the case for kubectl-direct operators holding the admin
-// kubeconfig but not mapped to a User CRD.
+// kubeconfig but not mapped to a User CRD. List errors surface to the
+// caller rather than falling through to SAR; a transient cache miss on
+// the primary path would otherwise false-deny a legitimate platform
+// admin whose only proof of privilege is the User CRD.
 func (v *TeamValidator) isPlatformAdmin(ctx context.Context, user authnv1.UserInfo) (bool, error) {
 	userList := &butlerv1alpha1.UserList{}
-	if err := v.Client.List(ctx, userList); err == nil {
-		for i := range userList.Items {
-			u := &userList.Items[i]
-			if u.Spec.Email == user.Username {
-				return u.Spec.IsPlatformAdmin, nil
-			}
+	if err := v.Client.List(ctx, userList); err != nil {
+		return false, fmt.Errorf("list users for platform-admin check: %w", err)
+	}
+	for i := range userList.Items {
+		u := &userList.Items[i]
+		if strings.EqualFold(u.Spec.Email, user.Username) {
+			return u.Spec.IsPlatformAdmin, nil
 		}
 	}
 	// No matching User CRD; fall back to the K8s authz model via SAR.
@@ -229,7 +234,7 @@ func (v *TeamValidator) isTeamAdminOrPlatformAdmin(ctx context.Context, user aut
 		return true, nil
 	}
 	for _, tu := range team.Spec.Access.Users {
-		if tu.Name == user.Username && tu.Role == butlerv1alpha1.TeamRoleAdmin {
+		if strings.EqualFold(tu.Name, user.Username) && tu.Role == butlerv1alpha1.TeamRoleAdmin {
 			return true, nil
 		}
 	}

@@ -15,13 +15,17 @@ import (
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
 )
 
-// promoteOwnerLabel promotes the butler.butlerlabs.dev/creator-email
+// promoteOwnerAnnotation copies the butler.butlerlabs.dev/creator-email
 // annotation (set by butler-server on creates it handles) to the
-// butler.butlerlabs.dev/owner label. The label feeds per-member cap
-// accounting and CAPI resource ownership tracking. Writes back to the
-// cluster when the label was missing. No-op when the annotation is
-// absent (kubectl-direct creates) or the label is already set.
-func (r *Reconciler) promoteOwnerLabel(ctx context.Context, tc *butlerv1alpha1.TenantCluster) error {
+// butler.butlerlabs.dev/owner annotation. The owner annotation is the
+// authoritative source for per-member cap accounting and CAPI resource
+// ownership tracking; the creator-email annotation is the raw input,
+// and the owner annotation is what downstream code reads. Stored as
+// annotations rather than labels because email addresses contain "@",
+// which is not valid in a Kubernetes label value. No-op when the
+// creator-email annotation is absent or the owner annotation is
+// already set to the same value.
+func (r *Reconciler) promoteOwnerAnnotation(ctx context.Context, tc *butlerv1alpha1.TenantCluster) error {
 	if tc.Annotations == nil {
 		return nil
 	}
@@ -29,17 +33,14 @@ func (r *Reconciler) promoteOwnerLabel(ctx context.Context, tc *butlerv1alpha1.T
 	if email == "" {
 		return nil
 	}
-	if tc.Labels[butlerv1alpha1.LabelOwner] == email {
+	if tc.Annotations[butlerv1alpha1.AnnotationOwner] == email {
 		return nil
 	}
-	if tc.Labels == nil {
-		tc.Labels = map[string]string{}
-	}
-	tc.Labels[butlerv1alpha1.LabelOwner] = email
+	tc.Annotations[butlerv1alpha1.AnnotationOwner] = email
 	if err := r.Update(ctx, tc); err != nil {
-		return fmt.Errorf("failed to set owner label: %w", err)
+		return fmt.Errorf("failed to set owner annotation: %w", err)
 	}
-	log.FromContext(ctx).V(1).Info("promoted owner label from creator-email annotation", "owner", email)
+	log.FromContext(ctx).V(1).Info("promoted owner annotation from creator-email", "owner", email)
 	return nil
 }
 
@@ -121,10 +122,39 @@ func mergeClusterDefaults(team *butlerv1alpha1.Team, envName string) *butlerv1al
 		v := *envDefaults.WorkerDiskGi
 		merged.WorkerDiskGi = &v
 	}
-	if len(envDefaults.DefaultAddons) > 0 {
-		merged.DefaultAddons = append([]string(nil), envDefaults.DefaultAddons...)
-	}
+	// DefaultAddons merge: append env additions onto the team set and
+	// deduplicate while preserving first-seen order. Team addons come
+	// first, env-only addons come after. Replace-semantics would
+	// surprise operators who expect env to be additive; scalar fields
+	// still use env-wins-on-conflict because lists need the combine.
+	merged.DefaultAddons = mergeAddons(merged.DefaultAddons, envDefaults.DefaultAddons)
 	return merged
+}
+
+// mergeAddons concatenates two addon name lists, dropping duplicates
+// while preserving first-seen order. Returns nil when both inputs are
+// empty so the output matches Go's zero-value idiom.
+func mergeAddons(a, b []string) []string {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, x := range a {
+		if _, ok := seen[x]; ok {
+			continue
+		}
+		seen[x] = struct{}{}
+		out = append(out, x)
+	}
+	for _, x := range b {
+		if _, ok := seen[x]; ok {
+			continue
+		}
+		seen[x] = struct{}{}
+		out = append(out, x)
+	}
+	return out
 }
 
 // applyClusterDefaults fills zero-valued fields on spec from defaults.

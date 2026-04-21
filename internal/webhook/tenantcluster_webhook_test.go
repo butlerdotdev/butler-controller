@@ -32,14 +32,15 @@ import (
 func buildTC(name, namespace, envLabel, owner string, replicas int32) *butlerv1alpha1.TenantCluster {
 	tc := &butlerv1alpha1.TenantCluster{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-			Labels:    map[string]string{},
+			Name:        name,
+			Namespace:   namespace,
+			Labels:      map[string]string{},
+			Annotations: map[string]string{},
 		},
 		Spec: butlerv1alpha1.TenantClusterSpec{
 			TeamRef: &butlerv1alpha1.LocalObjectReference{Name: "acme"},
 			Workers: butlerv1alpha1.WorkersSpec{
-				Replicas: replicas,
+				Replicas:        replicas,
 				MachineTemplate: butlerv1alpha1.MachineTemplateSpec{CPU: 2},
 			},
 		},
@@ -48,7 +49,7 @@ func buildTC(name, namespace, envLabel, owner string, replicas int32) *butlerv1a
 		tc.Labels[butlerv1alpha1.LabelEnvironment] = envLabel
 	}
 	if owner != "" {
-		tc.Labels[butlerv1alpha1.LabelOwner] = owner
+		tc.Annotations[butlerv1alpha1.AnnotationOwner] = owner
 	}
 	return tc
 }

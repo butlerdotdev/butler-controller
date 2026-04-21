@@ -620,7 +620,14 @@ func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc *bu
 				if other.Labels == nil || other.Labels[butlerv1alpha1.LabelEnvironment] != envLabel {
 					continue
 				}
-				if other.Labels[butlerv1alpha1.LabelOwner] == creator {
+				otherOwner := ""
+				if other.Annotations != nil {
+					otherOwner = other.Annotations[butlerv1alpha1.AnnotationOwner]
+					if otherOwner == "" {
+						otherOwner = other.Annotations[butlerv1alpha1.AnnotationCreatorEmail]
+					}
+				}
+				if strings.EqualFold(otherOwner, creator) {
 					ownedByCreator++
 				}
 			}

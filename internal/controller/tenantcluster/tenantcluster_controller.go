@@ -140,8 +140,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return r.setFailedStatus(ctx, tc, "ConfigError", "Failed to get ButlerConfig: "+err.Error())
 	}
 
-	if err := r.promoteOwnerLabel(ctx, tc); err != nil {
-		logger.Error(err, "failed to promote owner label")
+	if err := r.promoteOwnerAnnotation(ctx, tc); err != nil {
+		logger.Error(err, "failed to promote owner annotation")
 		return ctrl.Result{}, err
 	}
 

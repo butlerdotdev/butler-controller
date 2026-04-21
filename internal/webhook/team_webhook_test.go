@@ -32,6 +32,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -42,6 +43,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
@@ -417,5 +419,46 @@ func TestEnvironmentLimitsChanged(t *testing.T) {
 				t.Fatalf("environmentLimitsChanged = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// --- isPlatformAdmin error surfacing (finding #8) ---
+
+func TestTeamWebhook_UserListError_Surfaced(t *testing.T) {
+	s := teamScheme(t)
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, client client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*butlerv1alpha1.UserList); ok {
+					return fmt.Errorf("simulated apiserver flake")
+				}
+				return client.List(ctx, list, opts...)
+			},
+		}).
+		Build()
+	v := &TeamValidator{Client: c}
+
+	maxClusters := int32(20)
+	team := &butlerv1alpha1.Team{
+		ObjectMeta: metav1.ObjectMeta{Name: "acme"},
+		Spec: butlerv1alpha1.TeamSpec{
+			ResourceLimits: &butlerv1alpha1.TeamResourceLimits{MaxClusters: &maxClusters},
+		},
+	}
+	req := newAdmissionRequest(t, admissionv1.Create, "any@example.com", nil, team, nil)
+
+	resp := v.Handle(context.Background(), req)
+	if resp.Allowed {
+		t.Fatal("expected error/denial, got allowed")
+	}
+	// admission.Errored sets Result.Code != 0 (HTTP 500 here) and a
+	// message. A transient List error must not silently fall through
+	// to the SAR path; the whole point of the fix is to fail loud.
+	if resp.Result == nil || resp.Result.Code == 0 {
+		t.Fatalf("expected errored response, got %+v", resp)
+	}
+	if !strings.Contains(resp.Result.Message, "simulated apiserver flake") {
+		t.Errorf("expected underlying error surfaced, got %q", resp.Result.Message)
 	}
 }
