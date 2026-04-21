@@ -486,6 +486,31 @@ func TestCommonLabels(t *testing.T) {
 	if labels[butlerv1alpha1.LabelTeam] != "team-alpha" {
 		t.Error("expected team label when teamRef is set")
 	}
+	if _, ok := labels[butlerv1alpha1.LabelEnvironment]; ok {
+		t.Error("expected no env label when TC is unlabeled")
+	}
+	if _, ok := labels[butlerv1alpha1.LabelOwner]; ok {
+		t.Error("expected no owner label when TC is unlabeled")
+	}
+}
+
+func TestCommonLabels_EnvAndOwnerPropagated(t *testing.T) {
+	tc := newTestTenantCluster("sandbox-cluster", "team-alpha")
+	tc.Spec.TeamRef = &butlerv1alpha1.LocalObjectReference{Name: "team-alpha"}
+	tc.Labels = map[string]string{
+		butlerv1alpha1.LabelEnvironment: "dev",
+		butlerv1alpha1.LabelOwner:       "alice@example.com",
+	}
+	pc := newTestProviderConfig("harvester")
+
+	labels := NewBuilder(tc, pc, "ns").commonLabels()
+
+	if labels[butlerv1alpha1.LabelEnvironment] != "dev" {
+		t.Errorf("expected env label dev, got %q", labels[butlerv1alpha1.LabelEnvironment])
+	}
+	if labels[butlerv1alpha1.LabelOwner] != "alice@example.com" {
+		t.Errorf("expected owner label alice@example.com, got %q", labels[butlerv1alpha1.LabelOwner])
+	}
 }
 
 func TestResolveControlPlaneResources_NoConfig(t *testing.T) {

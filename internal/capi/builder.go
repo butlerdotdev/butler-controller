@@ -1178,6 +1178,14 @@ func (b *Builder) commonLabels() map[string]string {
 		labels[butlerv1alpha1.LabelTeam] = b.tc.Spec.TeamRef.Name
 	}
 
+	if env := b.tc.Labels[butlerv1alpha1.LabelEnvironment]; env != "" {
+		labels[butlerv1alpha1.LabelEnvironment] = env
+	}
+
+	if owner := b.tc.Labels[butlerv1alpha1.LabelOwner]; owner != "" {
+		labels[butlerv1alpha1.LabelOwner] = owner
+	}
+
 	return labels
 }
 

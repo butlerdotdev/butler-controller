@@ -140,6 +140,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return r.setFailedStatus(ctx, tc, "ConfigError", "Failed to get ButlerConfig: "+err.Error())
 	}
 
+	if err := r.promoteOwnerLabel(ctx, tc); err != nil {
+		logger.Error(err, "failed to promote owner label")
+		return ctrl.Result{}, err
+	}
+
+	if err := r.applyTeamAndEnvDefaults(ctx, tc); err != nil {
+		logger.Error(err, "failed to apply team/env defaults")
+		return r.setFailedStatus(ctx, tc, ReasonValidationFailed, err.Error())
+	}
+
 	if err := r.validateTenantCluster(ctx, tc, butlerConfig); err != nil {
 		logger.Error(err, "validation failed")
 		return r.setFailedStatus(ctx, tc, ReasonValidationFailed, err.Error())

@@ -287,5 +287,79 @@ func (r *Reconciler) validateTeamQuotas(ctx context.Context, tc *butlerv1alpha1.
 		}
 	}
 
+	return r.validateEnvironmentQuotas(ctx, tc, team, tcList.Items)
+}
+
+// validateEnvironmentQuotas applies env-scoped defense-in-depth checks
+// when the TenantCluster carries a butler.butlerlabs.dev/environment
+// label that matches a Team.spec.environments[] entry. Two gates per
+// ADR-009 v1 scope: env MaxClusters and per-member MaxClustersPerMember.
+// MaxTotalNodes is part of the embedded TeamResourceLimits shape but is
+// not enforced at env scope in v1. Team-total is enforced by the caller.
+func (r *Reconciler) validateEnvironmentQuotas(ctx context.Context, tc *butlerv1alpha1.TenantCluster, team *butlerv1alpha1.Team, siblings []butlerv1alpha1.TenantCluster) error {
+	if len(team.Spec.Environments) == 0 {
+		return nil
+	}
+
+	envName := tc.Labels[butlerv1alpha1.LabelEnvironment]
+	if envName == "" {
+		return nil
+	}
+
+	var env *butlerv1alpha1.EnvironmentSpec
+	for i := range team.Spec.Environments {
+		if team.Spec.Environments[i].Name == envName {
+			env = &team.Spec.Environments[i]
+			break
+		}
+	}
+	if env == nil || env.Limits == nil {
+		return nil
+	}
+
+	logger := log.FromContext(ctx)
+
+	var envSiblings []butlerv1alpha1.TenantCluster
+	for i := range siblings {
+		if siblings[i].Name == tc.Name {
+			continue
+		}
+		if siblings[i].Labels[butlerv1alpha1.LabelEnvironment] == envName {
+			envSiblings = append(envSiblings, siblings[i])
+		}
+	}
+
+	if env.Limits.MaxClusters != nil {
+		if int32(len(envSiblings))+1 > *env.Limits.MaxClusters {
+			msg := fmt.Sprintf("environment %q has %d cluster(s), env quota limits to %d",
+				envName, len(envSiblings), *env.Limits.MaxClusters)
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionQuotaSatisfied,
+				metav1.ConditionFalse, butlerv1alpha1.ReasonEnvQuotaExceeded, msg)
+			return fmt.Errorf("env quota exceeded: %s", msg)
+		}
+	}
+
+	if env.Limits.MaxClustersPerMember != nil && *env.Limits.MaxClustersPerMember > 0 {
+		owner := tc.Labels[butlerv1alpha1.LabelOwner]
+		if owner == "" {
+			logger.V(1).Info("per-member cap set but TenantCluster has no owner label; skipping cap enforcement",
+				"env", envName, "tc", tc.Name)
+			return nil
+		}
+		var ownerCount int32
+		for i := range envSiblings {
+			if envSiblings[i].Labels[butlerv1alpha1.LabelOwner] == owner {
+				ownerCount++
+			}
+		}
+		if ownerCount+1 > *env.Limits.MaxClustersPerMember {
+			msg := fmt.Sprintf("member %q owns %d cluster(s) in environment %q, per-member cap is %d",
+				owner, ownerCount, envName, *env.Limits.MaxClustersPerMember)
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionQuotaSatisfied,
+				metav1.ConditionFalse, butlerv1alpha1.ReasonPerMemberCapExceeded, msg)
+			return fmt.Errorf("per-member cap exceeded: %s", msg)
+		}
+	}
+
 	return nil
 }

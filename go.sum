@@ -1,13 +1,7 @@
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
-github.com/butlerdotdev/butler-api v0.9.4 h1:+ygWngvLX4K8Zg9wAeg11q2Xu7DxuZjyJ+nFGUbO1Pw=
-github.com/butlerdotdev/butler-api v0.9.4/go.mod h1:q/RjPFM/r2ELq4DqR78OiAxerKBvH5D4nTGsVLKbjqY=
-github.com/butlerdotdev/butler-api v0.9.5-0.20260421035110-542224c72b1d h1:DrNtwPvYyhWN6xR9wJoYTb5jf8BB+1ymSZEK3Bpc9os=
-github.com/butlerdotdev/butler-api v0.9.5-0.20260421035110-542224c72b1d/go.mod h1:q/RjPFM/r2ELq4DqR78OiAxerKBvH5D4nTGsVLKbjqY=
-github.com/butlerdotdev/butler-api v0.9.5-0.20260421132440-da0731e94ba1 h1:9Cw1M1imdcL2Kx0KjP1l89JGzBxkKLr5JMSoS5V0eT8=
-github.com/butlerdotdev/butler-api v0.9.5-0.20260421132440-da0731e94ba1/go.mod h1:q/RjPFM/r2ELq4DqR78OiAxerKBvH5D4nTGsVLKbjqY=
-github.com/butlerdotdev/butler-api v0.9.5-0.20260421134907-d82ca06e1f75 h1:cFmz3SglGo8V7WWaXGjO0ksZiX5vX3JiRMifcNeUwfg=
-github.com/butlerdotdev/butler-api v0.9.5-0.20260421134907-d82ca06e1f75/go.mod h1:q/RjPFM/r2ELq4DqR78OiAxerKBvH5D4nTGsVLKbjqY=
+github.com/butlerdotdev/butler-api v0.9.5-0.20260421140855-06ba1220a18f h1:TZ+uuj69sGD34bdABCULOe7itQPSnzYj4WoqDvKc95g=
+github.com/butlerdotdev/butler-api v0.9.5-0.20260421140855-06ba1220a18f/go.mod h1:q/RjPFM/r2ELq4DqR78OiAxerKBvH5D4nTGsVLKbjqY=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/creack/pty v1.1.9/go.mod h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ33E=
