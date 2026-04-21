@@ -59,7 +59,12 @@ type EnvironmentSpec struct {
 }
 
 type EnvironmentLimits struct {
-    TeamResourceLimits `json:",inline"`
+    // MaxClusters caps how many TenantClusters can exist in this
+    // environment. Unset means no env-level cap; the team ceiling still
+    // applies.
+    // +optional
+    // +kubebuilder:validation:Minimum=0
+    MaxClusters *int32 `json:"maxClusters,omitempty"`
 
     // MaxClustersPerMember caps how many TenantClusters each individual
     // team member can own in this environment. Zero or unset means no
@@ -71,7 +76,7 @@ type EnvironmentLimits struct {
 }
 ```
 
-`TeamResourceLimits`, `TeamAccess`, and `ClusterDefaults` are reused verbatim from `butler-api/api/v1alpha1/common_types.go` and `team_types.go`. No new quota surface is introduced.
+`TeamAccess` and `ClusterDefaults` are reused verbatim from `butler-api/api/v1alpha1/common_types.go` and `team_types.go`. `EnvironmentLimits` is intentionally narrow in v1: cluster count and per-member cap only. Compute, storage, and node caps remain on `Team.spec.resourceLimits` and apply team-wide. An earlier shape embedded the full `TeamResourceLimits` surface, which made the enforcement contract ambiguous: the webhook enforced every inherited field at env scope while the reconciler only enforced cluster count. Collapsing the surface removes the drift and keeps the operator mental model simple. Broader env caps can return in a follow-on ADR once a concrete need emerges.
 
 ### Label on TenantCluster
 
@@ -79,7 +84,9 @@ New label: `butler.butlerlabs.dev/environment`. Set at create time; immutable af
 
 ### RBAC: additive-only inheritance
 
-Team-level roles flow through to every environment unchanged. The environment's optional `access` block can elevate a member within that environment; it cannot reduce a member's team-level role. Consequences:
+Team-level roles flow through to every environment unchanged. The environment's optional `access` block can elevate a member within that environment; it cannot reduce a member's team-level role, and it cannot introduce subjects absent from the team-level `access` block. The Team admission webhook rejects a team whose `spec.environments[].access.users[].name` is not already listed in `spec.access.users[].name`, with the same rule applied to groups. Subject matching is strict on individual listings; group memberships are not resolved transitively because admission has no cheap way to enumerate them without an extra authentication service.
+
+Consequences:
 
 - A team admin is admin on every environment by construction.
 - A team operator stays at operator in an environment unless elevated to admin by the env's access block.
@@ -289,10 +296,18 @@ Rejected for v1: enables per-env NetworkPolicies and ResourceQuotas naturally, b
 - The new `Team` admission webhook introduces a cross-resource dependency: Team mutations require a User CRD lookup (or SubjectAccessReview) to verify the requesting identity's role. Adds an admission-time round-trip to the API server.
 - A new label must appear on TenantClusters. Existing automation that creates `TenantCluster` resources directly (GitOps, CI) must be updated to set the label once the owning team defines environments.
 
-### Owner-label edge cases for `MaxClustersPerMember`
+### `ClusterDefaults` in v1: declarative only
 
-- **kubectl-created TenantClusters without creator-email annotation**: butler-server sets `butler.butlerlabs.dev/creator-email` on creates it handles, and the controller promotes this annotation to a `butler.butlerlabs.dev/owner` label on the TenantCluster. Clusters created directly via kubectl (bypassing butler-server) carry no annotation. When the target env has `MaxClustersPerMember` set, the admission webhook rejects the create with a message pointing operators at the required annotation or label. kubectl-path creates must set the annotation explicitly. CLI reference documents the annotation name.
-- **Pre-existing TenantClusters without owner label**: treated as owned by no one for `MaxClustersPerMember` accounting. They do not count against any member's cap. `butleradm env migrate` can backfill the owner label from audit logs when the creator is recoverable; otherwise the label stays blank and the cluster remains unaccounted for member-cap purposes until an operator sets it manually.
+`Team.spec.clusterDefaults` and `Team.spec.environments[].clusterDefaults` are part of the schema and the controller resolves their merged value for observability, but v1 does not apply them to spec. The fields these defaults target all carry `+kubebuilder:default` markers (`CPU=4`, `Memory=16Gi`, `DiskSize=100Gi`) or `+kubebuilder:validation:Required` (`KubernetesVersion`, `Workers.Replicas`) on `TenantClusterSpec`. The apiserver stamps defaults or rejects empty values before the reconciler sees the spec, so an "apply if unset" step in the reconciler is structurally a no-op. A mutating webhook that runs before the schema stamp is the correct place to apply these; tracked as a v1.1 follow-on. The `ClusterDefaults` field stays in the schema so existing YAML keeps validating and the mutating webhook can adopt it without further CRD churn.
+
+`DefaultAddons` merge: env additions append onto the team set and deduplicate while preserving first-seen order. Replace-on-env-value would surprise operators who expect env defaults to layer on top. Scalar fields still use env-wins-on-conflict because lists need the combine and scalars do not.
+
+### Owner edge cases for `MaxClustersPerMember`
+
+- **Owner stored as annotation, not label**: email addresses contain `@`, which is not a valid Kubernetes label-value character. Storing the owner email on a label fails apiserver validation. The feature uses two annotations: `butler.butlerlabs.dev/creator-email` (set by butler-server from the authenticated session or by `butleradm env migrate` on backfill) and `butler.butlerlabs.dev/owner` (promoted by the controller from creator-email on first reconcile). Sibling scans in the admission webhook and reconciler read from the owner annotation with a fallback to creator-email, which closes the race between admission and controller reconcile. CAPI resource propagation uses `SetAnnotations` alongside `SetLabels` so downstream resources carry the owner.
+- **Creator-email must match the requesting identity**: the TenantCluster webhook rejects any create that sets `butler.butlerlabs.dev/creator-email` to a value other than the admission request's `UserInfo.Username` (case-insensitive compare). Without this check a kubectl-direct caller could claim another user's cap room. butler-server is unaffected because it impersonates the authenticated user when submitting the create, so the UserInfo already matches the annotation.
+- **kubectl-created TenantClusters without creator-email annotation**: when the target env has `MaxClustersPerMember` set, the admission webhook rejects the create with a message pointing operators at the required annotation. CLI reference documents the annotation name.
+- **Pre-existing TenantClusters without owner annotation**: treated as owned by no one for `MaxClustersPerMember` accounting. They do not count against any member's cap. `butleradm env migrate` can backfill the owner from audit logs when the creator is recoverable; otherwise the annotation stays blank and the cluster remains unaccounted for member-cap purposes until an operator sets it manually.
 
 ### Deferred
 
