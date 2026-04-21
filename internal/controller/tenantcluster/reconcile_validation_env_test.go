@@ -72,7 +72,7 @@ func TestValidateEnvironmentQuotas_NoEnvs_NoOp(t *testing.T) {
 func TestValidateEnvironmentQuotas_EnvClusterCapExceeded(t *testing.T) {
 	s := envValidationScheme(t)
 	team := teamWithEnv("acme", "prod", &butlerv1alpha1.EnvironmentLimits{
-		TeamResourceLimits: butlerv1alpha1.TeamResourceLimits{MaxClusters: int32Ptr(2)},
+		MaxClusters: int32Ptr(2),
 	})
 	c := fake.NewClientBuilder().WithScheme(s).Build()
 	r := &Reconciler{Client: c, Scheme: s}
@@ -96,7 +96,7 @@ func TestValidateEnvironmentQuotas_EnvClusterCapExceeded(t *testing.T) {
 func TestValidateEnvironmentQuotas_DifferentEnvNotCounted(t *testing.T) {
 	s := envValidationScheme(t)
 	team := teamWithEnv("acme", "prod", &butlerv1alpha1.EnvironmentLimits{
-		TeamResourceLimits: butlerv1alpha1.TeamResourceLimits{MaxClusters: int32Ptr(2)},
+		MaxClusters: int32Ptr(2),
 	})
 	c := fake.NewClientBuilder().WithScheme(s).Build()
 	r := &Reconciler{Client: c, Scheme: s}

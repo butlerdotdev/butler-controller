@@ -145,9 +145,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
-	if err := r.applyTeamAndEnvDefaults(ctx, tc); err != nil {
-		logger.Error(err, "failed to apply team/env defaults")
-		return r.setFailedStatus(ctx, tc, ReasonValidationFailed, err.Error())
+	// Resolve team/env ClusterDefaults for observability. v1 does not
+	// apply them to spec because the apiserver has already stamped
+	// kubebuilder defaults by the time reconciliation runs; see
+	// resolveTeamAndEnvDefaults for the full note. A future mutating
+	// webhook will apply them before the schema stamp.
+	if d := r.resolveTeamAndEnvDefaults(ctx, tc); d != nil {
+		logger.V(1).Info("resolved team/env defaults (declarative-only in v1)",
+			"team", tc.Spec.TeamRef.Name,
+			"env", tc.Labels[butlerv1alpha1.LabelEnvironment],
+			"kubernetesVersion", d.KubernetesVersion,
+			"defaultAddons", d.DefaultAddons,
+		)
 	}
 
 	if err := r.validateTenantCluster(ctx, tc, butlerConfig); err != nil {

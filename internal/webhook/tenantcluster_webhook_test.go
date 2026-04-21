@@ -127,7 +127,7 @@ func TestTCWebhook_EnvCapExceeded_Denied(t *testing.T) {
 	team := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{
 		Name: "prod",
 		Limits: &butlerv1alpha1.EnvironmentLimits{
-			TeamResourceLimits: butlerv1alpha1.TeamResourceLimits{MaxClusters: &maxClusters},
+			MaxClusters: &maxClusters,
 		},
 	})
 	existing1 := buildTC("tc-existing-1", "team-acme", "prod", "u1", 3)
@@ -149,7 +149,7 @@ func TestTCWebhook_EnvCapHasRoom_OtherEnvsIgnored(t *testing.T) {
 		butlerv1alpha1.EnvironmentSpec{
 			Name: "prod",
 			Limits: &butlerv1alpha1.EnvironmentLimits{
-				TeamResourceLimits: butlerv1alpha1.TeamResourceLimits{MaxClusters: &maxClusters},
+				MaxClusters: &maxClusters,
 			},
 		},
 		butlerv1alpha1.EnvironmentSpec{Name: "dev"},

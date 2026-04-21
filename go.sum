@@ -1,7 +1,7 @@
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
-github.com/butlerdotdev/butler-api v0.9.5-0.20260421154817-ed06da01828e h1:zXoVTt7MCOtsU0LyLB1ooigUIZunnwSwq6JCqcpl8Y4=
-github.com/butlerdotdev/butler-api v0.9.5-0.20260421154817-ed06da01828e/go.mod h1:q/RjPFM/r2ELq4DqR78OiAxerKBvH5D4nTGsVLKbjqY=
+github.com/butlerdotdev/butler-api v0.9.5-0.20260421155729-fafe31e7353a h1:dgZM0GZuHalpdy0zlU3vVdftbRBzk8MUNQap/szqc+k=
+github.com/butlerdotdev/butler-api v0.9.5-0.20260421155729-fafe31e7353a/go.mod h1:q/RjPFM/r2ELq4DqR78OiAxerKBvH5D4nTGsVLKbjqY=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/creack/pty v1.1.9/go.mod h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ33E=

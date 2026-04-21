@@ -6,8 +6,6 @@ package tenantcluster
 import (
 	"testing"
 
-	"k8s.io/apimachinery/pkg/api/resource"
-
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
 )
 
@@ -72,83 +70,6 @@ func TestMergeClusterDefaults_NoDefaults(t *testing.T) {
 	team := &butlerv1alpha1.Team{Spec: butlerv1alpha1.TeamSpec{}}
 	if merged := mergeClusterDefaults(team, ""); merged != nil {
 		t.Errorf("expected nil when neither team nor env defines defaults: got %v", merged)
-	}
-}
-
-func TestApplyClusterDefaults_FillsZeroFields(t *testing.T) {
-	spec := &butlerv1alpha1.TenantClusterSpec{
-		Workers: butlerv1alpha1.WorkersSpec{
-			MachineTemplate: butlerv1alpha1.MachineTemplateSpec{},
-		},
-	}
-	defaults := &butlerv1alpha1.ClusterDefaults{
-		KubernetesVersion: "v1.31.0",
-		WorkerCount:       int32Ptr(3),
-		WorkerCPU:         int32Ptr(4),
-		WorkerMemoryGi:    int32Ptr(16),
-		WorkerDiskGi:      int32Ptr(50),
-	}
-
-	applyClusterDefaults(spec, defaults)
-
-	if spec.KubernetesVersion != "v1.31.0" {
-		t.Errorf("expected KubernetesVersion filled: got %q", spec.KubernetesVersion)
-	}
-	if spec.Workers.Replicas != 3 {
-		t.Errorf("expected Replicas=3: got %d", spec.Workers.Replicas)
-	}
-	if spec.Workers.MachineTemplate.CPU != 4 {
-		t.Errorf("expected CPU=4: got %d", spec.Workers.MachineTemplate.CPU)
-	}
-	if spec.Workers.MachineTemplate.Memory.Cmp(resource.MustParse("16Gi")) != 0 {
-		t.Errorf("expected Memory=16Gi: got %s", spec.Workers.MachineTemplate.Memory.String())
-	}
-	if spec.Workers.MachineTemplate.DiskSize.Cmp(resource.MustParse("50Gi")) != 0 {
-		t.Errorf("expected DiskSize=50Gi: got %s", spec.Workers.MachineTemplate.DiskSize.String())
-	}
-}
-
-func TestApplyClusterDefaults_DoesNotOverwriteUserSetValues(t *testing.T) {
-	spec := &butlerv1alpha1.TenantClusterSpec{
-		KubernetesVersion: "v1.29.0",
-		Workers: butlerv1alpha1.WorkersSpec{
-			Replicas: 5,
-			MachineTemplate: butlerv1alpha1.MachineTemplateSpec{
-				CPU:      2,
-				Memory:   resource.MustParse("4Gi"),
-				DiskSize: resource.MustParse("20Gi"),
-			},
-		},
-	}
-	defaults := &butlerv1alpha1.ClusterDefaults{
-		KubernetesVersion: "v1.31.0",
-		WorkerCount:       int32Ptr(10),
-		WorkerCPU:         int32Ptr(8),
-		WorkerMemoryGi:    int32Ptr(32),
-		WorkerDiskGi:      int32Ptr(100),
-	}
-
-	applyClusterDefaults(spec, defaults)
-
-	if spec.KubernetesVersion != "v1.29.0" {
-		t.Errorf("expected user KubernetesVersion preserved: got %q", spec.KubernetesVersion)
-	}
-	if spec.Workers.Replicas != 5 {
-		t.Errorf("expected user Replicas=5 preserved: got %d", spec.Workers.Replicas)
-	}
-	if spec.Workers.MachineTemplate.CPU != 2 {
-		t.Errorf("expected user CPU=2 preserved: got %d", spec.Workers.MachineTemplate.CPU)
-	}
-	if spec.Workers.MachineTemplate.Memory.Cmp(resource.MustParse("4Gi")) != 0 {
-		t.Errorf("expected user Memory=4Gi preserved: got %s", spec.Workers.MachineTemplate.Memory.String())
-	}
-}
-
-func TestApplyClusterDefaults_NilDefaults(t *testing.T) {
-	spec := &butlerv1alpha1.TenantClusterSpec{}
-	applyClusterDefaults(spec, nil)
-	if spec.KubernetesVersion != "" {
-		t.Errorf("expected spec unchanged when defaults are nil")
 	}
 }
 

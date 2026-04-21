@@ -109,6 +109,10 @@ func (v *TeamValidator) handleCreate(ctx context.Context, req admission.Request)
 		}
 	}
 
+	if msg := validateEnvAccessMembership(team); msg != "" {
+		return admission.Denied(msg)
+	}
+
 	return admission.Allowed("")
 }
 
@@ -150,7 +154,53 @@ func (v *TeamValidator) handleUpdate(ctx context.Context, req admission.Request)
 		}
 	}
 
+	if msg := validateEnvAccessMembership(newTeam); msg != "" {
+		return admission.Denied(msg)
+	}
+
 	return admission.Allowed("")
+}
+
+// validateEnvAccessMembership enforces the ADR-009 additive-only
+// inheritance rule: every subject listed in an env's access block must
+// already appear as a subject in the team's access block. Matching is
+// strict on individual listings (email or group name); group membership
+// is not resolved transitively because the webhook has no way to
+// enumerate groups without an additional authentication service.
+// Returns an empty string when all subjects check out, or a rejection
+// message when at least one env subject is not a team member.
+func validateEnvAccessMembership(team *butlerv1alpha1.Team) string {
+	teamUsers := make(map[string]struct{}, len(team.Spec.Access.Users))
+	for _, u := range team.Spec.Access.Users {
+		teamUsers[strings.ToLower(u.Name)] = struct{}{}
+	}
+	teamGroups := make(map[string]struct{}, len(team.Spec.Access.Groups))
+	for _, g := range team.Spec.Access.Groups {
+		teamGroups[g.Name] = struct{}{}
+	}
+	for i := range team.Spec.Environments {
+		env := &team.Spec.Environments[i]
+		if env.Access == nil {
+			continue
+		}
+		for _, u := range env.Access.Users {
+			if _, ok := teamUsers[strings.ToLower(u.Name)]; !ok {
+				return fmt.Sprintf(
+					"spec.environments[%d].access.users[%q] is not a team member; env access is additive only and cannot introduce subjects absent from spec.access.users",
+					i, u.Name,
+				)
+			}
+		}
+		for _, g := range env.Access.Groups {
+			if _, ok := teamGroups[g.Name]; !ok {
+				return fmt.Sprintf(
+					"spec.environments[%d].access.groups[%q] is not a team group; env access is additive only and cannot introduce groups absent from spec.access.groups",
+					i, g.Name,
+				)
+			}
+		}
+	}
+	return ""
 }
 
 // environmentLimitsChanged reports whether any environment's Limits block

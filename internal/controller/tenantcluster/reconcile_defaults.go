@@ -8,7 +8,6 @@ import (
 	"fmt"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -44,14 +43,22 @@ func (r *Reconciler) promoteOwnerAnnotation(ctx context.Context, tc *butlerv1alp
 	return nil
 }
 
-// applyTeamAndEnvDefaults mutates the in-memory TenantCluster spec to fill
-// unset fields from Team.spec.environments[].clusterDefaults and
-// Team.spec.clusterDefaults. Env defaults win over Team defaults on the
-// same field, user-set fields on the TC win over both. See ADR-009.
+// resolveTeamAndEnvDefaults returns the effective ClusterDefaults for a
+// TenantCluster by layering the env entry's defaults over the team-level
+// defaults. Returns nil when neither side defines defaults or when the
+// referenced team is missing or unreachable (treat as no defaults, not
+// an error, to avoid blocking reconciliation on a transient cache miss).
 //
-// Applied to the in-memory spec only; never written back to the cluster,
-// matching the existing image-sync override pattern in the reconciler.
-func (r *Reconciler) applyTeamAndEnvDefaults(ctx context.Context, tc *butlerv1alpha1.TenantCluster) error {
+// Application note: ClusterDefaults is declarative-only in v1. The
+// TenantClusterSpec fields that ClusterDefaults targets all carry
+// kubebuilder defaults (CPU=4, Memory=16Gi, DiskSize=100Gi) or are
+// +kubebuilder:validation:Required (KubernetesVersion, Workers.Replicas),
+// so the apiserver stamps values before the reconciler sees them.
+// Consumers of this resolver are limited to logging and future paths
+// that bypass the schema defaulting. A mutating webhook is the correct
+// place to apply these before the apiserver stamp; tracked as a
+// follow-on.
+func (r *Reconciler) resolveTeamAndEnvDefaults(ctx context.Context, tc *butlerv1alpha1.TenantCluster) *butlerv1alpha1.ClusterDefaults {
 	if tc.Spec.TeamRef == nil || tc.Spec.TeamRef.Name == "" {
 		return nil
 	}
@@ -60,25 +67,20 @@ func (r *Reconciler) applyTeamAndEnvDefaults(ctx context.Context, tc *butlerv1al
 
 	team := &butlerv1alpha1.Team{}
 	if err := r.Get(ctx, types.NamespacedName{Name: tc.Spec.TeamRef.Name}, team); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
+		if !apierrors.IsNotFound(err) {
+			logger.V(1).Info("could not fetch team for defaults resolution", "team", tc.Spec.TeamRef.Name, "error", err)
 		}
-		return fmt.Errorf("failed to get team for defaults: %w", err)
-	}
-
-	effective := mergeClusterDefaults(team, tc.Labels[butlerv1alpha1.LabelEnvironment])
-	if effective == nil {
 		return nil
 	}
 
-	applyClusterDefaults(&tc.Spec, effective)
-	logger.V(1).Info("applied team/env defaults", "team", team.Name, "env", tc.Labels[butlerv1alpha1.LabelEnvironment])
-	return nil
+	return mergeClusterDefaults(team, tc.Labels[butlerv1alpha1.LabelEnvironment])
 }
 
 // mergeClusterDefaults returns an effective ClusterDefaults by layering
 // env.ClusterDefaults over team.ClusterDefaults. Env fields win; team
 // fields fill the remaining gaps. Nil when neither side defines defaults.
+// Exposed as a package function (not a method) so a future mutating
+// webhook can call it without a reconciler instance.
 func mergeClusterDefaults(team *butlerv1alpha1.Team, envName string) *butlerv1alpha1.ClusterDefaults {
 	var envDefaults *butlerv1alpha1.ClusterDefaults
 	if envName != "" {
@@ -155,34 +157,4 @@ func mergeAddons(a, b []string) []string {
 		out = append(out, x)
 	}
 	return out
-}
-
-// applyClusterDefaults fills zero-valued fields on spec from defaults.
-// User-set fields on the spec are never overwritten. Schema-level
-// kubebuilder defaults (applied by the API server) normally leave
-// numeric fields non-zero, so in practice this function only fills
-// gaps on paths that skipped the schema defaults (e.g. older clients).
-func applyClusterDefaults(spec *butlerv1alpha1.TenantClusterSpec, d *butlerv1alpha1.ClusterDefaults) {
-	if d == nil {
-		return
-	}
-
-	if spec.KubernetesVersion == "" && d.KubernetesVersion != "" {
-		spec.KubernetesVersion = d.KubernetesVersion
-	}
-
-	if spec.Workers.Replicas == 0 && d.WorkerCount != nil {
-		spec.Workers.Replicas = *d.WorkerCount
-	}
-
-	mt := &spec.Workers.MachineTemplate
-	if mt.CPU == 0 && d.WorkerCPU != nil {
-		mt.CPU = *d.WorkerCPU
-	}
-	if mt.Memory.IsZero() && d.WorkerMemoryGi != nil {
-		mt.Memory = resource.MustParse(fmt.Sprintf("%dGi", *d.WorkerMemoryGi))
-	}
-	if mt.DiskSize.IsZero() && d.WorkerDiskGi != nil {
-		mt.DiskSize = resource.MustParse(fmt.Sprintf("%dGi", *d.WorkerDiskGi))
-	}
 }

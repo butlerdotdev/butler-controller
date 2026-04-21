@@ -466,15 +466,10 @@ func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc *bu
 		return nil, fmt.Errorf("list tenant clusters in %q: %w", tc.Namespace, err)
 	}
 
-	// Partition existing clusters into same-env (count and resource sums)
-	// and everything else (ignored for env-scoped checks). Exclude self on
-	// update to keep the accounting consistent with the existing team-level
-	// check above.
-	var sameEnvReplicas int32
+	// Count same-env siblings (exclude self on update). v1 env-level
+	// enforcement is cluster count plus per-member cap; CPU/memory/
+	// storage/node caps stay on Team.spec.resourceLimits.
 	sameEnvCount := int32(0)
-	sameEnvCPU := resource.NewQuantity(0, resource.DecimalSI)
-	sameEnvMemory := resource.NewQuantity(0, resource.BinarySI)
-	sameEnvStorage := resource.NewQuantity(0, resource.BinarySI)
 	for i := range tcList.Items {
 		other := &tcList.Items[i]
 		if other.Name == tc.Name {
@@ -484,20 +479,8 @@ func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc *bu
 			continue
 		}
 		sameEnvCount++
-		sameEnvReplicas += other.Spec.Workers.Replicas
-		otherCPU := resource.NewQuantity(
-			int64(other.Spec.Workers.MachineTemplate.CPU)*int64(other.Spec.Workers.Replicas),
-			resource.DecimalSI,
-		)
-		sameEnvCPU.Add(*otherCPU)
-		for j := int32(0); j < other.Spec.Workers.Replicas; j++ {
-			sameEnvMemory.Add(other.Spec.Workers.MachineTemplate.Memory)
-			sameEnvStorage.Add(other.Spec.Workers.MachineTemplate.DiskSize)
-		}
 	}
 
-	mt := tc.Spec.Workers.MachineTemplate
-	replicas := tc.Spec.Workers.Replicas
 	lim := targetEnv.Limits
 
 	if lim.MaxClusters != nil && sameEnvCount+1 > *lim.MaxClusters {
@@ -508,79 +491,6 @@ func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc *bu
 				envLabel, team.Name, sameEnvCount, *lim.MaxClusters,
 			),
 		))
-	}
-
-	if lim.MaxTotalNodes != nil {
-		if sameEnvReplicas+replicas > *lim.MaxTotalNodes {
-			allErrs = append(allErrs, field.Forbidden(
-				field.NewPath("spec", "workers", "replicas"),
-				fmt.Sprintf(
-					"total worker nodes (%d) in environment %q would exceed env node quota (%d)",
-					sameEnvReplicas+replicas, envLabel, *lim.MaxTotalNodes,
-				),
-			))
-		}
-	}
-
-	if lim.MaxNodesPerCluster != nil && replicas > *lim.MaxNodesPerCluster {
-		allErrs = append(allErrs, field.Forbidden(
-			field.NewPath("spec", "workers", "replicas"),
-			fmt.Sprintf(
-				"worker replicas (%d) exceeds environment %q per-cluster node limit (%d)",
-				replicas, envLabel, *lim.MaxNodesPerCluster,
-			),
-		))
-	}
-
-	if lim.MaxCPUCores != nil && !lim.MaxCPUCores.IsZero() {
-		requestedCPU := resource.NewQuantity(int64(mt.CPU)*int64(replicas), resource.DecimalSI)
-		totalCPU := sameEnvCPU.DeepCopy()
-		totalCPU.Add(*requestedCPU)
-		if totalCPU.Cmp(*lim.MaxCPUCores) > 0 {
-			allErrs = append(allErrs, field.Forbidden(
-				field.NewPath("spec", "workers"),
-				fmt.Sprintf(
-					"total CPU (%s) in environment %q would exceed env CPU quota (%s)",
-					totalCPU.String(), envLabel, lim.MaxCPUCores.String(),
-				),
-			))
-		}
-	}
-
-	if lim.MaxMemory != nil && !lim.MaxMemory.IsZero() {
-		requestedMemory := resource.NewQuantity(0, resource.BinarySI)
-		for i := int32(0); i < replicas; i++ {
-			requestedMemory.Add(mt.Memory)
-		}
-		totalMemory := sameEnvMemory.DeepCopy()
-		totalMemory.Add(*requestedMemory)
-		if totalMemory.Cmp(*lim.MaxMemory) > 0 {
-			allErrs = append(allErrs, field.Forbidden(
-				field.NewPath("spec", "workers"),
-				fmt.Sprintf(
-					"total memory (%s) in environment %q would exceed env memory quota (%s)",
-					totalMemory.String(), envLabel, lim.MaxMemory.String(),
-				),
-			))
-		}
-	}
-
-	if lim.MaxStorage != nil && !lim.MaxStorage.IsZero() {
-		requestedStorage := resource.NewQuantity(0, resource.BinarySI)
-		for i := int32(0); i < replicas; i++ {
-			requestedStorage.Add(mt.DiskSize)
-		}
-		totalStorage := sameEnvStorage.DeepCopy()
-		totalStorage.Add(*requestedStorage)
-		if totalStorage.Cmp(*lim.MaxStorage) > 0 {
-			allErrs = append(allErrs, field.Forbidden(
-				field.NewPath("spec", "workers"),
-				fmt.Sprintf(
-					"total storage (%s) in environment %q would exceed env storage quota (%s)",
-					totalStorage.String(), envLabel, lim.MaxStorage.String(),
-				),
-			))
-		}
 	}
 
 	// MaxClustersPerMember enforcement. The creator's email is carried on

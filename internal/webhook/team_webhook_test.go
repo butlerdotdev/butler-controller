@@ -230,7 +230,7 @@ func TestTeamWebhook_CreateWithEnvLimits_NonPlatformAdmin_Denied(t *testing.T) {
 				{
 					Name: "prod",
 					Limits: &butlerv1alpha1.EnvironmentLimits{
-						TeamResourceLimits: butlerv1alpha1.TeamResourceLimits{MaxClusters: &maxClusters},
+						MaxClusters: &maxClusters,
 					},
 				},
 			},
@@ -272,7 +272,7 @@ func TestTeamWebhook_UpdateEnvLimits_TeamAdmin_Allowed(t *testing.T) {
 	oldTeam := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{
 		Name: "prod",
 		Limits: &butlerv1alpha1.EnvironmentLimits{
-			TeamResourceLimits: butlerv1alpha1.TeamResourceLimits{MaxClusters: &oldMax},
+			MaxClusters: &oldMax,
 		},
 	})
 	newTeam := oldTeam.DeepCopy()
@@ -294,7 +294,7 @@ func TestTeamWebhook_UpdateEnvLimits_TeamOperator_Denied(t *testing.T) {
 	oldTeam := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{
 		Name: "prod",
 		Limits: &butlerv1alpha1.EnvironmentLimits{
-			TeamResourceLimits: butlerv1alpha1.TeamResourceLimits{MaxClusters: &oldMax},
+			MaxClusters: &oldMax,
 		},
 	})
 	newTeam := oldTeam.DeepCopy()
@@ -319,7 +319,7 @@ func TestTeamWebhook_UpdateBothAsPlatformAdmin_Allowed(t *testing.T) {
 	oldTeam := newTeamWithEnvs("acme", butlerv1alpha1.EnvironmentSpec{
 		Name: "prod",
 		Limits: &butlerv1alpha1.EnvironmentLimits{
-			TeamResourceLimits: butlerv1alpha1.TeamResourceLimits{MaxClusters: &oldEnvMax},
+			MaxClusters: &oldEnvMax,
 		},
 	})
 	oldTeam.Spec.ResourceLimits = &butlerv1alpha1.TeamResourceLimits{MaxClusters: &oldTeamMax}
@@ -375,14 +375,14 @@ func TestEnvironmentLimitsChanged(t *testing.T) {
 			name: "add env with limits",
 			old:  nil,
 			new: []butlerv1alpha1.EnvironmentSpec{{Name: "prod", Limits: &butlerv1alpha1.EnvironmentLimits{
-				TeamResourceLimits: butlerv1alpha1.TeamResourceLimits{MaxClusters: &m5},
+				MaxClusters: &m5,
 			}}},
 			want: true,
 		},
 		{
 			name: "remove env with limits",
 			old: []butlerv1alpha1.EnvironmentSpec{{Name: "prod", Limits: &butlerv1alpha1.EnvironmentLimits{
-				TeamResourceLimits: butlerv1alpha1.TeamResourceLimits{MaxClusters: &m5},
+				MaxClusters: &m5,
 			}}},
 			new:  nil,
 			want: true,
@@ -390,22 +390,22 @@ func TestEnvironmentLimitsChanged(t *testing.T) {
 		{
 			name: "limit value changed",
 			old: []butlerv1alpha1.EnvironmentSpec{{Name: "prod", Limits: &butlerv1alpha1.EnvironmentLimits{
-				TeamResourceLimits: butlerv1alpha1.TeamResourceLimits{MaxClusters: &m5},
+				MaxClusters: &m5,
 			}}},
 			new: []butlerv1alpha1.EnvironmentSpec{{Name: "prod", Limits: &butlerv1alpha1.EnvironmentLimits{
-				TeamResourceLimits: butlerv1alpha1.TeamResourceLimits{MaxClusters: &m10},
+				MaxClusters: &m10,
 			}}},
 			want: true,
 		},
 		{
 			name: "access changed, limits unchanged",
 			old: []butlerv1alpha1.EnvironmentSpec{{Name: "prod", Limits: &butlerv1alpha1.EnvironmentLimits{
-				TeamResourceLimits: butlerv1alpha1.TeamResourceLimits{MaxClusters: &m5},
+				MaxClusters: &m5,
 			}}},
 			new: []butlerv1alpha1.EnvironmentSpec{{Name: "prod",
 				Access: &butlerv1alpha1.TeamAccess{Users: []butlerv1alpha1.TeamUser{{Name: "u@x", Role: butlerv1alpha1.TeamRoleAdmin}}},
 				Limits: &butlerv1alpha1.EnvironmentLimits{
-					TeamResourceLimits: butlerv1alpha1.TeamResourceLimits{MaxClusters: &m5},
+					MaxClusters: &m5,
 				},
 			}},
 			want: false,
@@ -461,4 +461,122 @@ func TestTeamWebhook_UserListError_Surfaced(t *testing.T) {
 	if !strings.Contains(resp.Result.Message, "simulated apiserver flake") {
 		t.Errorf("expected underlying error surfaced, got %q", resp.Result.Message)
 	}
+}
+
+// --- Env access membership enforcement (finding #6) ---
+
+func TestTeamWebhook_EnvAccessUser_MatchesTeam_Allowed(t *testing.T) {
+	s := teamScheme(t)
+	c := clientWithUsers(s, []butlerv1alpha1.User{platformAdminUser()})
+	v := &TeamValidator{Client: c}
+
+	team := &butlerv1alpha1.Team{
+		ObjectMeta: metav1.ObjectMeta{Name: "acme"},
+		Spec: butlerv1alpha1.TeamSpec{
+			Access: butlerv1alpha1.TeamAccess{
+				Users: []butlerv1alpha1.TeamUser{
+					{Name: "alice@example.com", Role: butlerv1alpha1.TeamRoleOperator},
+				},
+			},
+			Environments: []butlerv1alpha1.EnvironmentSpec{
+				{
+					Name: "prod",
+					Access: &butlerv1alpha1.TeamAccess{
+						Users: []butlerv1alpha1.TeamUser{
+							{Name: "alice@example.com", Role: butlerv1alpha1.TeamRoleAdmin},
+						},
+					},
+				},
+			},
+		},
+	}
+	req := newAdmissionRequest(t, admissionv1.Create, "platform-admin@example.com", nil, team, nil)
+	assertAllowed(t, v.Handle(context.Background(), req))
+}
+
+func TestTeamWebhook_EnvAccessUser_NotInTeam_Denied(t *testing.T) {
+	s := teamScheme(t)
+	c := clientWithUsers(s, []butlerv1alpha1.User{platformAdminUser()})
+	v := &TeamValidator{Client: c}
+
+	team := &butlerv1alpha1.Team{
+		ObjectMeta: metav1.ObjectMeta{Name: "acme"},
+		Spec: butlerv1alpha1.TeamSpec{
+			Access: butlerv1alpha1.TeamAccess{
+				Users: []butlerv1alpha1.TeamUser{
+					{Name: "alice@example.com", Role: butlerv1alpha1.TeamRoleOperator},
+				},
+			},
+			Environments: []butlerv1alpha1.EnvironmentSpec{
+				{
+					Name: "prod",
+					Access: &butlerv1alpha1.TeamAccess{
+						Users: []butlerv1alpha1.TeamUser{
+							{Name: "outsider@example.com", Role: butlerv1alpha1.TeamRoleAdmin},
+						},
+					},
+				},
+			},
+		},
+	}
+	req := newAdmissionRequest(t, admissionv1.Create, "platform-admin@example.com", nil, team, nil)
+	assertDenied(t, v.Handle(context.Background(), req), "is not a team member")
+}
+
+func TestTeamWebhook_EnvAccessGroup_NotInTeam_Denied(t *testing.T) {
+	s := teamScheme(t)
+	c := clientWithUsers(s, []butlerv1alpha1.User{platformAdminUser()})
+	v := &TeamValidator{Client: c}
+
+	team := &butlerv1alpha1.Team{
+		ObjectMeta: metav1.ObjectMeta{Name: "acme"},
+		Spec: butlerv1alpha1.TeamSpec{
+			Access: butlerv1alpha1.TeamAccess{
+				Groups: []butlerv1alpha1.TeamGroup{
+					{Name: "team-devs", Role: butlerv1alpha1.TeamRoleOperator},
+				},
+			},
+			Environments: []butlerv1alpha1.EnvironmentSpec{
+				{
+					Name: "prod",
+					Access: &butlerv1alpha1.TeamAccess{
+						Groups: []butlerv1alpha1.TeamGroup{
+							{Name: "outsider-group", Role: butlerv1alpha1.TeamRoleAdmin},
+						},
+					},
+				},
+			},
+		},
+	}
+	req := newAdmissionRequest(t, admissionv1.Create, "platform-admin@example.com", nil, team, nil)
+	assertDenied(t, v.Handle(context.Background(), req), "is not a team group")
+}
+
+func TestTeamWebhook_EnvAccessUser_CaseInsensitive_Allowed(t *testing.T) {
+	s := teamScheme(t)
+	c := clientWithUsers(s, []butlerv1alpha1.User{platformAdminUser()})
+	v := &TeamValidator{Client: c}
+
+	team := &butlerv1alpha1.Team{
+		ObjectMeta: metav1.ObjectMeta{Name: "acme"},
+		Spec: butlerv1alpha1.TeamSpec{
+			Access: butlerv1alpha1.TeamAccess{
+				Users: []butlerv1alpha1.TeamUser{
+					{Name: "Alice@Example.COM", Role: butlerv1alpha1.TeamRoleOperator},
+				},
+			},
+			Environments: []butlerv1alpha1.EnvironmentSpec{
+				{
+					Name: "prod",
+					Access: &butlerv1alpha1.TeamAccess{
+						Users: []butlerv1alpha1.TeamUser{
+							{Name: "alice@example.com", Role: butlerv1alpha1.TeamRoleAdmin},
+						},
+					},
+				},
+			},
+		},
+	}
+	req := newAdmissionRequest(t, admissionv1.Create, "platform-admin@example.com", nil, team, nil)
+	assertAllowed(t, v.Handle(context.Background(), req))
 }
