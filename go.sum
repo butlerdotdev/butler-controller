@@ -6,6 +6,8 @@ github.com/butlerdotdev/butler-api v0.9.5-0.20260421035110-542224c72b1d h1:DrNtw
 github.com/butlerdotdev/butler-api v0.9.5-0.20260421035110-542224c72b1d/go.mod h1:q/RjPFM/r2ELq4DqR78OiAxerKBvH5D4nTGsVLKbjqY=
 github.com/butlerdotdev/butler-api v0.9.5-0.20260421132440-da0731e94ba1 h1:9Cw1M1imdcL2Kx0KjP1l89JGzBxkKLr5JMSoS5V0eT8=
 github.com/butlerdotdev/butler-api v0.9.5-0.20260421132440-da0731e94ba1/go.mod h1:q/RjPFM/r2ELq4DqR78OiAxerKBvH5D4nTGsVLKbjqY=
+github.com/butlerdotdev/butler-api v0.9.5-0.20260421134907-d82ca06e1f75 h1:cFmz3SglGo8V7WWaXGjO0ksZiX5vX3JiRMifcNeUwfg=
+github.com/butlerdotdev/butler-api v0.9.5-0.20260421134907-d82ca06e1f75/go.mod h1:q/RjPFM/r2ELq4DqR78OiAxerKBvH5D4nTGsVLKbjqY=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/creack/pty v1.1.9/go.mod h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ33E=

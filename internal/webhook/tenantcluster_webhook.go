@@ -53,12 +53,54 @@ func (v *TenantClusterValidator) ValidateCreate(ctx context.Context, obj runtime
 
 // ValidateUpdate validates a TenantCluster on update.
 func (v *TenantClusterValidator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
+	oldTC, ok := oldObj.(*butlerv1alpha1.TenantCluster)
+	if !ok {
+		return nil, fmt.Errorf("expected TenantCluster, got %T", oldObj)
+	}
 	tc, ok := newObj.(*butlerv1alpha1.TenantCluster)
 	if !ok {
 		return nil, fmt.Errorf("expected TenantCluster, got %T", newObj)
 	}
 
+	if errs := validateEnvironmentLabelImmutability(oldTC, tc); len(errs) > 0 {
+		return nil, errs.ToAggregate()
+	}
+
 	return v.validateCreateUpdate(ctx, tc)
+}
+
+// validateEnvironmentLabelImmutability enforces that an env-label change
+// on update carries the AnnotationMigrationOperation annotation set to
+// "true". Direct kubectl edits of the label are rejected. Additions and
+// removals count as changes. A no-op update (label unchanged) passes
+// through. See ADR-009 Phased Migration for the operator model.
+func validateEnvironmentLabelImmutability(oldTC, newTC *butlerv1alpha1.TenantCluster) field.ErrorList {
+	var errs field.ErrorList
+	oldEnv := ""
+	if oldTC.Labels != nil {
+		oldEnv = oldTC.Labels[butlerv1alpha1.LabelEnvironment]
+	}
+	newEnv := ""
+	if newTC.Labels != nil {
+		newEnv = newTC.Labels[butlerv1alpha1.LabelEnvironment]
+	}
+	if oldEnv == newEnv {
+		return errs
+	}
+	migration := ""
+	if newTC.Annotations != nil {
+		migration = newTC.Annotations[butlerv1alpha1.AnnotationMigrationOperation]
+	}
+	if migration != "true" {
+		errs = append(errs, field.Forbidden(
+			field.NewPath("metadata", "labels").Key(butlerv1alpha1.LabelEnvironment),
+			fmt.Sprintf(
+				"env label changes require the %q annotation set to \"true\"; use `butleradm env migrate`",
+				butlerv1alpha1.AnnotationMigrationOperation,
+			),
+		))
+	}
+	return errs
 }
 
 // ValidateDelete validates a TenantCluster on deletion.

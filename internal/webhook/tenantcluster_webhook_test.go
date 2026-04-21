@@ -223,3 +223,73 @@ func TestTCWebhook_MaxClustersPerMember_UnderCap_Allowed(t *testing.T) {
 		t.Fatalf("expected allowed, got error: %v", err)
 	}
 }
+
+// --- Environment label immutability on update ---
+
+// withMigrationAnnotation returns a shallow copy of tc with the
+// migration-operation annotation set to "true".
+func withMigrationAnnotation(tc *butlerv1alpha1.TenantCluster) *butlerv1alpha1.TenantCluster {
+	out := tc.DeepCopy()
+	if out.Annotations == nil {
+		out.Annotations = map[string]string{}
+	}
+	out.Annotations[butlerv1alpha1.AnnotationMigrationOperation] = "true"
+	return out
+}
+
+func TestEnvLabelImmutability_Unchanged_Allowed(t *testing.T) {
+	old := buildTC("tc", "team-acme", "prod", "", 3)
+	new := buildTC("tc", "team-acme", "prod", "", 5) // replicas differ; env label does not
+	errs := validateEnvironmentLabelImmutability(old, new)
+	if len(errs) != 0 {
+		t.Fatalf("expected no errors, got: %v", errs.ToAggregate())
+	}
+}
+
+func TestEnvLabelImmutability_Changed_NoAnnotation_Denied(t *testing.T) {
+	old := buildTC("tc", "team-acme", "prod", "", 3)
+	new := buildTC("tc", "team-acme", "dev", "", 3)
+	errs := validateEnvironmentLabelImmutability(old, new)
+	if len(errs) == 0 {
+		t.Fatal("expected denial for env label change without migration annotation")
+	}
+	if !strings.Contains(errs.ToAggregate().Error(), "migration-operation") {
+		t.Fatalf("expected message to cite migration-operation annotation, got: %v", errs.ToAggregate())
+	}
+}
+
+func TestEnvLabelImmutability_Changed_WithAnnotation_Allowed(t *testing.T) {
+	old := buildTC("tc", "team-acme", "prod", "", 3)
+	new := withMigrationAnnotation(buildTC("tc", "team-acme", "dev", "", 3))
+	errs := validateEnvironmentLabelImmutability(old, new)
+	if len(errs) != 0 {
+		t.Fatalf("expected allowed with migration annotation, got: %v", errs.ToAggregate())
+	}
+}
+
+func TestEnvLabelImmutability_Removed_NoAnnotation_Denied(t *testing.T) {
+	old := buildTC("tc", "team-acme", "prod", "", 3)
+	new := buildTC("tc", "team-acme", "", "", 3)
+	errs := validateEnvironmentLabelImmutability(old, new)
+	if len(errs) == 0 {
+		t.Fatal("expected denial for env label removal without migration annotation")
+	}
+}
+
+func TestEnvLabelImmutability_Added_NoAnnotation_Denied(t *testing.T) {
+	old := buildTC("tc", "team-acme", "", "", 3)
+	new := buildTC("tc", "team-acme", "prod", "", 3)
+	errs := validateEnvironmentLabelImmutability(old, new)
+	if len(errs) == 0 {
+		t.Fatal("expected denial for env label addition without migration annotation")
+	}
+}
+
+func TestEnvLabelImmutability_Added_WithAnnotation_Allowed(t *testing.T) {
+	old := buildTC("tc", "team-acme", "", "", 3)
+	new := withMigrationAnnotation(buildTC("tc", "team-acme", "prod", "", 3))
+	errs := validateEnvironmentLabelImmutability(old, new)
+	if len(errs) != 0 {
+		t.Fatalf("expected allowed migration-path add, got: %v", errs.ToAggregate())
+	}
+}
