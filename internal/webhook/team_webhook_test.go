@@ -14,6 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// SAR fallback path coverage limitation: the isPlatformAdmin helper
+// falls back to a SubjectAccessReview when no User CRD matches the
+// caller. The SAR path is exercised only on live clusters where the
+// controller's ServiceAccount carries create on
+// subjectaccessreviews.authorization.k8s.io (granted by the
+// butler-controller chart as of
+// butler-charts/feat/butler-controller-sar-permission). The fake
+// client in controller-runtime cannot emulate the apiserver's
+// synchronous SAR handling: SARs are write-only resources that the
+// apiserver answers in-line without persistence, while the fake
+// client tries to store them and rejects empty metadata.name. Tests
+// in this file therefore cover the User CRD primary path only. The
+// SAR fallback must be validated via envtest or a real cluster.
 package webhook
 
 import (
