@@ -322,11 +322,247 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 		}
 	}
 
+	// Environment label enforcement and per-env quota checks.
+	if tc.Spec.TeamRef != nil {
+		envErrs, err := v.validateEnvironment(ctx, tc)
+		if err != nil {
+			return nil, err
+		}
+		allErrs = append(allErrs, envErrs...)
+	}
+
 	if len(allErrs) > 0 {
 		return nil, allErrs.ToAggregate()
 	}
 
 	return nil, nil
+}
+
+// validateEnvironment applies the environment-label, per-env quota, and
+// MaxClustersPerMember rules. Called only when tc.Spec.TeamRef is set.
+func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (field.ErrorList, error) {
+	var allErrs field.ErrorList
+
+	team := &butlerv1alpha1.Team{}
+	if err := v.Client.Get(ctx, types.NamespacedName{Name: tc.Spec.TeamRef.Name}, team); err != nil {
+		if apierrors.IsNotFound(err) {
+			return allErrs, nil
+		}
+		return nil, fmt.Errorf("fetch team %q: %w", tc.Spec.TeamRef.Name, err)
+	}
+
+	// Phase 1: team has no environments; label absence is allowed.
+	if len(team.Spec.Environments) == 0 {
+		return allErrs, nil
+	}
+
+	envLabel := ""
+	if tc.Labels != nil {
+		envLabel = tc.Labels[butlerv1alpha1.LabelEnvironment]
+	}
+
+	// Phase 2: team has environments; label is required and must match.
+	if envLabel == "" {
+		allErrs = append(allErrs, field.Required(
+			field.NewPath("metadata", "labels").Key(butlerv1alpha1.LabelEnvironment),
+			fmt.Sprintf("team %q defines environments; TenantClusters must carry this label set to one of the team's env names", team.Name),
+		))
+		return allErrs, nil
+	}
+
+	var targetEnv *butlerv1alpha1.EnvironmentSpec
+	for i := range team.Spec.Environments {
+		if team.Spec.Environments[i].Name == envLabel {
+			targetEnv = &team.Spec.Environments[i]
+			break
+		}
+	}
+	if targetEnv == nil {
+		names := make([]string, 0, len(team.Spec.Environments))
+		for i := range team.Spec.Environments {
+			names = append(names, team.Spec.Environments[i].Name)
+		}
+		allErrs = append(allErrs, field.NotSupported(
+			field.NewPath("metadata", "labels").Key(butlerv1alpha1.LabelEnvironment),
+			envLabel,
+			names,
+		))
+		return allErrs, nil
+	}
+
+	if targetEnv.Limits == nil {
+		return allErrs, nil
+	}
+
+	// List all TenantClusters in the team namespace so we can project them
+	// by environment for per-env quota accounting.
+	var tcList butlerv1alpha1.TenantClusterList
+	if err := v.Client.List(ctx, &tcList, client.InNamespace(tc.Namespace)); err != nil {
+		return nil, fmt.Errorf("list tenant clusters in %q: %w", tc.Namespace, err)
+	}
+
+	// Partition existing clusters into same-env (count and resource sums)
+	// and everything else (ignored for env-scoped checks). Exclude self on
+	// update to keep the accounting consistent with the existing team-level
+	// check above.
+	var sameEnvReplicas int32
+	sameEnvCount := int32(0)
+	sameEnvCPU := resource.NewQuantity(0, resource.DecimalSI)
+	sameEnvMemory := resource.NewQuantity(0, resource.BinarySI)
+	sameEnvStorage := resource.NewQuantity(0, resource.BinarySI)
+	for i := range tcList.Items {
+		other := &tcList.Items[i]
+		if other.Name == tc.Name {
+			continue
+		}
+		if other.Labels == nil || other.Labels[butlerv1alpha1.LabelEnvironment] != envLabel {
+			continue
+		}
+		sameEnvCount++
+		sameEnvReplicas += other.Spec.Workers.Replicas
+		otherCPU := resource.NewQuantity(
+			int64(other.Spec.Workers.MachineTemplate.CPU)*int64(other.Spec.Workers.Replicas),
+			resource.DecimalSI,
+		)
+		sameEnvCPU.Add(*otherCPU)
+		for j := int32(0); j < other.Spec.Workers.Replicas; j++ {
+			sameEnvMemory.Add(other.Spec.Workers.MachineTemplate.Memory)
+			sameEnvStorage.Add(other.Spec.Workers.MachineTemplate.DiskSize)
+		}
+	}
+
+	mt := tc.Spec.Workers.MachineTemplate
+	replicas := tc.Spec.Workers.Replicas
+	lim := targetEnv.Limits
+
+	if lim.MaxClusters != nil && sameEnvCount+1 > *lim.MaxClusters {
+		allErrs = append(allErrs, field.Forbidden(
+			field.NewPath("spec"),
+			fmt.Sprintf(
+				"environment %q in team %q already has %d cluster(s); env quota limits to %d",
+				envLabel, team.Name, sameEnvCount, *lim.MaxClusters,
+			),
+		))
+	}
+
+	if lim.MaxTotalNodes != nil {
+		if sameEnvReplicas+replicas > *lim.MaxTotalNodes {
+			allErrs = append(allErrs, field.Forbidden(
+				field.NewPath("spec", "workers", "replicas"),
+				fmt.Sprintf(
+					"total worker nodes (%d) in environment %q would exceed env node quota (%d)",
+					sameEnvReplicas+replicas, envLabel, *lim.MaxTotalNodes,
+				),
+			))
+		}
+	}
+
+	if lim.MaxNodesPerCluster != nil && replicas > *lim.MaxNodesPerCluster {
+		allErrs = append(allErrs, field.Forbidden(
+			field.NewPath("spec", "workers", "replicas"),
+			fmt.Sprintf(
+				"worker replicas (%d) exceeds environment %q per-cluster node limit (%d)",
+				replicas, envLabel, *lim.MaxNodesPerCluster,
+			),
+		))
+	}
+
+	if lim.MaxCPUCores != nil && !lim.MaxCPUCores.IsZero() {
+		requestedCPU := resource.NewQuantity(int64(mt.CPU)*int64(replicas), resource.DecimalSI)
+		totalCPU := sameEnvCPU.DeepCopy()
+		totalCPU.Add(*requestedCPU)
+		if totalCPU.Cmp(*lim.MaxCPUCores) > 0 {
+			allErrs = append(allErrs, field.Forbidden(
+				field.NewPath("spec", "workers"),
+				fmt.Sprintf(
+					"total CPU (%s) in environment %q would exceed env CPU quota (%s)",
+					totalCPU.String(), envLabel, lim.MaxCPUCores.String(),
+				),
+			))
+		}
+	}
+
+	if lim.MaxMemory != nil && !lim.MaxMemory.IsZero() {
+		requestedMemory := resource.NewQuantity(0, resource.BinarySI)
+		for i := int32(0); i < replicas; i++ {
+			requestedMemory.Add(mt.Memory)
+		}
+		totalMemory := sameEnvMemory.DeepCopy()
+		totalMemory.Add(*requestedMemory)
+		if totalMemory.Cmp(*lim.MaxMemory) > 0 {
+			allErrs = append(allErrs, field.Forbidden(
+				field.NewPath("spec", "workers"),
+				fmt.Sprintf(
+					"total memory (%s) in environment %q would exceed env memory quota (%s)",
+					totalMemory.String(), envLabel, lim.MaxMemory.String(),
+				),
+			))
+		}
+	}
+
+	if lim.MaxStorage != nil && !lim.MaxStorage.IsZero() {
+		requestedStorage := resource.NewQuantity(0, resource.BinarySI)
+		for i := int32(0); i < replicas; i++ {
+			requestedStorage.Add(mt.DiskSize)
+		}
+		totalStorage := sameEnvStorage.DeepCopy()
+		totalStorage.Add(*requestedStorage)
+		if totalStorage.Cmp(*lim.MaxStorage) > 0 {
+			allErrs = append(allErrs, field.Forbidden(
+				field.NewPath("spec", "workers"),
+				fmt.Sprintf(
+					"total storage (%s) in environment %q would exceed env storage quota (%s)",
+					totalStorage.String(), envLabel, lim.MaxStorage.String(),
+				),
+			))
+		}
+	}
+
+	// MaxClustersPerMember enforcement. The creator's email is carried on
+	// the incoming TenantCluster via the AnnotationCreatorEmail annotation
+	// set by butler-server on API-path creates. kubectl-direct creates
+	// without the annotation are rejected when the env sets this cap,
+	// preserving accounting integrity.
+	if lim.MaxClustersPerMember != nil && *lim.MaxClustersPerMember > 0 {
+		creator := ""
+		if tc.Annotations != nil {
+			creator = tc.Annotations[butlerv1alpha1.AnnotationCreatorEmail]
+		}
+		if creator == "" {
+			allErrs = append(allErrs, field.Required(
+				field.NewPath("metadata", "annotations").Key(butlerv1alpha1.AnnotationCreatorEmail),
+				fmt.Sprintf(
+					"environment %q sets maxClustersPerMember; TenantClusters must carry the %s annotation (set automatically by butler-server; kubectl-direct creates must supply it explicitly)",
+					envLabel, butlerv1alpha1.AnnotationCreatorEmail,
+				),
+			))
+		} else {
+			ownedByCreator := int32(0)
+			for i := range tcList.Items {
+				other := &tcList.Items[i]
+				if other.Name == tc.Name {
+					continue
+				}
+				if other.Labels == nil || other.Labels[butlerv1alpha1.LabelEnvironment] != envLabel {
+					continue
+				}
+				if other.Labels[butlerv1alpha1.LabelOwner] == creator {
+					ownedByCreator++
+				}
+			}
+			if ownedByCreator+1 > *lim.MaxClustersPerMember {
+				allErrs = append(allErrs, field.Forbidden(
+					field.NewPath("metadata", "annotations").Key(butlerv1alpha1.AnnotationCreatorEmail),
+					fmt.Sprintf(
+						"user %q already owns %d cluster(s) in environment %q; env limits to %d per member",
+						creator, ownedByCreator, envLabel, *lim.MaxClustersPerMember,
+					),
+				))
+			}
+		}
+	}
+
+	return allErrs, nil
 }
 
 // SetupWebhookWithManager registers the TenantCluster validating webhook with the manager.

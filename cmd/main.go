@@ -238,6 +238,10 @@ func main() {
 			setupLog.Error(err, "unable to create webhook", "webhook", "TenantCluster")
 			os.Exit(1)
 		}
+		if err = (&webhook.TeamValidator{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "Team")
+			os.Exit(1)
+		}
 		if err = (&webhook.NetworkPoolValidator{}).SetupWebhookWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "NetworkPool")
 			os.Exit(1)
