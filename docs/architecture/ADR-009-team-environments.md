@@ -130,7 +130,12 @@ Two new admission-webhook gates on `Team` updates:
 - `spec.resourceLimits` edits require platform admin. Team admins cannot raise their own ceiling.
 - `spec.environments[].limits` edits require team admin on the Team being edited (or platform admin).
 
-Platform-admin detection: the webhook reads `AdmissionRequest.UserInfo.Username` (email), looks up the corresponding `User` CRD, and reads `spec.isPlatformAdmin`. Fallback for kubectl-direct callers without a matching User CRD: `SubjectAccessReview` against ClusterRole `butler-cli-platform-admin`.
+Platform-admin detection runs two paths:
+
+1. **Primary (User CRD)**: the webhook reads `AdmissionRequest.UserInfo.Username` (email), lists `User` CRDs, and when one matches by `spec.email` the caller's `spec.isPlatformAdmin` value is authoritative. This handles callers mapped to a Butler User.
+2. **Fallback (SubjectAccessReview)**: when no User CRD matches the caller (kubectl-direct operators holding the admin kubeconfig, automation service accounts not onboarded as Butler Users), the webhook submits a `SubjectAccessReview` for `verb=* group=butler.butlerlabs.dev resource=teams`. Only subjects bound to the `butler-cli-platform-admin` ClusterRole receive `allowed=true`.
+
+The SAR path requires the butler-controller ServiceAccount to carry `create` on `subjectaccessreviews.authorization.k8s.io`. The butler-charts PR on branch `feat/butler-controller-sar-permission` adds that grant to the butler-controller chart; without it, the SAR request errors with a 500 and callers without a User CRD cannot pass the platform-admin check. The chart PR must land alongside this ADR.
 
 Team-admin detection: read the Team's own `spec.access.users[].role` and `spec.access.groups[].role` for `admin` matching the requesting user (by email or by group membership).
 
