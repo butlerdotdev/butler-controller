@@ -147,7 +147,23 @@ func validateEnvironmentLabelImmutability(oldTC, newTC *butlerv1alpha1.TenantClu
 func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc, oldTC *butlerv1alpha1.TenantCluster, userInfo authnv1.UserInfo) (admission.Warnings, error) {
 	var allErrs field.ErrorList
 
+	// Environment label and per-env checks are independent of
+	// providerConfigRef; a TC without a provider config still belongs
+	// to a team and a team may define environments. Run env validation
+	// first so the env-label-required and creator-email identity gates
+	// fire regardless of whether the provider-access path runs.
+	if tc.Spec.TeamRef != nil {
+		envErrs, err := v.validateEnvironment(ctx, tc, oldTC, userInfo)
+		if err != nil {
+			return nil, err
+		}
+		allErrs = append(allErrs, envErrs...)
+	}
+
 	if tc.Spec.ProviderConfigRef == nil {
+		if len(allErrs) > 0 {
+			return nil, allErrs.ToAggregate()
+		}
 		return nil, nil
 	}
 
@@ -399,15 +415,6 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc, o
 		}
 	}
 
-	// Environment label enforcement and per-env quota checks.
-	if tc.Spec.TeamRef != nil {
-		envErrs, err := v.validateEnvironment(ctx, tc, oldTC, userInfo)
-		if err != nil {
-			return nil, err
-		}
-		allErrs = append(allErrs, envErrs...)
-	}
-
 	if len(allErrs) > 0 {
 		return nil, allErrs.ToAggregate()
 	}
@@ -535,15 +542,23 @@ func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc, ol
 
 	// MaxClustersPerMember enforcement. The creator's email is carried on
 	// the incoming TenantCluster via the AnnotationCreatorEmail annotation
-	// set by butler-server on API-path creates. The annotation must match
-	// the requesting identity; without the match, kubectl-direct callers
-	// could spoof another user's cap by claiming a different email.
+	// set by butler-server on API-path creates. On CREATE the annotation
+	// must match the requesting identity; on UPDATE the annotation was
+	// already vetted at create time and must stay unchanged (covered by
+	// immutability below), so re-running the identity match on every
+	// update would also block finalizer removals by callers other than
+	// the original creator. Identity match is create-only.
 	if lim.MaxClustersPerMember != nil && *lim.MaxClustersPerMember > 0 {
 		creator := ""
 		if tc.Annotations != nil {
 			creator = tc.Annotations[butlerv1alpha1.AnnotationCreatorEmail]
 		}
-		if creator == "" {
+		isCreate := oldTC == nil
+		oldCreator := ""
+		if !isCreate && oldTC.Annotations != nil {
+			oldCreator = oldTC.Annotations[butlerv1alpha1.AnnotationCreatorEmail]
+		}
+		if creator == "" && isCreate {
 			allErrs = append(allErrs, field.Required(
 				field.NewPath("metadata", "annotations").Key(butlerv1alpha1.AnnotationCreatorEmail),
 				fmt.Sprintf(
@@ -551,13 +566,21 @@ func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc, ol
 					envLabel, butlerv1alpha1.AnnotationCreatorEmail,
 				),
 			))
-		} else if !strings.EqualFold(creator, userInfo.Username) {
+		} else if isCreate && !strings.EqualFold(creator, userInfo.Username) {
 			allErrs = append(allErrs, field.Invalid(
 				field.NewPath("metadata", "annotations").Key(butlerv1alpha1.AnnotationCreatorEmail),
 				creator,
 				fmt.Sprintf(
 					"%s must match the requesting identity %q; environment %q enforces per-member caps and cannot accept an annotation claiming a different user",
 					butlerv1alpha1.AnnotationCreatorEmail, userInfo.Username, envLabel,
+				),
+			))
+		} else if !isCreate && creator != oldCreator {
+			allErrs = append(allErrs, field.Forbidden(
+				field.NewPath("metadata", "annotations").Key(butlerv1alpha1.AnnotationCreatorEmail),
+				fmt.Sprintf(
+					"%s is immutable; cannot change from %q to %q",
+					butlerv1alpha1.AnnotationCreatorEmail, oldCreator, creator,
 				),
 			))
 		} else {
