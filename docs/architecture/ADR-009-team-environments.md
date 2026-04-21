@@ -231,6 +231,8 @@ Three phases with explicit detection criteria.
 - Operator-visible behavior: after migration, env quota accounting reflects the backfilled clusters; previously unaccounted clusters now count against their target env's cap.
 - Detection of phase completion: `kubectl get tc -n team-<name> -l '!butler.butlerlabs.dev/environment'` returns empty.
 
+**Label immutability and the migration-operation annotation**. Once a TenantCluster carries the `butler.butlerlabs.dev/environment` label, the label is immutable under normal operation. The admission webhook rejects any update that changes the label value (addition, removal, or modification) unless the update carries the annotation `butler.butlerlabs.dev/migration-operation: "true"`. The annotation is the explicit signal that the update is a migration-tool operation; `butleradm env migrate` sets it on every cluster it touches during phase 3 backfill. Direct `kubectl edit` of the env label is rejected by design, so env quota accounting cannot drift silently. See `butler-controller/internal/webhook/tenantcluster_webhook.go` for the enforcement logic.
+
 ## Alternatives Considered
 
 ### Standalone Environment CRD
