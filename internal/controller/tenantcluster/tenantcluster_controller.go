@@ -140,6 +140,25 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return r.setFailedStatus(ctx, tc, "ConfigError", "Failed to get ButlerConfig: "+err.Error())
 	}
 
+	if err := r.promoteOwnerAnnotation(ctx, tc); err != nil {
+		logger.Error(err, "failed to promote owner annotation")
+		return ctrl.Result{}, err
+	}
+
+	// Resolve team/env ClusterDefaults for observability. v1 does not
+	// apply them to spec because the apiserver has already stamped
+	// kubebuilder defaults by the time reconciliation runs; see
+	// resolveTeamAndEnvDefaults for the full note. A future mutating
+	// webhook will apply them before the schema stamp.
+	if d := r.resolveTeamAndEnvDefaults(ctx, tc); d != nil {
+		logger.V(1).Info("resolved team/env defaults (declarative-only in v1)",
+			"team", tc.Spec.TeamRef.Name,
+			"env", tc.Labels[butlerv1alpha1.LabelEnvironment],
+			"kubernetesVersion", d.KubernetesVersion,
+			"defaultAddons", d.DefaultAddons,
+		)
+	}
+
 	if err := r.validateTenantCluster(ctx, tc, butlerConfig); err != nil {
 		logger.Error(err, "validation failed")
 		return r.setFailedStatus(ctx, tc, ReasonValidationFailed, err.Error())

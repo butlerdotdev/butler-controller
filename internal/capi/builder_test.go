@@ -486,6 +486,42 @@ func TestCommonLabels(t *testing.T) {
 	if labels[butlerv1alpha1.LabelTeam] != "team-alpha" {
 		t.Error("expected team label when teamRef is set")
 	}
+	if _, ok := labels[butlerv1alpha1.LabelEnvironment]; ok {
+		t.Error("expected no env label when TC is unlabeled")
+	}
+}
+
+func TestCommonLabelsAndAnnotations_EnvAndOwnerPropagated(t *testing.T) {
+	tc := newTestTenantCluster("sandbox-cluster", "team-alpha")
+	tc.Spec.TeamRef = &butlerv1alpha1.LocalObjectReference{Name: "team-alpha"}
+	tc.Labels = map[string]string{
+		butlerv1alpha1.LabelEnvironment: "dev",
+	}
+	tc.Annotations = map[string]string{
+		butlerv1alpha1.AnnotationOwner: "alice@example.com",
+	}
+	pc := newTestProviderConfig("harvester")
+
+	b := NewBuilder(tc, pc, "ns")
+
+	labels := b.commonLabels()
+	if labels[butlerv1alpha1.LabelEnvironment] != "dev" {
+		t.Errorf("expected env label dev, got %q", labels[butlerv1alpha1.LabelEnvironment])
+	}
+
+	ann := b.commonAnnotations()
+	if ann[butlerv1alpha1.AnnotationOwner] != "alice@example.com" {
+		t.Errorf("expected owner annotation alice@example.com, got %q", ann[butlerv1alpha1.AnnotationOwner])
+	}
+
+	cluster := &unstructured.Unstructured{}
+	b.applyCommonMetadata(cluster)
+	if cluster.GetLabels()[butlerv1alpha1.LabelEnvironment] != "dev" {
+		t.Error("expected env label propagated to resource")
+	}
+	if cluster.GetAnnotations()[butlerv1alpha1.AnnotationOwner] != "alice@example.com" {
+		t.Error("expected owner annotation propagated to resource")
+	}
 }
 
 func TestResolveControlPlaneResources_NoConfig(t *testing.T) {

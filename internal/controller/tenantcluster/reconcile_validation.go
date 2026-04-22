@@ -6,6 +6,7 @@ package tenantcluster
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -15,6 +16,21 @@ import (
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
 )
+
+// ownerIdentity returns the authoritative owner email for a
+// TenantCluster. AnnotationOwner (set by the controller) is preferred;
+// AnnotationCreatorEmail (set by butler-server) is a fallback that
+// closes the race between webhook admission and controller reconcile
+// when sibling counts would otherwise miss a just-created cluster.
+func ownerIdentity(tc *butlerv1alpha1.TenantCluster) string {
+	if tc.Annotations == nil {
+		return ""
+	}
+	if v := tc.Annotations[butlerv1alpha1.AnnotationOwner]; v != "" {
+		return v
+	}
+	return tc.Annotations[butlerv1alpha1.AnnotationCreatorEmail]
+}
 
 func (r *Reconciler) validateTenantCluster(ctx context.Context, tc *butlerv1alpha1.TenantCluster, config *butlerv1alpha1.ButlerConfig) error {
 	logger := log.FromContext(ctx)
@@ -183,7 +199,7 @@ func (r *Reconciler) validateProviderLimits(ctx context.Context, tc *butlerv1alp
 			if existingCount >= maxClusters {
 				msg := fmt.Sprintf("team namespace %q has %d cluster(s), provider %q limits to %d",
 					tc.Namespace, existingCount, pc.Name, maxClusters)
-				r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+				r.setCondition(tc, butlerv1alpha1.TenantClusterConditionQuotaSatisfied,
 					metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
 				return fmt.Errorf("quota exceeded: %s", msg)
 			}
@@ -206,7 +222,7 @@ func (r *Reconciler) validateProviderLimits(ctx context.Context, tc *butlerv1alp
 			if totalNodes > maxNodes {
 				msg := fmt.Sprintf("total worker replicas (%d) exceeds provider %q per-team limit (%d)",
 					totalNodes, pc.Name, maxNodes)
-				r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+				r.setCondition(tc, butlerv1alpha1.TenantClusterConditionQuotaSatisfied,
 					metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
 				return fmt.Errorf("quota exceeded: %s", msg)
 			}
@@ -214,7 +230,16 @@ func (r *Reconciler) validateProviderLimits(ctx context.Context, tc *butlerv1alp
 	}
 
 	// Check team-level resource quotas (defense-in-depth when webhooks are disabled)
-	return r.validateTeamQuotas(ctx, tc)
+	if err := r.validateTeamQuotas(ctx, tc); err != nil {
+		return err
+	}
+
+	// All quota paths passed: record a positive condition so operators
+	// can observe the current quota state. A lingering False from a
+	// prior reconcile would otherwise persist until overwritten.
+	r.setCondition(tc, butlerv1alpha1.TenantClusterConditionQuotaSatisfied,
+		metav1.ConditionTrue, butlerv1alpha1.ReasonReady, "within all quotas")
+	return nil
 }
 
 // validateTeamQuotas checks Team.spec.resourceLimits for maxClusters, maxTotalNodes,
@@ -242,7 +267,7 @@ func (r *Reconciler) validateTeamQuotas(ctx context.Context, tc *butlerv1alpha1.
 		if tc.Spec.Workers.Replicas > *limits.MaxNodesPerCluster {
 			msg := fmt.Sprintf("worker replicas (%d) exceeds team %q per-cluster node limit (%d)",
 				tc.Spec.Workers.Replicas, team.Name, *limits.MaxNodesPerCluster)
-			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionQuotaSatisfied,
 				metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
 			return fmt.Errorf("quota exceeded: %s", msg)
 		}
@@ -264,7 +289,7 @@ func (r *Reconciler) validateTeamQuotas(ctx context.Context, tc *butlerv1alpha1.
 		if existingCount+1 > *limits.MaxClusters {
 			msg := fmt.Sprintf("team %q has %d cluster(s), team quota limits to %d",
 				team.Name, existingCount, *limits.MaxClusters)
-			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionQuotaSatisfied,
 				metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
 			return fmt.Errorf("quota exceeded: %s", msg)
 		}
@@ -281,9 +306,83 @@ func (r *Reconciler) validateTeamQuotas(ctx context.Context, tc *butlerv1alpha1.
 		if totalNodes > *limits.MaxTotalNodes {
 			msg := fmt.Sprintf("total worker nodes (%d) would exceed team %q node quota (%d)",
 				totalNodes, team.Name, *limits.MaxTotalNodes)
-			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionProviderAccessGranted,
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionQuotaSatisfied,
 				metav1.ConditionFalse, butlerv1alpha1.ReasonQuotaExceeded, msg)
 			return fmt.Errorf("quota exceeded: %s", msg)
+		}
+	}
+
+	return r.validateEnvironmentQuotas(ctx, tc, team, tcList.Items)
+}
+
+// validateEnvironmentQuotas applies env-scoped defense-in-depth checks
+// when the TenantCluster carries a butler.butlerlabs.dev/environment
+// label that matches a Team.spec.environments[] entry. Two gates per
+// ADR-009 v1 scope: env MaxClusters and per-member MaxClustersPerMember.
+// MaxTotalNodes is part of the embedded TeamResourceLimits shape but is
+// not enforced at env scope in v1. Team-total is enforced by the caller.
+func (r *Reconciler) validateEnvironmentQuotas(ctx context.Context, tc *butlerv1alpha1.TenantCluster, team *butlerv1alpha1.Team, siblings []butlerv1alpha1.TenantCluster) error {
+	if len(team.Spec.Environments) == 0 {
+		return nil
+	}
+
+	envName := tc.Labels[butlerv1alpha1.LabelEnvironment]
+	if envName == "" {
+		return nil
+	}
+
+	var env *butlerv1alpha1.EnvironmentSpec
+	for i := range team.Spec.Environments {
+		if team.Spec.Environments[i].Name == envName {
+			env = &team.Spec.Environments[i]
+			break
+		}
+	}
+	if env == nil || env.Limits == nil {
+		return nil
+	}
+
+	logger := log.FromContext(ctx)
+
+	var envSiblings []butlerv1alpha1.TenantCluster
+	for i := range siblings {
+		if siblings[i].Name == tc.Name {
+			continue
+		}
+		if siblings[i].Labels[butlerv1alpha1.LabelEnvironment] == envName {
+			envSiblings = append(envSiblings, siblings[i])
+		}
+	}
+
+	if env.Limits.MaxClusters != nil && *env.Limits.MaxClusters > 0 {
+		if int32(len(envSiblings))+1 > *env.Limits.MaxClusters {
+			msg := fmt.Sprintf("environment %q has %d cluster(s), env quota limits to %d",
+				envName, len(envSiblings), *env.Limits.MaxClusters)
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionQuotaSatisfied,
+				metav1.ConditionFalse, butlerv1alpha1.ReasonEnvQuotaExceeded, msg)
+			return fmt.Errorf("env quota exceeded: %s", msg)
+		}
+	}
+
+	if env.Limits.MaxClustersPerMember != nil && *env.Limits.MaxClustersPerMember > 0 {
+		owner := ownerIdentity(tc)
+		if owner == "" {
+			logger.V(1).Info("per-member cap set but TenantCluster has no owner annotation; skipping cap enforcement",
+				"env", envName, "tc", tc.Name)
+			return nil
+		}
+		var ownerCount int32
+		for i := range envSiblings {
+			if strings.EqualFold(ownerIdentity(&envSiblings[i]), owner) {
+				ownerCount++
+			}
+		}
+		if ownerCount+1 > *env.Limits.MaxClustersPerMember {
+			msg := fmt.Sprintf("member %q owns %d cluster(s) in environment %q, per-member cap is %d",
+				owner, ownerCount, envName, *env.Limits.MaxClustersPerMember)
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionQuotaSatisfied,
+				metav1.ConditionFalse, butlerv1alpha1.ReasonPerMemberCapExceeded, msg)
+			return fmt.Errorf("per-member cap exceeded: %s", msg)
 		}
 	}
 

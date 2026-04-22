@@ -18,15 +18,20 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"strings"
 
+	admissionv1 "k8s.io/api/admission/v1"
+	authnv1 "k8s.io/api/authentication/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
@@ -35,42 +40,150 @@ import (
 const defaultProviderConfigNamespace = "butler-system"
 
 // TenantClusterValidator validates TenantCluster resources on admission.
+//
+// Client is the cached, manager-backed client used for high-volume reads
+// (TenantCluster list for sibling counts); staleness up to 1s is
+// tolerable because webhook decisions only need approximate counts.
+//
+// APIReader is an uncached reader used for reads whose staleness would
+// flip an admission decision: Team spec (env list, limits, access).
+// controller-runtime's cached client can lag apiserver writes by a
+// reconcile tick, which is enough to miss a just-applied env rename or
+// access-block edit. The Team admission webhook for "resourceLimits
+// changed, needs platform admin" wants the current answer, not a 1s-
+// old one.
 type TenantClusterValidator struct {
-	Client client.Client
+	Client    client.Client
+	APIReader client.Reader
 }
 
 // +kubebuilder:webhook:path=/validate-butler-butlerlabs-dev-v1alpha1-tenantcluster,mutating=false,failurePolicy=fail,sideEffects=None,groups=butler.butlerlabs.dev,resources=tenantclusters,verbs=create;update,versions=v1alpha1,name=vtenantcluster.kb.io,admissionReviewVersions=v1
 
-// ValidateCreate validates a TenantCluster on creation.
-func (v *TenantClusterValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	tc, ok := obj.(*butlerv1alpha1.TenantCluster)
-	if !ok {
-		return nil, fmt.Errorf("expected TenantCluster, got %T", obj)
+// Handle implements admission.Handler. Dispatches to handleCreate or
+// handleUpdate based on the operation. Uses the raw admission.Handler
+// pattern (not CustomValidator) so the handler can read UserInfo from
+// the admission request. UserInfo is required to validate that the
+// creator-email annotation matches the requesting identity; this is
+// the only defense against a kubectl-direct caller spoofing another
+// user's MaxClustersPerMember cap by claiming a different email.
+func (v *TenantClusterValidator) Handle(ctx context.Context, req admission.Request) admission.Response {
+	log.FromContext(ctx).Info("admission request received",
+		"op", string(req.Operation),
+		"namespace", req.Namespace,
+		"name", req.Name,
+		"userInfoUsername", req.UserInfo.Username,
+		"userInfoGroups", req.UserInfo.Groups,
+	)
+	switch req.Operation {
+	case admissionv1.Create:
+		return v.handleCreate(ctx, req)
+	case admissionv1.Update:
+		return v.handleUpdate(ctx, req)
+	default:
+		return admission.Allowed("")
 	}
-
-	return v.validateCreateUpdate(ctx, tc)
 }
 
-// ValidateUpdate validates a TenantCluster on update.
-func (v *TenantClusterValidator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
-	tc, ok := newObj.(*butlerv1alpha1.TenantCluster)
-	if !ok {
-		return nil, fmt.Errorf("expected TenantCluster, got %T", newObj)
+func (v *TenantClusterValidator) handleCreate(ctx context.Context, req admission.Request) admission.Response {
+	tc := &butlerv1alpha1.TenantCluster{}
+	if err := json.Unmarshal(req.Object.Raw, tc); err != nil {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode TenantCluster: %w", err))
 	}
-
-	return v.validateCreateUpdate(ctx, tc)
+	if _, err := v.validateCreateUpdate(ctx, tc, nil, req.UserInfo); err != nil {
+		return admission.Denied(err.Error())
+	}
+	return admission.Allowed("")
 }
 
-// ValidateDelete validates a TenantCluster on deletion.
-func (v *TenantClusterValidator) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
-	return nil, nil
+func (v *TenantClusterValidator) handleUpdate(ctx context.Context, req admission.Request) admission.Response {
+	oldTC := &butlerv1alpha1.TenantCluster{}
+	if err := json.Unmarshal(req.OldObject.Raw, oldTC); err != nil {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode old TenantCluster: %w", err))
+	}
+	tc := &butlerv1alpha1.TenantCluster{}
+	if err := json.Unmarshal(req.Object.Raw, tc); err != nil {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode new TenantCluster: %w", err))
+	}
+	if errs := validateEnvironmentLabelImmutability(oldTC, tc); len(errs) > 0 {
+		return admission.Denied(errs.ToAggregate().Error())
+	}
+	if _, err := v.validateCreateUpdate(ctx, tc, oldTC, req.UserInfo); err != nil {
+		return admission.Denied(err.Error())
+	}
+	return admission.Allowed("")
 }
 
-// validateCreateUpdate contains shared validation logic for create and update operations.
-func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (admission.Warnings, error) {
+// validateEnvironmentLabelImmutability enforces that an env-label change
+// on update carries the AnnotationMigrationOperation annotation set to
+// "true". Direct kubectl edits of the label are rejected. Additions and
+// removals count as changes. A no-op update (label unchanged) passes
+// through. See ADR-009 Phased Migration for the operator model.
+func validateEnvironmentLabelImmutability(oldTC, newTC *butlerv1alpha1.TenantCluster) field.ErrorList {
+	var errs field.ErrorList
+	oldEnv := ""
+	if oldTC.Labels != nil {
+		oldEnv = oldTC.Labels[butlerv1alpha1.LabelEnvironment]
+	}
+	newEnv := ""
+	if newTC.Labels != nil {
+		newEnv = newTC.Labels[butlerv1alpha1.LabelEnvironment]
+	}
+	if oldEnv == newEnv {
+		return errs
+	}
+	migration := ""
+	if newTC.Annotations != nil {
+		migration = newTC.Annotations[butlerv1alpha1.AnnotationMigrationOperation]
+	}
+	if migration != "true" {
+		errs = append(errs, field.Forbidden(
+			field.NewPath("metadata", "labels").Key(butlerv1alpha1.LabelEnvironment),
+			fmt.Sprintf(
+				"env label changes require the %q annotation set to \"true\"; use `butleradm env migrate`",
+				butlerv1alpha1.AnnotationMigrationOperation,
+			),
+		))
+	}
+	return errs
+}
+
+// validateCreateUpdate contains shared validation logic for create and
+// update operations. oldTC is nil on create and non-nil on update; the
+// update path carries it through so validateEnvironment can grandfather
+// pre-existing unlabeled TenantClusters whose team later defined
+// environments (ADR-009 phased migration, phase 2).
+func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc, oldTC *butlerv1alpha1.TenantCluster, userInfo authnv1.UserInfo) (admission.Warnings, error) {
 	var allErrs field.ErrorList
 
+	// Aggregate (count- and sum-based) quota gates are create-time
+	// guards that simulate adding this TC to the namespace total. On
+	// update the cluster already exists and the admitted count is
+	// stable; re-running the simulation treats the update as an extra
+	// addition and deadlocks routine operations (scale, annotate,
+	// deletionTimestamp propagation, finalizer removal) after a quota
+	// reduction. Per-cluster caps (MaxNodesPerCluster) remain on both
+	// paths because they gate THIS TC's own spec and are legitimate
+	// to re-check on scale. See ADR-009: "Cluster creation validates
+	// three gates in order."
+	isCreate := oldTC == nil
+
+	// Environment label and per-env checks are independent of
+	// providerConfigRef; a TC without a provider config still belongs
+	// to a team and a team may define environments. Run env validation
+	// first so the env-label-required and creator-email identity gates
+	// fire regardless of whether the provider-access path runs.
+	if tc.Spec.TeamRef != nil {
+		envErrs, err := v.validateEnvironment(ctx, tc, oldTC, userInfo)
+		if err != nil {
+			return nil, err
+		}
+		allErrs = append(allErrs, envErrs...)
+	}
+
 	if tc.Spec.ProviderConfigRef == nil {
+		if len(allErrs) > 0 {
+			return nil, allErrs.ToAggregate()
+		}
 		return nil, nil
 	}
 
@@ -116,8 +229,10 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 		}
 	}
 
-	// Enforce per-team cluster limit.
-	if pc.Spec.Limits != nil && pc.Spec.Limits.MaxClustersPerTeam != nil {
+	// Enforce per-team cluster limit. Create-only: on update the TC is
+	// already counted and re-simulation would deadlock operations when
+	// the cap is reduced below existing usage.
+	if isCreate && pc.Spec.Limits != nil && pc.Spec.Limits.MaxClustersPerTeam != nil {
 		maxClusters := *pc.Spec.Limits.MaxClustersPerTeam
 
 		var tcList butlerv1alpha1.TenantClusterList
@@ -144,8 +259,9 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 		}
 	}
 
-	// Enforce per-team node limit.
-	if pc.Spec.Limits != nil && pc.Spec.Limits.MaxNodesPerTeam != nil {
+	// Enforce per-team node limit. Create-only (aggregate, see comment
+	// on MaxClustersPerTeam above).
+	if isCreate && pc.Spec.Limits != nil && pc.Spec.Limits.MaxNodesPerTeam != nil {
 		maxNodes := *pc.Spec.Limits.MaxNodesPerTeam
 
 		var tcList butlerv1alpha1.TenantClusterList
@@ -175,7 +291,7 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 	// Enforce team-level CPU, Memory, and Storage quotas.
 	if tc.Spec.TeamRef != nil {
 		team := &butlerv1alpha1.Team{}
-		if err := v.Client.Get(ctx, types.NamespacedName{Name: tc.Spec.TeamRef.Name}, team); err == nil {
+		if err := v.APIReader.Get(ctx, types.NamespacedName{Name: tc.Spec.TeamRef.Name}, team); err == nil {
 			if limits := team.Spec.ResourceLimits; limits != nil {
 				// List existing clusters for resource accounting
 				var tcList butlerv1alpha1.TenantClusterList
@@ -183,8 +299,10 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 					mt := tc.Spec.Workers.MachineTemplate
 					replicas := tc.Spec.Workers.Replicas
 
-					// Cluster count check
-					if limits.MaxClusters != nil {
+					// Cluster count check (create-only; on update the TC is
+					// already counted and re-simulation deadlocks on quota
+					// reduction).
+					if isCreate && limits.MaxClusters != nil {
 						existingCount := int32(0)
 						for i := range tcList.Items {
 							if tcList.Items[i].Name != tc.Name {
@@ -203,8 +321,8 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 						}
 					}
 
-					// Total nodes check
-					if limits.MaxTotalNodes != nil {
+					// Total nodes check (create-only, aggregate)
+					if isCreate && limits.MaxTotalNodes != nil {
 						totalNodes := replicas
 						for i := range tcList.Items {
 							if tcList.Items[i].Name != tc.Name {
@@ -235,8 +353,8 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 						}
 					}
 
-					// CPU quota check
-					if limits.MaxCPUCores != nil && !limits.MaxCPUCores.IsZero() {
+					// CPU quota check (create-only, aggregate)
+					if isCreate && limits.MaxCPUCores != nil && !limits.MaxCPUCores.IsZero() {
 						requestedCPU := resource.NewQuantity(int64(mt.CPU)*int64(replicas), resource.DecimalSI)
 						currentCPU := resource.NewQuantity(0, resource.DecimalSI)
 						for i := range tcList.Items {
@@ -262,8 +380,8 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 						}
 					}
 
-					// Memory quota check
-					if limits.MaxMemory != nil && !limits.MaxMemory.IsZero() {
+					// Memory quota check (create-only, aggregate)
+					if isCreate && limits.MaxMemory != nil && !limits.MaxMemory.IsZero() {
 						requestedMemory := resource.NewQuantity(0, resource.BinarySI)
 						for i := int32(0); i < replicas; i++ {
 							requestedMemory.Add(mt.Memory)
@@ -290,8 +408,8 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 						}
 					}
 
-					// Storage quota check
-					if limits.MaxStorage != nil && !limits.MaxStorage.IsZero() {
+					// Storage quota check (create-only, aggregate)
+					if isCreate && limits.MaxStorage != nil && !limits.MaxStorage.IsZero() {
 						requestedStorage := resource.NewQuantity(0, resource.BinarySI)
 						for i := int32(0); i < replicas; i++ {
 							requestedStorage.Add(mt.DiskSize)
@@ -329,11 +447,220 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc *b
 	return nil, nil
 }
 
-// SetupWebhookWithManager registers the TenantCluster validating webhook with the manager.
+// validateEnvironment applies the environment-label, per-env quota, and
+// MaxClustersPerMember rules. Called only when tc.Spec.TeamRef is set.
+// userInfo is used to validate that the creator-email annotation (when
+// present and MaxClustersPerMember is engaged) matches the requesting
+// identity, preventing a kubectl-direct caller from claiming another
+// user's cap room. Email comparison is case-insensitive per common
+// MTA practice (RFC 5321 allows CS local-parts but discourages it).
+//
+// oldTC is nil on create and non-nil on update. On update, a pre-
+// existing TenantCluster that lacked the env label is grandfathered:
+// operators can continue to scale/update/patch without adding a label,
+// matching the ADR-009 phase-2 contract that existing unlabeled
+// clusters "continue to work" after the team gains environments.
+// Likewise, if the cluster's env label references an env that has
+// since been removed from the team spec, unchanged-label updates are
+// tolerated so the cluster can still be scaled or deleted. Migration
+// to a valid env requires the standard migration-operation annotation.
+func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc, oldTC *butlerv1alpha1.TenantCluster, userInfo authnv1.UserInfo) (field.ErrorList, error) {
+	var allErrs field.ErrorList
+
+	team := &butlerv1alpha1.Team{}
+	if err := v.APIReader.Get(ctx, types.NamespacedName{Name: tc.Spec.TeamRef.Name}, team); err != nil {
+		if apierrors.IsNotFound(err) {
+			return allErrs, nil
+		}
+		return nil, fmt.Errorf("fetch team %q: %w", tc.Spec.TeamRef.Name, err)
+	}
+
+	// Phase 1: team has no environments; label absence is allowed.
+	if len(team.Spec.Environments) == 0 {
+		return allErrs, nil
+	}
+
+	envLabel := ""
+	if tc.Labels != nil {
+		envLabel = tc.Labels[butlerv1alpha1.LabelEnvironment]
+	}
+
+	// Phase 2: team has environments; label is required on create and
+	// must match a team env. On update, a TenantCluster that was
+	// unlabeled before the team gained environments is grandfathered.
+	if envLabel == "" {
+		if oldTC != nil && (oldTC.Labels == nil || oldTC.Labels[butlerv1alpha1.LabelEnvironment] == "") {
+			return allErrs, nil
+		}
+		allErrs = append(allErrs, field.Required(
+			field.NewPath("metadata", "labels").Key(butlerv1alpha1.LabelEnvironment),
+			fmt.Sprintf("team %q defines environments; TenantClusters must carry this label set to one of the team's env names", team.Name),
+		))
+		return allErrs, nil
+	}
+
+	var targetEnv *butlerv1alpha1.EnvironmentSpec
+	for i := range team.Spec.Environments {
+		if team.Spec.Environments[i].Name == envLabel {
+			targetEnv = &team.Spec.Environments[i]
+			break
+		}
+	}
+	if targetEnv == nil {
+		// On update with unchanged env label, tolerate a dangling
+		// reference so operators can still scale or delete clusters
+		// whose env was removed from the team. A changed label is
+		// gated by the immutability check above plus the migration
+		// annotation, so this tolerance does not enable bypass.
+		if oldTC != nil && oldTC.Labels[butlerv1alpha1.LabelEnvironment] == envLabel {
+			return allErrs, nil
+		}
+		names := make([]string, 0, len(team.Spec.Environments))
+		for i := range team.Spec.Environments {
+			names = append(names, team.Spec.Environments[i].Name)
+		}
+		allErrs = append(allErrs, field.NotSupported(
+			field.NewPath("metadata", "labels").Key(butlerv1alpha1.LabelEnvironment),
+			envLabel,
+			names,
+		))
+		return allErrs, nil
+	}
+
+	if targetEnv.Limits == nil {
+		return allErrs, nil
+	}
+
+	// List all TenantClusters in the team namespace so we can project them
+	// by environment for per-env quota accounting.
+	var tcList butlerv1alpha1.TenantClusterList
+	if err := v.Client.List(ctx, &tcList, client.InNamespace(tc.Namespace)); err != nil {
+		return nil, fmt.Errorf("list tenant clusters in %q: %w", tc.Namespace, err)
+	}
+
+	// Count same-env siblings (exclude self on update). v1 env-level
+	// enforcement is cluster count plus per-member cap; CPU/memory/
+	// storage/node caps stay on Team.spec.resourceLimits.
+	sameEnvCount := int32(0)
+	for i := range tcList.Items {
+		other := &tcList.Items[i]
+		if other.Name == tc.Name {
+			continue
+		}
+		if other.Labels == nil || other.Labels[butlerv1alpha1.LabelEnvironment] != envLabel {
+			continue
+		}
+		sameEnvCount++
+	}
+
+	lim := targetEnv.Limits
+	isCreate := oldTC == nil
+
+	// Env cluster-count cap. Create-only: the TC already counts in
+	// same-env siblings after admission; re-simulating on update would
+	// deadlock operations (scale, annotate, deletionTimestamp, finalizer
+	// removal) when an admin reduces the cap below current usage. Zero
+	// means no cap (aligned with MaxClustersPerMember semantics).
+	if isCreate && lim.MaxClusters != nil && *lim.MaxClusters > 0 && sameEnvCount+1 > *lim.MaxClusters {
+		allErrs = append(allErrs, field.Forbidden(
+			field.NewPath("spec"),
+			fmt.Sprintf(
+				"environment %q in team %q already has %d cluster(s); env quota limits to %d",
+				envLabel, team.Name, sameEnvCount, *lim.MaxClusters,
+			),
+		))
+	}
+
+	// MaxClustersPerMember enforcement. The creator's email is carried on
+	// the incoming TenantCluster via the AnnotationCreatorEmail annotation
+	// set by butler-server on API-path creates. On CREATE the annotation
+	// must match the requesting identity; on UPDATE the annotation was
+	// already vetted at create time and must stay unchanged (immutability
+	// check below). The cap simulation (ownedByCreator+1 > max) is
+	// create-only for the same reason as the env cluster cap above;
+	// update-path identity match is also skipped and replaced by
+	// annotation immutability.
+	if lim.MaxClustersPerMember != nil && *lim.MaxClustersPerMember > 0 {
+		creator := ""
+		if tc.Annotations != nil {
+			creator = tc.Annotations[butlerv1alpha1.AnnotationCreatorEmail]
+		}
+		oldCreator := ""
+		if !isCreate && oldTC.Annotations != nil {
+			oldCreator = oldTC.Annotations[butlerv1alpha1.AnnotationCreatorEmail]
+		}
+		if creator == "" && isCreate {
+			allErrs = append(allErrs, field.Required(
+				field.NewPath("metadata", "annotations").Key(butlerv1alpha1.AnnotationCreatorEmail),
+				fmt.Sprintf(
+					"environment %q sets maxClustersPerMember; TenantClusters must carry the %s annotation (set automatically by butler-server; kubectl-direct creates must supply it explicitly)",
+					envLabel, butlerv1alpha1.AnnotationCreatorEmail,
+				),
+			))
+		} else if isCreate && !strings.EqualFold(creator, userInfo.Username) {
+			allErrs = append(allErrs, field.Invalid(
+				field.NewPath("metadata", "annotations").Key(butlerv1alpha1.AnnotationCreatorEmail),
+				creator,
+				fmt.Sprintf(
+					"%s must match the requesting identity %q; environment %q enforces per-member caps and cannot accept an annotation claiming a different user",
+					butlerv1alpha1.AnnotationCreatorEmail, userInfo.Username, envLabel,
+				),
+			))
+		} else if !isCreate && creator != oldCreator {
+			allErrs = append(allErrs, field.Forbidden(
+				field.NewPath("metadata", "annotations").Key(butlerv1alpha1.AnnotationCreatorEmail),
+				fmt.Sprintf(
+					"%s is immutable; cannot change from %q to %q",
+					butlerv1alpha1.AnnotationCreatorEmail, oldCreator, creator,
+				),
+			))
+		} else if isCreate {
+			ownedByCreator := int32(0)
+			for i := range tcList.Items {
+				other := &tcList.Items[i]
+				if other.Name == tc.Name {
+					continue
+				}
+				if other.Labels == nil || other.Labels[butlerv1alpha1.LabelEnvironment] != envLabel {
+					continue
+				}
+				otherOwner := ""
+				if other.Annotations != nil {
+					otherOwner = other.Annotations[butlerv1alpha1.AnnotationOwner]
+					if otherOwner == "" {
+						otherOwner = other.Annotations[butlerv1alpha1.AnnotationCreatorEmail]
+					}
+				}
+				if strings.EqualFold(otherOwner, creator) {
+					ownedByCreator++
+				}
+			}
+			if ownedByCreator+1 > *lim.MaxClustersPerMember {
+				allErrs = append(allErrs, field.Forbidden(
+					field.NewPath("metadata", "annotations").Key(butlerv1alpha1.AnnotationCreatorEmail),
+					fmt.Sprintf(
+						"user %q already owns %d cluster(s) in environment %q; env limits to %d per member",
+						creator, ownedByCreator, envLabel, *lim.MaxClustersPerMember,
+					),
+				))
+			}
+		}
+	}
+
+	return allErrs, nil
+}
+
+// SetupWebhookWithManager registers the TenantCluster validating webhook
+// with the manager. Uses the raw admission.Handler path (not
+// CustomValidator) so the handler can read UserInfo from the admission
+// request; this is required to verify the creator-email annotation
+// against the requesting identity.
 func (v *TenantClusterValidator) SetupWebhookWithManager(mgr ctrl.Manager) error {
 	v.Client = mgr.GetClient()
-	return ctrl.NewWebhookManagedBy(mgr).
-		For(&butlerv1alpha1.TenantCluster{}).
-		WithValidator(v).
-		Complete()
+	v.APIReader = mgr.GetAPIReader()
+	mgr.GetWebhookServer().Register(
+		"/validate-butler-butlerlabs-dev-v1alpha1-tenantcluster",
+		&admission.Webhook{Handler: v},
+	)
+	return nil
 }
