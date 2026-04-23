@@ -87,7 +87,7 @@ func main() {
 	flag.BoolVar(&enableStewardControllers, "enable-kamaji-controllers", true,
 		"Deprecated: use --enable-steward-controllers instead.")
 	flag.BoolVar(&enableWebhooks, "enable-webhooks", false,
-		"Enable admission webhooks for TenantCluster, NetworkPool, and ProviderConfig. "+
+		"Enable admission webhooks for Team, TenantCluster, NetworkPool, and ProviderConfig. "+
 			"Requires cert-manager for TLS certificate management.")
 	flag.IntVar(&webhookPort, "webhook-port", 9443,
 		"Port the webhook server binds to. Override when the default conflicts "+
