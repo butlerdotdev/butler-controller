@@ -89,7 +89,34 @@ No in-place data migration. Re-deploying the chart with the flag on:
 
 ### Rollback procedure
 
-A misbehaving webhook (cert expired, controller crashloop, unintended rule catch) blocks Team and TenantCluster mutations. Restore pre-ADR-012 behavior without editing code:
+A misbehaving webhook (cert expired, controller crashloop, unintended rule catch) blocks Team and TenantCluster mutations. Restore pre-ADR-012 behavior without editing code. The correct path depends on how butler-controller is deployed.
+
+#### Flux-managed deployments (butler-beta, Company 1, most production installs)
+
+For clusters where butler-controller is managed by a Flux `HelmRelease`, a direct `helm upgrade` conflicts with Flux reconciliation: Flux re-asserts the GitOps-repo state on the next sync and undoes the override. Two correct paths:
+
+**(a) GitOps-repo values edit.** Update `HelmRelease.spec.values.controller.webhooksEnabled` to `false` in the cluster's GitOps repo, commit, push. Wait for Flux to reconcile (default 10-minute interval; `flux reconcile helmrelease butler-controller -n butler-system` forces immediate).
+
+**(b) Suspend + direct upgrade.** When the GitOps round-trip is too slow for incident response:
+
+```bash
+flux suspend helmrelease butler-controller -n butler-system
+helm upgrade butler-controller \
+  oci://ghcr.io/butlerdotdev/charts/butler-controller \
+  --reuse-values \
+  --set controller.webhooksEnabled=false \
+  -n butler-system
+```
+
+Fix the underlying issue, update the GitOps values to match the current cluster state, then:
+
+```bash
+flux resume helmrelease butler-controller -n butler-system
+```
+
+The resume operation must not drift values relative to what's deployed, or Flux will re-enable webhooks on the next sync.
+
+#### Direct Helm deployments (dev clusters, non-Flux installs)
 
 ```bash
 helm upgrade butler-controller \
@@ -99,7 +126,9 @@ helm upgrade butler-controller \
   -n butler-system
 ```
 
-The next Helm sync removes the `ValidatingWebhookConfiguration`, the `Certificate`, and the Service. Controller continues serving its reconciliation responsibilities; admission gates go dormant until webhooks are re-enabled.
+#### Post-rollback state
+
+On either path, the next Helm sync removes the `ValidatingWebhookConfiguration`, the `Certificate`, and the Service. Controller continues serving its reconciliation responsibilities; admission gates go dormant until webhooks are re-enabled.
 
 ## Consequences
 
