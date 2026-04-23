@@ -1,13 +1,11 @@
-# Butler umbrella chart scope evaluation
+# ADR-014: Butler umbrella chart
 
 | | |
 |---|---|
-| **Status** | Draft evaluation (not a ratified ADR) |
+| **Status** | Accepted |
 | **Date** | 2026-04-23 |
 | **Scope** | Should Butler ship as a Helm umbrella chart, and if so, which components belong inside? |
-| **Outcome** | Recommended: ship a `butler` umbrella bundling butler-crds + butler-controller + butler-console + butler-addons + steward-crds + steward + capi-steward. Provider charts and butler-portal stay external. |
-
-This evaluation is a draft; promotion to `ADR-014-*` (wherever placed) is a future decision once the recommendation stabilizes and the open questions close.
+| **Outcome** | Ship a `butler` umbrella bundling butler-crds + butler-controller + butler-console + butler-addons + steward-crds + steward + capi-steward. Provider charts and butler-portal stay external. butler-bootstrap is a cluster-bootstrap tool, not a management-cluster runtime component; out of umbrella scope by nature. |
 
 ## 1. Context
 
@@ -170,7 +168,7 @@ For each component, IN or OUT of the umbrella with evidence-based reasoning. Cri
 | butler-controller | IN | Core reconciler for Butler CRDs. Releases track butler-api pins; moves in lockstep with butler-crds. Primary upgrade target. |
 | butler-console | IN | Ships butler-server as well as the SPA. butler-server also pins butler-api v0.10.0 alongside butler-controller. Customer expectation is that UI and controller upgrade together. Not bundling forces customers to coordinate a console chart bump with a controller chart bump every release. |
 | butler-addons | IN | Installs ButlerConfig singleton, init User, AddonDefinition catalog. Semantically tied to `butler-crds` (ButlerConfig is a CRD, AddonDefinitions reference the catalog the controller reads). Tiny RBAC+CR chart; trivial to include; keeps the "install Butler" story a single operation. |
-| butler-bootstrap | **OPEN** (lean OUT) | Chart exists at 0.1.0 and has not iterated. butler-beta does not deploy it. butler-cli performs the bootstrap role on butler-beta today. Chart may be legacy. Requires product-side clarification (Phase 8). Default position until clarified: OUT. |
+| butler-bootstrap | OUT | Chart is used only for cluster bootstrap (provisioning new clusters), not as a management-cluster runtime component. The umbrella is a management-cluster install; butler-bootstrap runs in a different phase of the platform lifecycle. Correctly OUT by nature of being a different workload class, not because of doubt about its future. |
 | butler-provider-harvester | OUT | Per-customer choice. butler-beta runs zero provider charts. Bundling all providers would install 3 controller Deployments and 3 credential Secrets surfaces on every management cluster regardless of use. Customers install the provider they run. |
 | butler-provider-nutanix | OUT | Same as harvester. |
 | butler-provider-proxmox | OUT | Same as harvester. Chart is at 0.1.0 and provider is still maturing. |
@@ -186,11 +184,9 @@ For each component, IN or OUT of the umbrella with evidence-based reasoning. Cri
 
 **IN (7 subcharts):** butler-crds, butler-controller, butler-console, butler-addons, steward-crds, steward, capi-steward. steward-etcd ships transitively as a subchart of steward.
 
-**Pending decision (1 subchart):** butler-bootstrap. Default OUT pending clarification. See Phase 8.
+**OUT:** all provider charts (per-customer choice; see §5.1), butler-portal (separate product line), butler-bootstrap (cluster-bootstrap tool, not a management-cluster runtime), butler-cli (not a chart).
 
-**OUT:** all provider charts (per-customer choice; see §5.1), butler-portal (separate product line), butler-cli (not a chart).
-
-**Prerequisite workstream:** no capi-steward Helm chart exists today. Session 0 of the implementation plan (§8) must create one before the umbrella can bundle it.
+**Prerequisite workstream:** no capi-steward Helm chart exists today. Session 0 of the implementation plan (§8) must create one before the umbrella can bundle it. Chart location: `capi-steward/charts/capi-steward/` (matching the steward repo's `charts/steward` pattern; see §9.4).
 
 ### 5.3 External prerequisites (documented, not bundled)
 
@@ -368,13 +364,13 @@ Every meaningful Phase 4 and Phase 5 decision gets stress-tested.
 
 **Survives:** PARTIALLY. If, once multiple customers are running 2+ providers, the coordination tax materializes, revisit. For this decision, the evidence points OUT.
 
-### 7.4 Decision: butler-bootstrap stays out (pending clarification)
+### 7.4 Decision: butler-bootstrap stays out (resolved by classification)
 
 **Counterargument:** A chart exists; someone presumably uses it. Default-OUT might break a workflow we cannot see.
 
-**Response:** butler-beta does not deploy the chart. The chart has not iterated past 0.1.0. butler-cli performs the bootstrap role on observed customers. Either the chart is legacy (drop it) or it serves a workflow not represented in either observed customer (Company 1 unobserved). This is genuinely a Phase 8 question the evaluation cannot answer alone.
+**Response:** butler-bootstrap is used only for initial cluster bootstrap, not as a management-cluster runtime component. The umbrella is a management-cluster install (all 7 subcharts run continuously on the management cluster); butler-bootstrap runs during a different phase of the platform lifecycle, producing a cluster that the umbrella then installs into. Not including butler-bootstrap in a management-cluster umbrella is not a coverage gap; it is a correct workload-class separation.
 
-**Survives:** YES. Flagged for user decision (§9).
+**Survives:** NO. Resolved.
 
 ### 7.5 Decision: umbrella name is `butler` (not `butler-platform`)
 
@@ -399,7 +395,7 @@ Six sessions. Each session is surgical and validates on butler-beta or a KinD sc
 | Session | Scope | Validation | Depends on |
 |---|---|---|---|
 | 0 | Create a capi-steward Helm chart (prereq workstream; capi-steward is currently deployed via raw kubectl manifests). Publish to the same OCI registry used by the other Butler charts. | `helm install` on a KinD cluster reproduces the kubectl-managed Deployment + RBAC. | none |
-| 1 | Scaffold `butler-charts/charts/butler/Chart.yaml` with all 7 subchart dependencies at current versions. Minimal `values.yaml`. `helm template` smoke test. | `helm lint` + `helm template` pass locally. No push. | Session 0; Phase 8 resolution of butler-bootstrap inclusion |
+| 1 | Scaffold `butler-charts/charts/butler/Chart.yaml` with all 7 subchart dependencies at current versions. Minimal `values.yaml`. `helm template` smoke test. | `helm lint` + `helm template` pass locally. No push. | Session 0 |
 | 2 | Introduce `global.*` values. Rewire each subchart's values.yaml to honor globals via the Helm subchart global pattern. Requires PRs into butler-crds/controller/console/addons and steward/capi-steward to accept globals. | `helm template` shows expected rendering with a single `global.imageRegistry` override. Subchart individual installs still work (backward compatible). | Session 1 |
 | 3 | Release `butler 1.0.0-rc0` to OCI. Install on a KinD scratch cluster via `helm install`. | Full KinD smoke test: CRDs install, controller + console + steward + capi-steward pods Ready, ButlerConfig and a test TenantControlPlane reconcile. | Session 2 |
 | 4 | Migration harness: write and test the Helm 3 release adoption script on the KinD scratch cluster that previously held the seven individual releases (four butler-* + steward-crds + steward + a capi-steward Helm release converted from kubectl manifests). Prove it re-adopts without resource churn. | Re-adopt dry-run, apply, confirm `helm list` shows only `butler` and `helm get manifest butler` matches the union of the previous releases. | Session 3 |
@@ -410,9 +406,9 @@ Six sessions. Each session is surgical and validates on butler-beta or a KinD sc
 
 ## 9. Phase 8: open questions
 
-1. **butler-bootstrap chart status.** Is the chart still intended for use, or has butler-cli fully replaced it? Default: OUT of umbrella until clarified. If kept, re-evaluate inclusion.
-2. **butler-providers meta-umbrella.** If multi-provider deployments become common, is a `butler-providers` sub-umbrella worth building that bundles only the providers a specific customer needs? Not today; worth a future decision point.
-3. **Document location and ADR asymmetry.** ADR-009, ADR-012 live in butler-controller. ADR-013 lives in butler-server. ADR-010 and ADR-011 are referenced elsewhere but not observed in butler-controller's docs/architecture this session; they likely live in butler-server and butler-cli respectively. If this evaluation promotes to ADR-014, where does it land: butler-controller (consistency with the charter ADRs), butler-charts (consistency with the subject matter), or a new butler-umbrella docs tree (consistency with cross-repo architecture)? Worth resolving before the next ADR lands anywhere.
+1. **butler-bootstrap chart status.** [CLOSED 2026-04-23] Is the chart still intended for use, or has butler-cli fully replaced it? **Decision:** butler-bootstrap is the cluster-bootstrap tool; it runs during cluster provisioning, not as a management-cluster runtime component. It does not belong in a management-cluster umbrella; this is a workload-class distinction, not a doubt about the chart's future. §5.1 and §7.4 updated accordingly.
+2. **butler-providers meta-umbrella.** If multi-provider deployments become common, is a `butler-providers` sub-umbrella worth building that bundles only the providers a specific customer needs? Not today; worth a future decision point. Tracked as butlerdotdev/butler-charts#66.
+3. **Document location and ADR asymmetry.** [CLOSED 2026-04-23] **Decision:** this evaluation promotes to ADR-014 at `butler-controller/docs/architecture/ADR-014-butler-umbrella-chart.md`, matching ADR-009 and ADR-012 precedent. The broader asymmetry (ADR-010, ADR-011, ADR-013 live in other repos) stands as a separate documentation item; not addressed here.
 4. **capi-steward Helm chart creation.** [CLOSED 2026-04-23] The umbrella scope includes capi-steward, but no Helm chart exists today (deployed via kubectl manifests on butler-beta). Session 0 of the implementation plan creates the chart. **Decision:** chart lives in the capi-steward repo at `capi-steward/charts/capi-steward/`, matching the steward repo's `charts/steward` pattern for consistency. Published to the same OCI registry.
 5. **butler-cli integration.** Today, `butleradm` bootstrap installs individual charts. Post-umbrella, does the CLI install the umbrella by default? That's a butler-cli PR; not an umbrella decision, but a dependency of any "install Butler" story refresh.
 6. **Company 1 kubeconfig parity.** This evaluation could not validate against Company 1. Before the Session 5-6 cutover sequence, get Company 1 runtime state into scope (shared kubeconfig or a one-time snapshot via their operator) to avoid migrating blind.
@@ -439,7 +435,7 @@ Surfaced by this evaluation; tracked separately from the umbrella implementation
 
 ## 11. Summary
 
-Ship a Butler umbrella bundling seven subcharts: the butler core four (`butler-crds + butler-controller + butler-console + butler-addons`) plus the Steward family (`steward-crds + steward + capi-steward`). `steward-etcd` comes along transitively as steward's subchart. Keep the provider family OUT (per-customer choice), butler-portal OUT (separate product line), butler-cli N/A (not a chart). butler-bootstrap remains open pending product clarification.
+Ship a Butler umbrella bundling seven subcharts: the butler core four (`butler-crds + butler-controller + butler-console + butler-addons`) plus the Steward family (`steward-crds + steward + capi-steward`). `steward-etcd` comes along transitively as steward's subchart. Keep the provider family OUT (per-customer choice), butler-portal OUT (separate product line), butler-bootstrap OUT (cluster-bootstrap tool, not a management-cluster runtime), butler-cli N/A (not a chart).
 
 Document external prerequisites (cert-manager, CAPI core + providers, MetalLB, Gateway API) rather than bundling them. Use Helm 3 release adoption for in-place migration of butler-beta and Company 1.
 
@@ -449,4 +445,10 @@ The umbrella proposal is correct in its core premise: every Butler management cl
 
 Steward's distinct product existence (standalone chart, independent release cadence, CNCF Sandbox trajectory, community governance) is preserved by keeping its standalone chart at `steward/charts/steward`. The umbrella's pinned dependency on Steward is a separate artifact that does not affect Steward's identity or cadence; it is the kube-prometheus-stack pattern applied to Butler.
 
-Revisit in a future session once butler-bootstrap's status closes, once the capi-steward chart is created (§8 Session 0), and once multi-provider customer deployments are observed.
+## 12. Decision record
+
+- **Ratified:** 2026-04-23
+- **Scope:** umbrella chart shape and component selection. 7 subcharts IN (butler-crds, butler-controller, butler-console, butler-addons, steward-crds, steward, capi-steward; steward-etcd transitive). Provider family OUT (per-customer choice). butler-portal OUT (separate product line). butler-bootstrap OUT (cluster-bootstrap tool, not management-cluster runtime). butler-cli N/A (not a chart).
+- **Implementation:** planned across 7 sessions. Session 0 creates the capi-steward Helm chart at `capi-steward/charts/capi-steward/` (matches the steward repo's `charts/steward` layout). Sessions 1-6 scaffold the umbrella, wire globals, release to OCI, build the migration harness, cut over butler-beta, and cut over Company 1.
+- **Follow-up issues tracked independently:** butlerdotdev/butler-bootstrap#23 (remove stubbed Flux code), butlerdotdev/butler-charts#65 (butler-crds helm.sh/resource-policy hardening), butlerdotdev/butler-charts#66 (provider-bundling revisit trigger).
+- **Revisit:** if a customer begins running 2+ provider charts simultaneously (butler-charts#66 trigger).
