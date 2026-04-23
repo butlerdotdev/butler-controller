@@ -413,10 +413,18 @@ Six sessions. Each session is surgical and validates on butler-beta or a KinD sc
 1. **butler-bootstrap chart status.** Is the chart still intended for use, or has butler-cli fully replaced it? Default: OUT of umbrella until clarified. If kept, re-evaluate inclusion.
 2. **butler-providers meta-umbrella.** If multi-provider deployments become common, is a `butler-providers` sub-umbrella worth building that bundles only the providers a specific customer needs? Not today; worth a future decision point.
 3. **Document location and ADR asymmetry.** ADR-009, ADR-012 live in butler-controller. ADR-013 lives in butler-server. ADR-010 and ADR-011 are referenced elsewhere but not observed in butler-controller's docs/architecture this session; they likely live in butler-server and butler-cli respectively. If this evaluation promotes to ADR-014, where does it land: butler-controller (consistency with the charter ADRs), butler-charts (consistency with the subject matter), or a new butler-umbrella docs tree (consistency with cross-repo architecture)? Worth resolving before the next ADR lands anywhere.
-4. **capi-steward Helm chart creation.** The umbrella scope includes capi-steward, but no Helm chart exists today (deployed via kubectl manifests on butler-beta). Session 0 of the implementation plan creates the chart. Open question: does the chart live in butler-charts (with the other operator charts) or in the capi-steward repo (matching steward's `charts/steward` pattern)? Recommend the latter for consistency with steward's repo layout.
+4. **capi-steward Helm chart creation.** [CLOSED 2026-04-23] The umbrella scope includes capi-steward, but no Helm chart exists today (deployed via kubectl manifests on butler-beta). Session 0 of the implementation plan creates the chart. **Decision:** chart lives in the capi-steward repo at `capi-steward/charts/capi-steward/`, matching the steward repo's `charts/steward` pattern for consistency. Published to the same OCI registry.
 5. **butler-cli integration.** Today, `butleradm` bootstrap installs individual charts. Post-umbrella, does the CLI install the umbrella by default? That's a butler-cli PR; not an umbrella decision, but a dependency of any "install Butler" story refresh.
 6. **Company 1 kubeconfig parity.** This evaluation could not validate against Company 1. Before the Session 5-6 cutover sequence, get Company 1 runtime state into scope (shared kubeconfig or a one-time snapshot via their operator) to avoid migrating blind.
-7. **butler-bootstrap stubbed Flux bootstrapping cleanup.** Separate from the umbrella decision: butler-bootstrap currently contains stubbed, non-functional Flux bootstrapping code. Since Flux is not a Butler prereq and not part of the install flow, the stubbed code is dead weight and should be removed. File as a follow-up issue on the butler-bootstrap repo; track independently of this evaluation.
+7. **butler-bootstrap stubbed Flux bootstrapping cleanup.** [FILED as butlerdotdev/butler-bootstrap#23] Separate from the umbrella decision: butler-bootstrap currently contains stubbed, non-functional Flux bootstrapping code. Since Flux is not a Butler prereq and not part of the install flow, the stubbed code is dead weight and should be removed. Tracked independently of this evaluation.
+
+## 9a. Filed follow-up issues
+
+Surfaced by this evaluation; tracked separately from the umbrella implementation:
+
+- butlerdotdev/butler-bootstrap#23: Remove stubbed Flux bootstrapping code
+- butlerdotdev/butler-charts#65: Harden butler-crds chart against helm uninstall CRD deletion (pre-existing risk, §7.1)
+- butlerdotdev/butler-charts#66: Revisit provider bundling when a second customer runs 2+ providers simultaneously (§7.3 PARTIALLY-surviving counterargument)
 
 ## 10. Critical files and evidence sources
 
