@@ -201,6 +201,23 @@ For each component, IN or OUT of the umbrella with evidence-based reasoning. Cri
 
 Steward is no longer listed as an external prereq: it is bundled as a subchart (§5.1). The umbrella's Steward subchart version pin replaces the previously-proposed external compatibility matrix.
 
+#### Install narrative
+
+```
+1. Platform prereq: install cert-manager (one command, one chart)
+2. Install Butler: helm install butler oci://... (single command, installs all 7 subcharts)
+3. Optional post-install capabilities (operator choice, none required):
+   - Flux CD: enable GitOps workflows (butler-console's GitOps tab
+     uses Flux CRs when present; skip entirely if GitOps is not a
+     customer requirement)
+   - Provider controllers: install the provider chart(s) the
+     customer actually runs (harvester, nutanix, proxmox, etc.)
+   - Webhook enablement: flip controller.webhooksEnabled per
+     ADR-012 once cert-manager has provisioned the webhook cert
+```
+
+Flux is explicitly NOT a prerequisite. Butler management clusters install and run without Flux; Butler's GitOps features consume Flux CRs when Flux is present and gracefully no-op when it is not. An earlier draft of this evaluation incorrectly listed Flux as a prereq. Evidence to the contrary: butler-bootstrap currently contains stubbed (non-functional) Flux bootstrapping code, and butler-beta's Flux deployment is an operator-side GitOps choice, not a Butler prereq.
+
 ### 5.4 Compatibility matrix shape
 
 The umbrella chart's README ships a compatibility matrix covering the external pieces the umbrella does not bundle:
@@ -386,7 +403,7 @@ Six sessions. Each session is surgical and validates on butler-beta or a KinD sc
 | 2 | Introduce `global.*` values. Rewire each subchart's values.yaml to honor globals via the Helm subchart global pattern. Requires PRs into butler-crds/controller/console/addons and steward/capi-steward to accept globals. | `helm template` shows expected rendering with a single `global.imageRegistry` override. Subchart individual installs still work (backward compatible). | Session 1 |
 | 3 | Release `butler 1.0.0-rc0` to OCI. Install on a KinD scratch cluster via `helm install`. | Full KinD smoke test: CRDs install, controller + console + steward + capi-steward pods Ready, ButlerConfig and a test TenantControlPlane reconcile. | Session 2 |
 | 4 | Migration harness: write and test the Helm 3 release adoption script on the KinD scratch cluster that previously held the seven individual releases (four butler-* + steward-crds + steward + a capi-steward Helm release converted from kubectl manifests). Prove it re-adopts without resource churn. | Re-adopt dry-run, apply, confirm `helm list` shows only `butler` and `helm get manifest butler` matches the union of the previous releases. | Session 3 |
-| 5 | butler-beta cutover. Apply the migration script, including the conversion of the currently-kubectl-managed capi-steward Deployment into the umbrella. Consolidate Flux HelmReleases on butler-beta. | butler-beta stays green: Management GitOps tab loads, cluster create works, webhooks enforce, TenantControlPlane reconciliation unchanged. | Session 4 |
+| 5 | butler-beta cutover. Apply the migration script, including the conversion of the currently-kubectl-managed capi-steward Deployment into the umbrella. butler-beta runs Flux for GitOps, so its per-component HelmReleases collapse to a single umbrella HelmRelease; customers not running Flux would use the direct `helm upgrade` path instead. | butler-beta stays green: Management GitOps tab loads, cluster create works, webhooks enforce, TenantControlPlane reconciliation unchanged. | Session 4 |
 | 6 | Company 1 cutover per their change window. | Per Company 1 harness (to be defined when the window is scheduled). | Session 5 + Company 1 availability |
 
 **Total calendar estimate:** 3-5 development weeks assuming one session per ~2 work days plus butler-beta validation windows. Company 1 cutover timing depends on their change window.
@@ -399,6 +416,7 @@ Six sessions. Each session is surgical and validates on butler-beta or a KinD sc
 4. **capi-steward Helm chart creation.** The umbrella scope includes capi-steward, but no Helm chart exists today (deployed via kubectl manifests on butler-beta). Session 0 of the implementation plan creates the chart. Open question: does the chart live in butler-charts (with the other operator charts) or in the capi-steward repo (matching steward's `charts/steward` pattern)? Recommend the latter for consistency with steward's repo layout.
 5. **butler-cli integration.** Today, `butleradm` bootstrap installs individual charts. Post-umbrella, does the CLI install the umbrella by default? That's a butler-cli PR; not an umbrella decision, but a dependency of any "install Butler" story refresh.
 6. **Company 1 kubeconfig parity.** This evaluation could not validate against Company 1. Before the Session 5-6 cutover sequence, get Company 1 runtime state into scope (shared kubeconfig or a one-time snapshot via their operator) to avoid migrating blind.
+7. **butler-bootstrap stubbed Flux bootstrapping cleanup.** Separate from the umbrella decision: butler-bootstrap currently contains stubbed, non-functional Flux bootstrapping code. Since Flux is not a Butler prereq and not part of the install flow, the stubbed code is dead weight and should be removed. File as a follow-up issue on the butler-bootstrap repo; track independently of this evaluation.
 
 ## 10. Critical files and evidence sources
 
