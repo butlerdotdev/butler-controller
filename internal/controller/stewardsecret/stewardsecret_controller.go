@@ -107,6 +107,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, capiSecret, func() error {
+		// CAPI expects kubeconfig secrets to have this type.
+		// Must be set on create; Secret type is immutable after creation.
+		if capiSecret.CreationTimestamp.IsZero() {
+			capiSecret.Type = corev1.SecretType("cluster.x-k8s.io/secret")
+		}
+
 		// Set labels
 		if capiSecret.Labels == nil {
 			capiSecret.Labels = make(map[string]string)
