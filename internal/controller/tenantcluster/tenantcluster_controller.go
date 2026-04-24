@@ -276,7 +276,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	if isTalosCluster(tc) {
-		if err := r.reconcileTalosBootstrap(ctx, tc, butlerConfig); err != nil {
+		if err := r.reconcileTalosBootstrap(ctx, tc, butlerConfig, providerConfig); err != nil {
 			logger.Error(err, "failed to reconcile Talos bootstrap")
 			degraded = append(degraded, "talos bootstrap failed ("+truncateError(err)+")")
 		}
