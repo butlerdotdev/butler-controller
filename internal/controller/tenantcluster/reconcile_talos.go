@@ -203,6 +203,21 @@ func isTalosCluster(tc *butlerv1alpha1.TenantCluster) bool {
 	return talos.IsTalosCluster(tc)
 }
 
+// resolveTimeServers returns the NTP servers to use for Talos worker config.
+// Fallback chain: TenantCluster → ProviderConfig.Network → ButlerConfig → pool.ntp.org.
+func resolveTimeServers(tc *butlerv1alpha1.TenantCluster, providerConfig *butlerv1alpha1.ProviderConfig, butlerConfig *butlerv1alpha1.ButlerConfig) []string {
+	if len(tc.Spec.TimeServers) > 0 {
+		return tc.Spec.TimeServers
+	}
+	if providerConfig != nil && providerConfig.Spec.Network != nil && len(providerConfig.Spec.Network.TimeServers) > 0 {
+		return providerConfig.Spec.Network.TimeServers
+	}
+	if servers := butlerConfig.GetDefaultTimeServers(); len(servers) > 0 {
+		return servers
+	}
+	return []string{"pool.ntp.org"}
+}
+
 // reconcileTalosBootstrap generates the Talos machine config and creates the bootstrap
 // Secret that CAPI's dataSecretName mechanism reads. This is called after the TCP is
 // ready and the control plane is accessible.
@@ -212,7 +227,7 @@ func isTalosCluster(tc *butlerv1alpha1.TenantCluster) bool {
 //   - cluster.token: kubeadm bootstrap token for kubelet TLS bootstrapping
 //   - machine.ca.crt: OS CA cert for trusting steward-trustd
 //   - cluster.ca.crt: K8s cluster CA for trusting the API server
-func (r *Reconciler) reconcileTalosBootstrap(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) error {
+func (r *Reconciler) reconcileTalosBootstrap(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig, providerConfig *butlerv1alpha1.ProviderConfig) error {
 	logger := log.FromContext(ctx)
 
 	secretName := fmt.Sprintf("%s-talos-bootstrap", tc.Name)
@@ -357,7 +372,13 @@ func (r *Reconciler) reconcileTalosBootstrap(ctx context.Context, tc *butlerv1al
 	}
 
 	// Get Talos-specific config
+	// Default install disk varies by provider:
+	//   - KubeVirt/Harvester: /dev/vda (virtio)
+	//   - Nutanix/Proxmox:    /dev/sda (SCSI)
 	installDisk := "/dev/vda"
+	if providerConfig != nil && providerConfig.Spec.Provider != butlerv1alpha1.ProviderTypeHarvester {
+		installDisk = "/dev/sda"
+	}
 	var installerImage string
 	if tc.Spec.Workers.MachineTemplate.OS.Talos != nil {
 		if tc.Spec.Workers.MachineTemplate.OS.Talos.InstallDisk != "" {
@@ -365,6 +386,8 @@ func (r *Reconciler) reconcileTalosBootstrap(ctx context.Context, tc *butlerv1al
 		}
 		installerImage = tc.Spec.Workers.MachineTemplate.OS.Talos.InstallerImage
 	}
+
+	timeServers := resolveTimeServers(tc, providerConfig, butlerConfig)
 
 	// Generate Talos machine config
 	input := talos.MachineConfigInput{
@@ -378,6 +401,7 @@ func (r *Reconciler) reconcileTalosBootstrap(ctx context.Context, tc *butlerv1al
 		ServiceCIDR:          serviceCIDR,
 		InstallDisk:          installDisk,
 		InstallerImage:       installerImage,
+		TimeServers:          timeServers,
 	}
 
 	machineConfigData, err := talos.GenerateWorkerConfig(input)

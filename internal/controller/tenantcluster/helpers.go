@@ -22,6 +22,33 @@ import (
 	"github.com/butlerdotdev/butler-controller/internal/tenant"
 )
 
+// getNutanixCredentials reads username, password, and optional CA bundle from
+// the ProviderConfig's referenced credentials Secret.
+func (r *Reconciler) getNutanixCredentials(ctx context.Context, pc *butlerv1alpha1.ProviderConfig) (*struct{ Username, Password, CABundle string }, error) {
+	ns := pc.Spec.CredentialsRef.Namespace
+	if ns == "" {
+		ns = "butler-system"
+	}
+
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      pc.Spec.CredentialsRef.Name,
+		Namespace: ns,
+	}, secret); err != nil {
+		return nil, fmt.Errorf("failed to get credentials secret %s/%s: %w", ns, pc.Spec.CredentialsRef.Name, err)
+	}
+
+	username := string(secret.Data["username"])
+	password := string(secret.Data["password"])
+	if username == "" || password == "" {
+		return nil, fmt.Errorf("credentials secret %s/%s missing username or password key", ns, pc.Spec.CredentialsRef.Name)
+	}
+
+	caBundle := string(secret.Data["ca.pem"])
+
+	return &struct{ Username, Password, CABundle string }{Username: username, Password: password, CABundle: caBundle}, nil
+}
+
 func (r *Reconciler) getButlerConfig(ctx context.Context) (*butlerv1alpha1.ButlerConfig, error) {
 	config := &butlerv1alpha1.ButlerConfig{}
 	if err := r.Get(ctx, types.NamespacedName{Name: ButlerConfigSingletonName}, config); err != nil {

@@ -228,6 +228,59 @@ func TestEndpointFromTCPStatus(t *testing.T) {
 	}
 }
 
+func TestGenerateWorkerConfig_TimeServers(t *testing.T) {
+	t.Run("with time servers", func(t *testing.T) {
+		input := validInput()
+		input.TimeServers = []string{"ntp01.example.com", "ntp02.example.com"}
+
+		data, err := GenerateWorkerConfig(input)
+		if err != nil {
+			t.Fatalf("GenerateWorkerConfig() error = %v", err)
+		}
+
+		var config map[string]interface{}
+		if err := yaml.Unmarshal(data, &config); err != nil {
+			t.Fatalf("failed to unmarshal: %v", err)
+		}
+
+		machine := config["machine"].(map[string]interface{})
+		timeSection, ok := machine["time"].(map[string]interface{})
+		if !ok {
+			t.Fatal("machine.time section missing when TimeServers provided")
+		}
+		servers, ok := timeSection["servers"].([]interface{})
+		if !ok {
+			t.Fatal("machine.time.servers missing or wrong type")
+		}
+		if len(servers) != 2 {
+			t.Fatalf("expected 2 time servers, got %d", len(servers))
+		}
+		if servers[0] != "ntp01.example.com" || servers[1] != "ntp02.example.com" {
+			t.Errorf("time servers = %v, want [ntp01.example.com ntp02.example.com]", servers)
+		}
+	})
+
+	t.Run("without time servers", func(t *testing.T) {
+		input := validInput()
+		// TimeServers is empty by default
+
+		data, err := GenerateWorkerConfig(input)
+		if err != nil {
+			t.Fatalf("GenerateWorkerConfig() error = %v", err)
+		}
+
+		var config map[string]interface{}
+		if err := yaml.Unmarshal(data, &config); err != nil {
+			t.Fatalf("failed to unmarshal: %v", err)
+		}
+
+		machine := config["machine"].(map[string]interface{})
+		if _, ok := machine["time"]; ok {
+			t.Error("machine.time should not be set when TimeServers is empty")
+		}
+	})
+}
+
 func TestGenerateWorkerConfig_NoInstallerImage(t *testing.T) {
 	input := validInput()
 	input.InstallerImage = ""

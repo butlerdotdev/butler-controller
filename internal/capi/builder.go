@@ -77,6 +77,7 @@ type Builder struct {
 type NutanixCredentials struct {
 	Username string
 	Password string
+	CABundle string // PEM-encoded CA chain for Prism Central TLS verification
 }
 
 // NewBuilder creates a new CAPI resource builder.
@@ -90,10 +91,11 @@ func NewBuilder(tc *butlerv1alpha1.TenantCluster, pc *butlerv1alpha1.ProviderCon
 
 // WithNutanixCredentials sets the Nutanix credentials for CAPX secret generation.
 // Must be called before Build() when using Nutanix provider.
-func (b *Builder) WithNutanixCredentials(username, password string) *Builder {
+func (b *Builder) WithNutanixCredentials(username, password, caBundle string) *Builder {
 	b.nutanixCreds = &NutanixCredentials{
 		Username: username,
 		Password: password,
+		CABundle: caBundle,
 	}
 	return b
 }
@@ -723,6 +725,15 @@ func (b *Builder) buildNutanixCluster(name string) *unstructured.Unstructured {
 				"namespace": b.namespace,
 			},
 		},
+	}
+
+	// Add CA trust bundle for internal PKI (e.g. corporate CAs)
+	if b.nutanixCreds != nil && b.nutanixCreds.CABundle != "" {
+		prismCentral := spec["prismCentral"].(map[string]interface{})
+		prismCentral["additionalTrustBundle"] = map[string]interface{}{
+			"kind": "String",
+			"data": b.nutanixCreds.CABundle,
+		}
 	}
 
 	nxCluster.Object["spec"] = spec

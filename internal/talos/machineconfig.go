@@ -65,6 +65,10 @@ type MachineConfigInput struct {
 
 	// InstallerImage is the Talos installer image reference.
 	InstallerImage string
+
+	// TimeServers are NTP servers for time synchronization.
+	// Talos blocks kubelet startup until time is synced.
+	TimeServers []string
 }
 
 // GenerateWorkerConfig generates a Talos v1alpha1 worker machine config YAML.
@@ -143,6 +147,12 @@ func buildConfig(input MachineConfigInput, clusterDNS string) map[string]interfa
 		install["image"] = input.InstallerImage
 	}
 	machine["install"] = install
+
+	if len(input.TimeServers) > 0 {
+		machine["time"] = map[string]interface{}{
+			"servers": input.TimeServers,
+		}
+	}
 
 	cluster := map[string]interface{}{
 		"controlPlane": map[string]interface{}{

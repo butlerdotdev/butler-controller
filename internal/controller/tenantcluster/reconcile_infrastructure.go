@@ -66,6 +66,19 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 	builder := capi.NewBuilder(tc, providerConfig, tc.Status.TenantNamespace).
 		WithButlerConfig(butlerConfig)
 
+	// Nutanix requires credentials from the ProviderConfig's referenced Secret.
+	// CAPX needs username/password to create a per-cluster credential Secret in
+	// the tenant namespace (JSON array with basic_auth type).
+	if providerConfig.Spec.Provider == butlerv1alpha1.ProviderTypeNutanix {
+		creds, err := r.getNutanixCredentials(ctx, providerConfig)
+		if err != nil {
+			r.setCondition(tc, butlerv1alpha1.TenantClusterConditionInfrastructureReady,
+				metav1.ConditionFalse, ReasonProviderConfigNotFound, fmt.Sprintf("failed to load Nutanix credentials: %v", err))
+			return ctrl.Result{}, err
+		}
+		builder.WithNutanixCredentials(creds.Username, creds.Password, creds.CABundle)
+	}
+
 	// For Ingress/Gateway modes, get the Ingress controller IP for worker /etc/hosts
 	// CRITICAL: If Ingress/Gateway mode is enabled but the Ingress controller doesn't have
 	// an external IP yet, we MUST wait. Otherwise, KubeadmConfigTemplate will be created
@@ -189,7 +202,7 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 		// maintenance mode and join the cluster before Cilium and other addons can
 		// schedule pods on them.
 		if isTalosCluster(tc) {
-			if err := r.reconcileTalosBootstrap(ctx, tc, butlerConfig); err != nil {
+			if err := r.reconcileTalosBootstrap(ctx, tc, butlerConfig, providerConfig); err != nil {
 				logger.Error(err, "failed to reconcile Talos bootstrap")
 			}
 			allApplied, err := r.reconcileTalosApplyConfig(ctx, tc)
