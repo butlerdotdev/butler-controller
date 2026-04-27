@@ -122,43 +122,23 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 		return ctrl.Result{}, fmt.Errorf("failed to build CAPI resources: %w", err)
 	}
 
-	for _, resource := range resourceSet.AllResources() {
-		if resource == nil {
-			continue
-		}
+	// For Talos clusters, defer MachineDeployment creation until the bootstrap
+	// secret exists. CAPX treats a missing dataSecretName target as a terminal
+	// CreateError on the NutanixMachine, which is NOT retryable. The bootstrap
+	// secret requires the control plane to be ready first (it needs the CP endpoint,
+	// trustd credentials, and a bootstrap token from the tenant API server).
+	//
+	// For non-Talos clusters, create all resources in one pass — kubeadm bootstrap
+	// uses a configRef to a KubeadmConfigTemplate, which CAPI handles natively.
+	var initialResources []*unstructured.Unstructured
+	if isTalosCluster(tc) {
+		initialResources = resourceSet.ResourcesWithoutMachineDeployment()
+	} else {
+		initialResources = resourceSet.AllResources()
+	}
 
-		existing := &unstructured.Unstructured{}
-		existing.SetGroupVersionKind(resource.GroupVersionKind())
-
-		err := r.Get(ctx, types.NamespacedName{
-			Name:      resource.GetName(),
-			Namespace: resource.GetNamespace(),
-		}, existing)
-
-		if apierrors.IsNotFound(err) {
-			logger.Info("creating CAPI resource",
-				"kind", resource.GetKind(),
-				"name", resource.GetName(),
-				"namespace", resource.GetNamespace())
-
-			if err := r.Create(ctx, resource); err != nil {
-				if apierrors.IsAlreadyExists(err) {
-					logger.V(1).Info("CAPI resource created by concurrent reconcile",
-						"kind", resource.GetKind(),
-						"name", resource.GetName())
-				} else {
-					return ctrl.Result{}, fmt.Errorf("failed to create %s %s: %w",
-						resource.GetKind(), resource.GetName(), err)
-				}
-			}
-		} else if err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to get %s %s: %w",
-				resource.GetKind(), resource.GetName(), err)
-		} else {
-			logger.V(1).Info("CAPI resource already exists",
-				"kind", resource.GetKind(),
-				"name", resource.GetName())
-		}
+	if err := r.createCAPIResources(ctx, initialResources); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	infraReady, controlPlaneReady, workersReady, err := r.checkInfrastructureStatus(ctx, tc)
@@ -195,16 +175,28 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionControlPlaneReady,
 			metav1.ConditionTrue, ReasonControlPlaneReady, "Control plane is ready")
 
-		// For Talos clusters, create the bootstrap Secret and apply config to workers
-		// as soon as CP is ready. Bootstrap MUST happen here because CAPI Machines
-		// reference the Secret via dataSecretName and block until it exists.
+		// For Talos clusters: two-phase resource creation.
+		// Phase 1 (above) created all CAPI resources EXCEPT the MachineDeployment.
+		// Phase 2 (here): now that the CP is ready, create the bootstrap secret,
+		// then create the MachineDeployment so CAPX can find the secret immediately.
+		//
 		// Config must be applied BEFORE addon installation — workers need to leave
 		// maintenance mode and join the cluster before Cilium and other addons can
 		// schedule pods on them.
 		if isTalosCluster(tc) {
 			if err := r.reconcileTalosBootstrap(ctx, tc, butlerConfig, providerConfig); err != nil {
 				logger.Error(err, "failed to reconcile Talos bootstrap")
+				return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 			}
+
+			// Bootstrap secret exists — now safe to create the MachineDeployment.
+			// CAPX will find the dataSecretName target and proceed normally.
+			if resourceSet.MachineDeployment != nil {
+				if err := r.createCAPIResources(ctx, []*unstructured.Unstructured{resourceSet.MachineDeployment}); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
+
 			allApplied, err := r.reconcileTalosApplyConfig(ctx, tc)
 			if err != nil {
 				logger.Error(err, "failed to apply Talos config to workers")
@@ -674,4 +666,51 @@ func (r *Reconciler) reconcileImageSync(ctx context.Context, tc *butlerv1alpha1.
 	tc.Status.ImageSyncRef = &butlerv1alpha1.LocalObjectReference{Name: is.Name}
 
 	return "", fmt.Errorf("ImageSync %s created, waiting for completion", imageSyncName)
+}
+
+// createCAPIResources creates or verifies existence of the given CAPI resources.
+// Idempotent: skips resources that already exist.
+func (r *Reconciler) createCAPIResources(ctx context.Context, resources []*unstructured.Unstructured) error {
+	logger := log.FromContext(ctx)
+
+	for _, resource := range resources {
+		if resource == nil {
+			continue
+		}
+
+		existing := &unstructured.Unstructured{}
+		existing.SetGroupVersionKind(resource.GroupVersionKind())
+
+		err := r.Get(ctx, types.NamespacedName{
+			Name:      resource.GetName(),
+			Namespace: resource.GetNamespace(),
+		}, existing)
+
+		if apierrors.IsNotFound(err) {
+			logger.Info("creating CAPI resource",
+				"kind", resource.GetKind(),
+				"name", resource.GetName(),
+				"namespace", resource.GetNamespace())
+
+			if err := r.Create(ctx, resource); err != nil {
+				if apierrors.IsAlreadyExists(err) {
+					logger.V(1).Info("CAPI resource created by concurrent reconcile",
+						"kind", resource.GetKind(),
+						"name", resource.GetName())
+				} else {
+					return fmt.Errorf("failed to create %s %s: %w",
+						resource.GetKind(), resource.GetName(), err)
+				}
+			}
+		} else if err != nil {
+			return fmt.Errorf("failed to get %s %s: %w",
+				resource.GetKind(), resource.GetName(), err)
+		} else {
+			logger.V(1).Info("CAPI resource already exists",
+				"kind", resource.GetKind(),
+				"name", resource.GetName())
+		}
+	}
+
+	return nil
 }

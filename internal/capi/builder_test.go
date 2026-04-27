@@ -457,6 +457,189 @@ func TestAllResources(t *testing.T) {
 	}
 }
 
+func TestResourcesWithoutMachineDeployment_ExcludesMD(t *testing.T) {
+	tc := newTestTenantCluster("test-cluster", "default")
+	pc := newTestProviderConfig("harvester")
+
+	builder := NewBuilder(tc, pc, "test-cluster-12345678")
+	rs, err := builder.Build()
+	if err != nil {
+		t.Fatalf("failed to build resources: %v", err)
+	}
+
+	resources := rs.ResourcesWithoutMachineDeployment()
+
+	// Should have 6 slots (no MachineDeployment)
+	if len(resources) != 6 {
+		t.Fatalf("expected 6 resource slots, got %d", len(resources))
+	}
+
+	// Verify no MachineDeployment in the list
+	for _, r := range resources {
+		if r != nil && r.GetKind() == "MachineDeployment" {
+			t.Error("ResourcesWithoutMachineDeployment must not contain MachineDeployment")
+		}
+	}
+
+	// Verify MachineDeployment is still accessible directly on the ResourceSet
+	if rs.MachineDeployment == nil {
+		t.Error("MachineDeployment should still be present on the ResourceSet")
+	}
+	if rs.MachineDeployment.GetKind() != "MachineDeployment" {
+		t.Errorf("expected MachineDeployment kind, got %s", rs.MachineDeployment.GetKind())
+	}
+}
+
+func TestTalosNutanixBuild_HasMachineDeploymentWithDataSecretName(t *testing.T) {
+	tc := newTestTenantCluster("talos-cluster", "default")
+	tc.Spec.Workers.MachineTemplate.OS.Type = butlerv1alpha1.OSTypeTalos
+
+	pc := newTestProviderConfig("nutanix")
+	pc.Spec.Nutanix = &butlerv1alpha1.NutanixProviderConfig{
+		Endpoint:    "https://prism.example.com",
+		Port:        9440,
+		ClusterUUID: "cluster-uuid-1234",
+		SubnetUUID:  "subnet-uuid-5678",
+	}
+
+	builder := NewBuilder(tc, pc, "talos-cluster-12345678").
+		WithNutanixCredentials("admin", "password", "")
+
+	rs, err := builder.Build()
+	if err != nil {
+		t.Fatalf("failed to build resources: %v", err)
+	}
+
+	// Builder still produces MachineDeployment — it's the reconciler that defers creation
+	if rs.MachineDeployment == nil {
+		t.Fatal("expected MachineDeployment to be built")
+	}
+
+	// Talos clusters use dataSecretName, not configRef
+	md := rs.MachineDeployment
+	spec := md.Object["spec"].(map[string]interface{})
+	template := spec["template"].(map[string]interface{})
+	templateSpec := template["spec"].(map[string]interface{})
+	bootstrap := templateSpec["bootstrap"].(map[string]interface{})
+
+	if _, hasConfigRef := bootstrap["configRef"]; hasConfigRef {
+		t.Error("Talos cluster should not have bootstrap.configRef")
+	}
+
+	secretName, ok := bootstrap["dataSecretName"].(string)
+	if !ok {
+		t.Fatal("expected bootstrap.dataSecretName for Talos cluster")
+	}
+	if secretName != "talos-cluster-talos-bootstrap" {
+		t.Errorf("expected dataSecretName 'talos-cluster-talos-bootstrap', got '%s'", secretName)
+	}
+
+	// No BootstrapConfigTemplate for Talos
+	if rs.BootstrapConfigTemplate != nil {
+		t.Error("Talos cluster should not have BootstrapConfigTemplate")
+	}
+}
+
+func TestTalosNutanixBuild_ResourcesWithoutMD(t *testing.T) {
+	tc := newTestTenantCluster("talos-cluster", "default")
+	tc.Spec.Workers.MachineTemplate.OS.Type = butlerv1alpha1.OSTypeTalos
+
+	pc := newTestProviderConfig("nutanix")
+	pc.Spec.Nutanix = &butlerv1alpha1.NutanixProviderConfig{
+		Endpoint:    "https://prism.example.com",
+		Port:        9440,
+		ClusterUUID: "cluster-uuid-1234",
+		SubnetUUID:  "subnet-uuid-5678",
+	}
+
+	builder := NewBuilder(tc, pc, "talos-cluster-12345678").
+		WithNutanixCredentials("admin", "password", "")
+
+	rs, err := builder.Build()
+	if err != nil {
+		t.Fatalf("failed to build resources: %v", err)
+	}
+
+	// Phase 1 resources (without MachineDeployment)
+	phase1 := rs.ResourcesWithoutMachineDeployment()
+
+	// Count non-nil resources
+	var phase1NonNil []*unstructured.Unstructured
+	for _, r := range phase1 {
+		if r != nil {
+			phase1NonNil = append(phase1NonNil, r)
+		}
+	}
+
+	// Nutanix Talos: CredentialSecret, NutanixCluster, NutanixMachineTemplate,
+	// StewardControlPlane, Cluster (no BootstrapConfigTemplate for Talos)
+	if len(phase1NonNil) != 5 {
+		t.Errorf("expected 5 non-nil phase 1 resources for Nutanix Talos, got %d", len(phase1NonNil))
+		for _, r := range phase1NonNil {
+			t.Logf("  - %s", r.GetKind())
+		}
+	}
+
+	// MachineDeployment still on the struct for phase 2
+	if rs.MachineDeployment == nil {
+		t.Error("MachineDeployment must still be present on ResourceSet for phase 2 creation")
+	}
+}
+
+func TestNonTalosHarvesterBuild_AllResourcesUnchanged(t *testing.T) {
+	// Ensure the fix doesn't change behavior for non-Talos clusters
+	tc := newTestTenantCluster("kubeadm-cluster", "default")
+	// OS.Type defaults to empty (non-Talos)
+	pc := newTestProviderConfig("harvester")
+
+	builder := NewBuilder(tc, pc, "kubeadm-cluster-12345678")
+	rs, err := builder.Build()
+	if err != nil {
+		t.Fatalf("failed to build resources: %v", err)
+	}
+
+	all := rs.AllResources()
+	withoutMD := rs.ResourcesWithoutMachineDeployment()
+
+	// AllResources should have MachineDeployment
+	hasMD := false
+	for _, r := range all {
+		if r != nil && r.GetKind() == "MachineDeployment" {
+			hasMD = true
+			break
+		}
+	}
+	if !hasMD {
+		t.Error("AllResources for non-Talos cluster must include MachineDeployment")
+	}
+
+	// ResourcesWithoutMachineDeployment should NOT have it
+	for _, r := range withoutMD {
+		if r != nil && r.GetKind() == "MachineDeployment" {
+			t.Error("ResourcesWithoutMachineDeployment must not contain MachineDeployment")
+		}
+	}
+
+	// Non-Talos should have BootstrapConfigTemplate (kubeadm)
+	if rs.BootstrapConfigTemplate == nil {
+		t.Error("Non-Talos cluster should have BootstrapConfigTemplate")
+	}
+
+	// Non-Talos bootstrap uses configRef, not dataSecretName
+	md := rs.MachineDeployment
+	spec := md.Object["spec"].(map[string]interface{})
+	template := spec["template"].(map[string]interface{})
+	templateSpec := template["spec"].(map[string]interface{})
+	bootstrap := templateSpec["bootstrap"].(map[string]interface{})
+
+	if _, hasConfigRef := bootstrap["configRef"]; !hasConfigRef {
+		t.Error("Non-Talos cluster should have bootstrap.configRef")
+	}
+	if _, hasSecret := bootstrap["dataSecretName"]; hasSecret {
+		t.Error("Non-Talos cluster should not have bootstrap.dataSecretName")
+	}
+}
+
 func TestUnsupportedProvider(t *testing.T) {
 	tc := newTestTenantCluster("test-cluster", "default")
 	pc := newTestProviderConfig("proxmox")
