@@ -1134,8 +1134,12 @@ func (b *Builder) buildMachineDeployment(name string, machineTemplate, bootstrap
 			},
 		}
 	} else {
-		// Talos: use dataSecretName — CAPI reads the Secret directly,
-		// waiting (requeueing) until the Secret is created by reconcileTalosBootstrap
+		// Talos: use dataSecretName — CAPX reads the Secret directly.
+		// IMPORTANT: The Secret MUST exist before the MachineDeployment is created.
+		// CAPX (Nutanix) treats a missing Secret as a terminal CreateError on the
+		// NutanixMachine, which is NOT retryable. The reconciler defers
+		// MachineDeployment creation for Talos clusters until after the bootstrap
+		// secret is created by reconcileTalosBootstrap.
 		bootstrap = map[string]interface{}{
 			"dataSecretName": fmt.Sprintf("%s-talos-bootstrap", name),
 		}
@@ -1305,5 +1309,20 @@ func (rs *ResourceSet) AllResources() []*unstructured.Unstructured {
 		rs.ControlPlane,            // Then control plane
 		rs.MachineDeployment,       // Then machine deployment
 		rs.Cluster,                 // Finally the top-level cluster (references others)
+	}
+}
+
+// ResourcesWithoutMachineDeployment returns all resources except the MachineDeployment.
+// Used for Talos clusters where the MachineDeployment must be deferred until the
+// bootstrap secret exists — CAPX treats a missing dataSecretName target as a terminal
+// CreateError on the NutanixMachine, which is not retryable.
+func (rs *ResourceSet) ResourcesWithoutMachineDeployment() []*unstructured.Unstructured {
+	return []*unstructured.Unstructured{
+		rs.CredentialSecret,
+		rs.InfrastructureCluster,
+		rs.BootstrapConfigTemplate,
+		rs.MachineTemplate,
+		rs.ControlPlane,
+		rs.Cluster,
 	}
 }
