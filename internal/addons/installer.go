@@ -690,6 +690,7 @@ func (i *Installer) InstallTraefik(ctx context.Context, kubeconfig []byte, versi
 		"--set", "ingressClass.enabled=true",
 		"--set", "ingressClass.isDefaultClass=true",
 		"--set", "service.type=LoadBalancer",
+		"--set", `commonLabels.butler\.butlerlabs\.dev/platform-lb=true`,
 		"--wait",
 		"--timeout", "2m",
 	}
