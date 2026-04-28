@@ -158,18 +158,22 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 		})
 	}
 
-	// 5. Traefik - Ingress
-	traefikVersion := addons.DefaultTraefikVersion
-	if tc.Spec.Addons.Ingress != nil && tc.Spec.Addons.Ingress.Version != "" {
-		traefikVersion = tc.Spec.Addons.Ingress.Version
-	}
-	logger.Info("installing Traefik", "version", traefikVersion)
-	if err := r.Installer.InstallTraefik(ctx, kubeconfigData, traefikVersion); err != nil {
-		logger.Error(err, "failed to install Traefik")
+	// 5. Traefik - Ingress (optional)
+	if tc.Spec.Addons.Ingress.IsIngressEnabled() {
+		traefikVersion := addons.DefaultTraefikVersion
+		if tc.Spec.Addons.Ingress != nil && tc.Spec.Addons.Ingress.Version != "" {
+			traefikVersion = tc.Spec.Addons.Ingress.Version
+		}
+		logger.Info("installing Traefik", "version", traefikVersion)
+		if err := r.Installer.InstallTraefik(ctx, kubeconfigData, traefikVersion); err != nil {
+			logger.Error(err, "failed to install Traefik")
+		} else {
+			addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
+				Name: "traefik", Version: traefikVersion, Status: "Healthy", ManagedBy: "butler",
+			})
+		}
 	} else {
-		addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
-			Name: "traefik", Version: traefikVersion, Status: "Healthy", ManagedBy: "butler",
-		})
+		logger.Info("skipping Traefik installation (disabled by spec)")
 	}
 
 	// Update observed state
