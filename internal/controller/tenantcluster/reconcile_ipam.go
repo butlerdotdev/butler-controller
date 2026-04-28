@@ -196,6 +196,10 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 		return nil
 	}
 
+	// Ensure platform LB services are labeled before counting, so existing
+	// clusters provisioned before the label existed get correct IP accounting.
+	r.ensurePlatformLBLabels(ctx, tenantClient)
+
 	usedIPs, err := r.countUsedLBIPs(ctx, tenantClient)
 	if err != nil {
 		logger.V(1).Info("cannot count used LB IPs, skipping", "error", err)
@@ -354,6 +358,8 @@ func (r *Reconciler) listLBAllocations(ctx context.Context, tc *butlerv1alpha1.T
 }
 
 // countUsedLBIPs counts the number of LoadBalancer services with assigned IPs on a tenant cluster.
+// Platform-managed LB services (labeled with LabelPlatformLB) are excluded since they are
+// infrastructure services whose IPs should not count against tenant workload allocation.
 func (r *Reconciler) countUsedLBIPs(ctx context.Context, tc *tenant.TenantClient) (int32, error) {
 	svcList, err := tc.Clientset.CoreV1().Services("").List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -365,6 +371,9 @@ func (r *Reconciler) countUsedLBIPs(ctx context.Context, tc *tenant.TenantClient
 		if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
 			continue
 		}
+		if svc.Labels[butlerv1alpha1.LabelPlatformLB] == "true" {
+			continue
+		}
 		for _, ing := range svc.Status.LoadBalancer.Ingress {
 			if ing.IP != "" {
 				count++
@@ -373,6 +382,31 @@ func (r *Reconciler) countUsedLBIPs(ctx context.Context, tc *tenant.TenantClient
 		}
 	}
 	return count, nil
+}
+
+// ensurePlatformLBLabels ensures the Traefik service on a tenant cluster has the platform-lb
+// label so that countUsedLBIPs excludes it from usage calculations. This handles existing
+// clusters that were provisioned before the label was added to InstallTraefik.
+func (r *Reconciler) ensurePlatformLBLabels(ctx context.Context, tc *tenant.TenantClient) {
+	logger := log.FromContext(ctx)
+
+	svc, err := tc.Clientset.CoreV1().Services("traefik").Get(ctx, "traefik", metav1.GetOptions{})
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			logger.V(1).Info("ensurePlatformLBLabels: failed to get traefik service", "error", err)
+		}
+		return
+	}
+	if svc.Labels[butlerv1alpha1.LabelPlatformLB] == "true" {
+		return
+	}
+	if svc.Labels == nil {
+		svc.Labels = make(map[string]string)
+	}
+	svc.Labels[butlerv1alpha1.LabelPlatformLB] = "true"
+	if _, err := tc.Clientset.CoreV1().Services("traefik").Update(ctx, svc, metav1.UpdateOptions{}); err != nil {
+		logger.V(1).Info("ensurePlatformLBLabels: failed to patch label", "error", err)
+	}
 }
 
 // updateMetalLBPool configures MetalLB on the tenant cluster with all allocated IP ranges.
