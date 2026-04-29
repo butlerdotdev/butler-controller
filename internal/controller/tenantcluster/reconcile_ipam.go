@@ -6,6 +6,7 @@ package tenantcluster
 import (
 	"context"
 	"fmt"
+	"net"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -200,7 +201,7 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 	// clusters provisioned before the label existed get correct IP accounting.
 	r.ensurePlatformLBLabels(ctx, tenantClient)
 
-	platformCount, tenantCount, err := r.countLBIPs(ctx, tenantClient)
+	platformCount, tenantCount, serviceIPs, err := r.countLBIPs(ctx, tenantClient)
 	if err != nil {
 		logger.V(1).Info("cannot count LB IPs, skipping", "error", err)
 		return nil
@@ -273,8 +274,8 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 		}
 	}
 
-	// Shrink: if we have more than 1 allocation and enough spare IPs
-	if len(allocs) > 1 && availableIPs > growthIncrement {
+	// Shrink: if we have more than 1 allocation and at least one growth-increment of spare capacity
+	if len(allocs) > 1 && availableIPs >= growthIncrement {
 		// Find the newest allocation that is fully unused and older than 10 minutes
 		var shrinkCandidate *butlerv1alpha1.IPAllocation
 		for i := len(allocs) - 1; i >= 1; i-- { // Skip index 0 (initial allocation)
@@ -301,6 +302,9 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 			}
 		}
 	}
+
+	// Reclaim orphan allocations whose IPs are not used by any service on the tenant
+	r.reclaimOrphanAllocations(ctx, allocs, serviceIPs)
 
 	// Update MetalLB pool with all current allocated ranges
 	if err := r.updateMetalLBPool(ctx, tc, butlerConfig, allocs); err != nil {
@@ -362,12 +366,14 @@ func (r *Reconciler) listLBAllocations(ctx context.Context, tc *butlerv1alpha1.T
 // returning separate counts for platform-managed LBs and tenant workload LBs.
 // Platform LBs (labeled with LabelPlatformLB) consume pool capacity but should not
 // be treated as tenant workload demand for growth/shrink decisions.
-func (r *Reconciler) countLBIPs(ctx context.Context, tc *tenant.TenantClient) (platformCount, tenantCount int32, err error) {
+// Also returns the set of all assigned LB IPs for use in orphan detection.
+func (r *Reconciler) countLBIPs(ctx context.Context, tc *tenant.TenantClient) (platformCount, tenantCount int32, serviceIPs map[string]bool, err error) {
 	svcList, err := tc.Clientset.CoreV1().Services("").List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to list services: %w", err)
+		return 0, 0, nil, fmt.Errorf("failed to list services: %w", err)
 	}
 
+	serviceIPs = make(map[string]bool)
 	for _, svc := range svcList.Items {
 		if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
 			continue
@@ -375,8 +381,8 @@ func (r *Reconciler) countLBIPs(ctx context.Context, tc *tenant.TenantClient) (p
 		hasIP := false
 		for _, ing := range svc.Status.LoadBalancer.Ingress {
 			if ing.IP != "" {
+				serviceIPs[ing.IP] = true
 				hasIP = true
-				break
 			}
 		}
 		if !hasIP {
@@ -388,7 +394,7 @@ func (r *Reconciler) countLBIPs(ctx context.Context, tc *tenant.TenantClient) (p
 			tenantCount++
 		}
 	}
-	return platformCount, tenantCount, nil
+	return platformCount, tenantCount, serviceIPs, nil
 }
 
 // ensurePlatformLBLabels ensures the Traefik service on a tenant cluster has the platform-lb
@@ -413,6 +419,71 @@ func (r *Reconciler) ensurePlatformLBLabels(ctx context.Context, tc *tenant.Tena
 	svc.Labels[butlerv1alpha1.LabelPlatformLB] = "true"
 	if _, err := tc.Clientset.CoreV1().Services("traefik").Update(ctx, svc, metav1.UpdateOptions{}); err != nil {
 		logger.V(1).Info("ensurePlatformLBLabels: failed to patch label", "error", err)
+	}
+}
+
+// reclaimOrphanAllocations deletes IPAllocations whose IPs are not used by any
+// LoadBalancer service on the tenant cluster. Only allocations older than 5 minutes
+// are considered, to avoid racing normal allocation propagation.
+func (r *Reconciler) reclaimOrphanAllocations(ctx context.Context, allocs []butlerv1alpha1.IPAllocation, serviceIPs map[string]bool) {
+	logger := log.FromContext(ctx)
+
+	const orphanGracePeriod = 5 * time.Minute
+
+	for i := range allocs {
+		alloc := &allocs[i]
+		if alloc.Status.Phase != butlerv1alpha1.IPAllocationPhaseAllocated {
+			continue
+		}
+		if time.Since(alloc.CreationTimestamp.Time) < orphanGracePeriod {
+			continue
+		}
+		if allocationHasServiceIP(alloc, serviceIPs) {
+			continue
+		}
+		logger.Info("reclaiming orphan IPAllocation",
+			"allocation", alloc.Name,
+			"start", alloc.Status.StartAddress,
+			"end", alloc.Status.EndAddress,
+			"age", time.Since(alloc.CreationTimestamp.Time).Round(time.Second))
+		if err := r.Delete(ctx, alloc); err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to delete orphan IPAllocation", "allocation", alloc.Name)
+		}
+	}
+}
+
+// allocationHasServiceIP returns true if any IP in the allocation's range matches
+// a service IP from the tenant cluster.
+func allocationHasServiceIP(alloc *butlerv1alpha1.IPAllocation, serviceIPs map[string]bool) bool {
+	if alloc.Status.StartAddress == "" {
+		return false
+	}
+	start := net.ParseIP(alloc.Status.StartAddress).To4()
+	end := net.ParseIP(alloc.Status.EndAddress).To4()
+	if start == nil || end == nil {
+		return false
+	}
+	ip := make(net.IP, 4)
+	copy(ip, start)
+	for i := 0; i < 256; i++ { // safety bound
+		if serviceIPs[ip.String()] {
+			return true
+		}
+		if ip.Equal(end) {
+			break
+		}
+		incrementIP(ip)
+	}
+	return false
+}
+
+// incrementIP advances an IPv4 address by one.
+func incrementIP(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
+		}
 	}
 }
 
