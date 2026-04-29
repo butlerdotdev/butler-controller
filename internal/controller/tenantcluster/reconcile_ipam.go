@@ -200,18 +200,19 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 	// clusters provisioned before the label existed get correct IP accounting.
 	r.ensurePlatformLBLabels(ctx, tenantClient)
 
-	usedIPs, err := r.countUsedLBIPs(ctx, tenantClient)
+	platformCount, tenantCount, err := r.countLBIPs(ctx, tenantClient)
 	if err != nil {
-		logger.V(1).Info("cannot count used LB IPs, skipping", "error", err)
+		logger.V(1).Info("cannot count LB IPs, skipping", "error", err)
 		return nil
 	}
 
-	availableIPs := totalAllocated - usedIPs
+	availableIPs := totalAllocated - platformCount - tenantCount
 	growthIncrement := r.getGrowthIncrement(pc)
 
 	logger.V(1).Info("elastic IPAM status",
-		"totalAllocated", totalAllocated, "usedIPs", usedIPs,
-		"availableIPs", availableIPs, "growthIncrement", growthIncrement)
+		"totalAllocated", totalAllocated, "platformLBs", platformCount,
+		"tenantLBs", tenantCount, "availableIPs", availableIPs,
+		"growthIncrement", growthIncrement)
 
 	// Grow: if fewer than 1 IP is available
 	if availableIPs < 1 {
@@ -357,36 +358,42 @@ func (r *Reconciler) listLBAllocations(ctx context.Context, tc *butlerv1alpha1.T
 	return allocList.Items, nil
 }
 
-// countUsedLBIPs counts the number of LoadBalancer services with assigned IPs on a tenant cluster.
-// Platform-managed LB services (labeled with LabelPlatformLB) are excluded since they are
-// infrastructure services whose IPs should not count against tenant workload allocation.
-func (r *Reconciler) countUsedLBIPs(ctx context.Context, tc *tenant.TenantClient) (int32, error) {
+// countLBIPs counts LoadBalancer services with assigned IPs on a tenant cluster,
+// returning separate counts for platform-managed LBs and tenant workload LBs.
+// Platform LBs (labeled with LabelPlatformLB) consume pool capacity but should not
+// be treated as tenant workload demand for growth/shrink decisions.
+func (r *Reconciler) countLBIPs(ctx context.Context, tc *tenant.TenantClient) (platformCount, tenantCount int32, err error) {
 	svcList, err := tc.Clientset.CoreV1().Services("").List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return 0, fmt.Errorf("failed to list services: %w", err)
+		return 0, 0, fmt.Errorf("failed to list services: %w", err)
 	}
 
-	var count int32
 	for _, svc := range svcList.Items {
 		if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
 			continue
 		}
-		if svc.Labels[butlerv1alpha1.LabelPlatformLB] == "true" {
-			continue
-		}
+		hasIP := false
 		for _, ing := range svc.Status.LoadBalancer.Ingress {
 			if ing.IP != "" {
-				count++
+				hasIP = true
 				break
 			}
 		}
+		if !hasIP {
+			continue
+		}
+		if svc.Labels[butlerv1alpha1.LabelPlatformLB] == "true" {
+			platformCount++
+		} else {
+			tenantCount++
+		}
 	}
-	return count, nil
+	return platformCount, tenantCount, nil
 }
 
 // ensurePlatformLBLabels ensures the Traefik service on a tenant cluster has the platform-lb
-// label so that countUsedLBIPs excludes it from usage calculations. This handles existing
-// clusters that were provisioned before the label was added to InstallTraefik.
+// label so that countLBIPs can distinguish platform LBs from tenant workload LBs. This handles
+// existing clusters that were provisioned before the label was added to InstallTraefik.
 func (r *Reconciler) ensurePlatformLBLabels(ctx context.Context, tc *tenant.TenantClient) {
 	logger := log.FromContext(ctx)
 
