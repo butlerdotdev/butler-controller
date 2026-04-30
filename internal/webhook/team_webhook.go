@@ -240,7 +240,9 @@ func environmentLimitsChanged(old, new []butlerv1alpha1.EnvironmentSpec) bool {
 
 // isPlatformAdmin returns true when the user is a platform admin. Primary
 // path: list User CRDs and match on Spec.Email == user.Username; the
-// matching User's Spec.IsPlatformAdmin is the authoritative answer. The
+// matching User's effective platform role is the authoritative answer,
+// checked via IsPlatformAdmin() which honors both the deprecated
+// Spec.IsPlatformAdmin bool and the new Spec.PlatformRole field. The
 // SAR fallback fires only when no User CRD matches the caller's username,
 // which is the case for kubectl-direct operators holding the admin
 // kubeconfig but not mapped to a User CRD. List errors surface to the
@@ -255,7 +257,7 @@ func (v *TeamValidator) isPlatformAdmin(ctx context.Context, user authnv1.UserIn
 	for i := range userList.Items {
 		u := &userList.Items[i]
 		if strings.EqualFold(u.Spec.Email, user.Username) {
-			return u.Spec.IsPlatformAdmin, nil
+			return u.IsPlatformAdmin(), nil
 		}
 	}
 	// No matching User CRD; fall back to the K8s authz model via SAR.
