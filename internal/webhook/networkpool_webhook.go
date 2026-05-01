@@ -19,6 +19,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"net"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -48,7 +49,7 @@ func (v *NetworkPoolValidator) ValidateCreate(_ context.Context, obj runtime.Obj
 }
 
 // ValidateUpdate validates a NetworkPool on update.
-func (v *NetworkPoolValidator) ValidateUpdate(_ context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
+func (v *NetworkPoolValidator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
 	oldPool, ok := oldObj.(*butlerv1alpha1.NetworkPool)
 	if !ok {
 		return nil, fmt.Errorf("expected NetworkPool for old object, got %T", oldObj)
@@ -92,7 +93,100 @@ func (v *NetworkPoolValidator) ValidateUpdate(_ context.Context, oldObj, newObj 
 		}
 	}
 
+	// Validate tenant allocation range narrowing: if the range was narrowed,
+	// ensure no existing IPAllocations have addresses outside the new range.
+	if err := v.validateTenantAllocationNarrowing(ctx, oldPool, newPool); err != nil {
+		return nil, err
+	}
+
 	return nil, nil
+}
+
+// validateTenantAllocationNarrowing rejects narrowing of the tenant allocation
+// range when existing IPAllocations have addresses outside the proposed range.
+func (v *NetworkPoolValidator) validateTenantAllocationNarrowing(ctx context.Context, oldPool, newPool *butlerv1alpha1.NetworkPool) error {
+	if oldPool.Spec.TenantAllocation == nil || newPool.Spec.TenantAllocation == nil {
+		return nil
+	}
+
+	oldStart := oldPool.Spec.TenantAllocation.Start
+	oldEnd := oldPool.Spec.TenantAllocation.End
+	newStart := newPool.Spec.TenantAllocation.Start
+	newEnd := newPool.Spec.TenantAllocation.End
+
+	// If the range didn't change, nothing to validate
+	if oldStart == newStart && oldEnd == newEnd {
+		return nil
+	}
+
+	// Parse new range boundaries
+	newStartIP := net.ParseIP(newStart).To4()
+	newEndIP := net.ParseIP(newEnd).To4()
+	if newStartIP == nil || newEndIP == nil {
+		return nil // validation of IPs themselves is done by validatePoolSpec
+	}
+	newStartUint := ipam.IPToUint32(newStartIP)
+	newEndUint := ipam.IPToUint32(newEndIP)
+
+	// List all IPAllocations referencing this pool
+	var allocList butlerv1alpha1.IPAllocationList
+	if err := v.Client.List(ctx, &allocList, client.MatchingLabels{
+		butlerv1alpha1.LabelNetworkPool: newPool.Name,
+	}); err != nil {
+		return fmt.Errorf("failed to list IPAllocations for pool %q: %w", newPool.Name, err)
+	}
+
+	var allErrs field.ErrorList
+	for i := range allocList.Items {
+		alloc := &allocList.Items[i]
+		if alloc.Status.Phase != butlerv1alpha1.IPAllocationPhaseAllocated {
+			continue
+		}
+
+		// Check each address in the allocation
+		for _, addr := range alloc.Status.Addresses {
+			ip := net.ParseIP(addr).To4()
+			if ip == nil {
+				continue
+			}
+			ipUint := ipam.IPToUint32(ip)
+			if ipUint < newStartUint || ipUint > newEndUint {
+				allErrs = append(allErrs, field.Forbidden(
+					field.NewPath("spec", "tenantAllocation"),
+					fmt.Sprintf(
+						"cannot narrow tenant allocation range: IPAllocation %q has address %s outside the proposed range %s-%s. Migrate or delete affected allocations first",
+						alloc.Name, addr, newStart, newEnd,
+					),
+				))
+				break // one violation per allocation is enough
+			}
+		}
+
+		// Also check start/end addresses for allocations that may not have
+		// Addresses populated (belt and suspenders).
+		if len(alloc.Status.Addresses) == 0 && alloc.Status.StartAddress != "" {
+			startIP := net.ParseIP(alloc.Status.StartAddress).To4()
+			endIP := net.ParseIP(alloc.Status.EndAddress).To4()
+			if startIP != nil && endIP != nil {
+				sUint := ipam.IPToUint32(startIP)
+				eUint := ipam.IPToUint32(endIP)
+				if sUint < newStartUint || eUint > newEndUint {
+					allErrs = append(allErrs, field.Forbidden(
+						field.NewPath("spec", "tenantAllocation"),
+						fmt.Sprintf(
+							"cannot narrow tenant allocation range: IPAllocation %q has addresses %s-%s outside the proposed range %s-%s. Migrate or delete affected allocations first",
+							alloc.Name, alloc.Status.StartAddress, alloc.Status.EndAddress, newStart, newEnd,
+						),
+					))
+				}
+			}
+		}
+	}
+
+	if len(allErrs) > 0 {
+		return allErrs.ToAggregate()
+	}
+	return nil
 }
 
 // ValidateDelete validates a NetworkPool on deletion.

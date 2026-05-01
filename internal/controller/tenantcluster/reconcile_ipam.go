@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"regexp"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -19,6 +20,9 @@ import (
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
 	"github.com/butlerdotdev/butler-controller/internal/tenant"
 )
+
+// growthSuffixPattern matches the "-N" suffix on growth allocation names.
+var growthSuffixPattern = regexp.MustCompile(`-\d+$`)
 
 // reconcileIPAllocation creates or checks LB IPAllocation for IPAM mode providers.
 // Returns true if IPAM is ready (allocated or not needed), false if waiting.
@@ -115,6 +119,7 @@ func (r *Reconciler) reconcileIPAllocation(ctx context.Context, tc *butlerv1alph
 					butlerv1alpha1.LabelTeam:           tc.Namespace,
 					butlerv1alpha1.LabelTenant:         tc.Name,
 					butlerv1alpha1.LabelAllocationType: "loadbalancer",
+					LabelAllocationRole:                AllocationRoleInitial,
 				},
 			},
 			Spec: butlerv1alpha1.IPAllocationSpec{
@@ -179,6 +184,11 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 	if len(allocs) == 0 {
 		return nil // No allocations yet, initial allocation handles this
 	}
+
+	// Migration: label any pre-existing allocations that lack the allocation-role label.
+	// Initial allocations have the pattern <team>-<tenant>-lb (no numeric suffix),
+	// growth allocations have the pattern <team>-<tenant>-lb-<N>.
+	r.migrateAllocationRoleLabels(ctx, allocs, tc)
 
 	// Count total allocated and available IPs
 	var totalAllocated int32
@@ -252,6 +262,7 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 						butlerv1alpha1.LabelTeam:           tc.Namespace,
 						butlerv1alpha1.LabelTenant:         tc.Name,
 						butlerv1alpha1.LabelAllocationType: "loadbalancer",
+						LabelAllocationRole:                AllocationRoleGrowth,
 					},
 				},
 				Spec: butlerv1alpha1.IPAllocationSpec{
@@ -274,12 +285,16 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 		}
 	}
 
-	// Shrink: if we have more than 1 allocation and at least one growth-increment of spare capacity
+	// Shrink: if we have more than 1 allocation and at least one growth-increment of spare capacity.
+	// Only growth allocations are shrink candidates — the initial allocation is never deleted
+	// regardless of its position in the List result (Kubernetes List ordering is undefined).
 	if len(allocs) > 1 && availableIPs >= growthIncrement {
-		// Find the newest allocation that is fully unused and older than 10 minutes
 		var shrinkCandidate *butlerv1alpha1.IPAllocation
-		for i := len(allocs) - 1; i >= 1; i-- { // Skip index 0 (initial allocation)
+		for i := len(allocs) - 1; i >= 0; i-- {
 			alloc := &allocs[i]
+			if alloc.Labels[LabelAllocationRole] != AllocationRoleGrowth {
+				continue
+			}
 			if alloc.Status.Phase != butlerv1alpha1.IPAllocationPhaseAllocated {
 				continue
 			}
@@ -301,6 +316,14 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 				return fmt.Errorf("failed to delete shrink allocation: %w", err)
 			}
 		}
+	}
+
+	// Re-fetch allocations to get a fresh slice. The shrink phase above may
+	// have deleted an allocation, so the original slice is stale. Using stale
+	// data for reclaim or MetalLB pool updates causes brief pool corruption.
+	allocs, err = r.listLBAllocations(ctx, tc)
+	if err != nil {
+		return fmt.Errorf("failed to re-list LB allocations after shrink: %w", err)
 	}
 
 	// Reclaim orphan allocations whose IPs are not used by any service on the tenant
@@ -560,5 +583,48 @@ func (r *Reconciler) cleanupIPAllocations(ctx context.Context, tc *butlerv1alpha
 		} else {
 			logger.Info("deleted elastic IPAllocation during cleanup", "name", alloc.Name)
 		}
+	}
+}
+
+// migrateAllocationRoleLabels is a one-time migration that labels existing
+// IPAllocations that predate the allocation-role label. The name pattern is
+// used to infer the role:
+//
+//	<team>-<tenant>-lb       → initial
+//	<team>-<tenant>-lb-<N>   → growth
+//
+// This runs on every reconcile until all allocations are labeled, at which
+// point it becomes a no-op.
+func (r *Reconciler) migrateAllocationRoleLabels(ctx context.Context, allocs []butlerv1alpha1.IPAllocation, tc *butlerv1alpha1.TenantCluster) {
+	logger := log.FromContext(ctx)
+	initialName := fmt.Sprintf("%s-%s-lb", tc.Namespace, tc.Name)
+
+	for i := range allocs {
+		alloc := &allocs[i]
+		if alloc.Labels[LabelAllocationRole] != "" {
+			continue // already labeled
+		}
+
+		role := AllocationRoleGrowth
+		if alloc.Name == initialName {
+			role = AllocationRoleInitial
+		} else if !growthSuffixPattern.MatchString(alloc.Name) {
+			// Name doesn't match the growth pattern either — treat as initial
+			// for safety (don't allow it to be shrunk).
+			role = AllocationRoleInitial
+		}
+
+		patch := client.MergeFrom(alloc.DeepCopy())
+		if alloc.Labels == nil {
+			alloc.Labels = make(map[string]string)
+		}
+		alloc.Labels[LabelAllocationRole] = role
+		if err := r.Patch(ctx, alloc, patch); err != nil {
+			logger.Error(err, "failed to migrate allocation-role label",
+				"allocation", alloc.Name, "role", role)
+			continue
+		}
+		logger.Info("migrated allocation-role label",
+			"allocation", alloc.Name, "role", role)
 	}
 }

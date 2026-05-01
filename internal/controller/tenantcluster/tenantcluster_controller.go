@@ -45,6 +45,19 @@ import (
 const (
 	ButlerConfigSingletonName = "butler"
 
+	// LabelAllocationRole distinguishes initial vs growth IPAllocations.
+	// The butler-api does not define this label yet, so it lives here until
+	// the next API release.
+	LabelAllocationRole = "butler.butlerlabs.dev/allocation-role"
+
+	// AllocationRoleInitial marks the first IPAllocation created during
+	// reconcileIPAllocation (the "seed" allocation for a new tenant).
+	AllocationRoleInitial = "initial"
+
+	// AllocationRoleGrowth marks IPAllocations created by the elastic IPAM
+	// growth path inside reconcileElasticIPAM.
+	AllocationRoleGrowth = "growth"
+
 	ReasonValidating             = "Validating"
 	ReasonValidationFailed       = "ValidationFailed"
 	ReasonTeamNotFound           = "TeamNotFound"
