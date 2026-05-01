@@ -285,12 +285,16 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 		}
 	}
 
-	// Shrink: if we have more than 1 allocation and at least one growth-increment of spare capacity
+	// Shrink: if we have more than 1 allocation and at least one growth-increment of spare capacity.
+	// Only growth allocations are shrink candidates — the initial allocation is never deleted
+	// regardless of its position in the List result (Kubernetes List ordering is undefined).
 	if len(allocs) > 1 && availableIPs >= growthIncrement {
-		// Find the newest allocation that is fully unused and older than 10 minutes
 		var shrinkCandidate *butlerv1alpha1.IPAllocation
-		for i := len(allocs) - 1; i >= 1; i-- { // Skip index 0 (initial allocation)
+		for i := len(allocs) - 1; i >= 0; i-- {
 			alloc := &allocs[i]
+			if alloc.Labels[LabelAllocationRole] != AllocationRoleGrowth {
+				continue
+			}
 			if alloc.Status.Phase != butlerv1alpha1.IPAllocationPhaseAllocated {
 				continue
 			}
