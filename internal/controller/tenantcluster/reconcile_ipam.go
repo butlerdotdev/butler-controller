@@ -115,6 +115,7 @@ func (r *Reconciler) reconcileIPAllocation(ctx context.Context, tc *butlerv1alph
 					butlerv1alpha1.LabelTeam:           tc.Namespace,
 					butlerv1alpha1.LabelTenant:         tc.Name,
 					butlerv1alpha1.LabelAllocationType: "loadbalancer",
+					LabelAllocationRole:                AllocationRoleInitial,
 				},
 			},
 			Spec: butlerv1alpha1.IPAllocationSpec{
@@ -252,6 +253,7 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 						butlerv1alpha1.LabelTeam:           tc.Namespace,
 						butlerv1alpha1.LabelTenant:         tc.Name,
 						butlerv1alpha1.LabelAllocationType: "loadbalancer",
+						LabelAllocationRole:                AllocationRoleGrowth,
 					},
 				},
 				Spec: butlerv1alpha1.IPAllocationSpec{
