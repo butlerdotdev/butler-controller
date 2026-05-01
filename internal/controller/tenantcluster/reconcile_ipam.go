@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"regexp"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -19,6 +20,9 @@ import (
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
 	"github.com/butlerdotdev/butler-controller/internal/tenant"
 )
+
+// growthSuffixPattern matches the "-N" suffix on growth allocation names.
+var growthSuffixPattern = regexp.MustCompile(`-\d+$`)
 
 // reconcileIPAllocation creates or checks LB IPAllocation for IPAM mode providers.
 // Returns true if IPAM is ready (allocated or not needed), false if waiting.
@@ -180,6 +184,11 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 	if len(allocs) == 0 {
 		return nil // No allocations yet, initial allocation handles this
 	}
+
+	// Migration: label any pre-existing allocations that lack the allocation-role label.
+	// Initial allocations have the pattern <team>-<tenant>-lb (no numeric suffix),
+	// growth allocations have the pattern <team>-<tenant>-lb-<N>.
+	r.migrateAllocationRoleLabels(ctx, allocs, tc)
 
 	// Count total allocated and available IPs
 	var totalAllocated int32
@@ -562,5 +571,48 @@ func (r *Reconciler) cleanupIPAllocations(ctx context.Context, tc *butlerv1alpha
 		} else {
 			logger.Info("deleted elastic IPAllocation during cleanup", "name", alloc.Name)
 		}
+	}
+}
+
+// migrateAllocationRoleLabels is a one-time migration that labels existing
+// IPAllocations that predate the allocation-role label. The name pattern is
+// used to infer the role:
+//
+//	<team>-<tenant>-lb       → initial
+//	<team>-<tenant>-lb-<N>   → growth
+//
+// This runs on every reconcile until all allocations are labeled, at which
+// point it becomes a no-op.
+func (r *Reconciler) migrateAllocationRoleLabels(ctx context.Context, allocs []butlerv1alpha1.IPAllocation, tc *butlerv1alpha1.TenantCluster) {
+	logger := log.FromContext(ctx)
+	initialName := fmt.Sprintf("%s-%s-lb", tc.Namespace, tc.Name)
+
+	for i := range allocs {
+		alloc := &allocs[i]
+		if alloc.Labels[LabelAllocationRole] != "" {
+			continue // already labeled
+		}
+
+		role := AllocationRoleGrowth
+		if alloc.Name == initialName {
+			role = AllocationRoleInitial
+		} else if !growthSuffixPattern.MatchString(alloc.Name) {
+			// Name doesn't match the growth pattern either — treat as initial
+			// for safety (don't allow it to be shrunk).
+			role = AllocationRoleInitial
+		}
+
+		patch := client.MergeFrom(alloc.DeepCopy())
+		if alloc.Labels == nil {
+			alloc.Labels = make(map[string]string)
+		}
+		alloc.Labels[LabelAllocationRole] = role
+		if err := r.Patch(ctx, alloc, patch); err != nil {
+			logger.Error(err, "failed to migrate allocation-role label",
+				"allocation", alloc.Name, "role", role)
+			continue
+		}
+		logger.Info("migrated allocation-role label",
+			"allocation", alloc.Name, "role", role)
 	}
 }
