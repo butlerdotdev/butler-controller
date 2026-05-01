@@ -318,6 +318,14 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 		}
 	}
 
+	// Re-fetch allocations to get a fresh slice. The shrink phase above may
+	// have deleted an allocation, so the original slice is stale. Using stale
+	// data for reclaim or MetalLB pool updates causes brief pool corruption.
+	allocs, err = r.listLBAllocations(ctx, tc)
+	if err != nil {
+		return fmt.Errorf("failed to re-list LB allocations after shrink: %w", err)
+	}
+
 	// Reclaim orphan allocations whose IPs are not used by any service on the tenant
 	r.reclaimOrphanAllocations(ctx, allocs, serviceIPs)
 
