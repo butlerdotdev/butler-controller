@@ -22,8 +22,15 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
+	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -600,57 +607,172 @@ spec:
 	return nil
 }
 
-// UpdateMetalLBPool updates the MetalLB IPAddressPool with the given address ranges.
-// This is used by elastic IPAM to configure multiple address ranges.
+// metallbFieldManager is the SSA field manager identity for Butler IPAM-managed
+// MetalLB resources. Other field managers (manual edits, Flux, etc.) will have
+// their fields overwritten on the next reconcile.
+const metallbFieldManager = "butler-controller/ipam"
+
+var (
+	metallbPoolGVR = schema.GroupVersionResource{
+		Group:    "metallb.io",
+		Version:  "v1beta1",
+		Resource: "ipaddresspools",
+	}
+	metallbL2AdvGVR = schema.GroupVersionResource{
+		Group:    "metallb.io",
+		Version:  "v1beta1",
+		Resource: "l2advertisements",
+	}
+)
+
+// UpdateMetalLBPool updates the MetalLB IPAddressPool and L2Advertisement on a
+// tenant cluster using server-side apply. Retries transient failures with
+// exponential backoff and verifies the applied state via read-back.
 func (i *Installer) UpdateMetalLBPool(ctx context.Context, kubeconfig []byte, ranges []string) error {
 	logger := log.FromContext(ctx)
 
-	kubeconfigPath, cleanup, err := i.writeKubeconfig(kubeconfig)
+	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
 	if err != nil {
+		return fmt.Errorf("failed to parse tenant kubeconfig: %w", err)
+	}
+	restConfig.Timeout = 30 * time.Second
+
+	dynClient, err := dynamic.NewForConfig(restConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+
+	// Build the IPAddressPool object
+	addresses := make([]interface{}, len(ranges))
+	for i, r := range ranges {
+		addresses[i] = r
+	}
+
+	pool := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "metallb.io/v1beta1",
+			"kind":       "IPAddressPool",
+			"metadata": map[string]interface{}{
+				"name":      "default-pool",
+				"namespace": "metallb-system",
+			},
+			"spec": map[string]interface{}{
+				"addresses": addresses,
+			},
+		},
+	}
+
+	// Build the L2Advertisement object
+	l2Adv := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "metallb.io/v1beta1",
+			"kind":       "L2Advertisement",
+			"metadata": map[string]interface{}{
+				"name":      "default",
+				"namespace": "metallb-system",
+			},
+			"spec": map[string]interface{}{
+				"ipAddressPools": []interface{}{"default-pool"},
+			},
+		},
+	}
+
+	applyOpts := metav1.ApplyOptions{FieldManager: metallbFieldManager, Force: true}
+
+	// Apply IPAddressPool with retry
+	if err := applyWithRetry(ctx, func(ctx context.Context) error {
+		_, err := dynClient.Resource(metallbPoolGVR).Namespace("metallb-system").
+			Apply(ctx, "default-pool", pool, applyOpts)
 		return err
-	}
-	defer cleanup()
-
-	// Build addresses YAML list
-	var addressLines string
-	for _, r := range ranges {
-		addressLines += fmt.Sprintf("    - %s\n", r)
+	}); err != nil {
+		return fmt.Errorf("failed to apply MetalLB IPAddressPool: %w", err)
 	}
 
-	poolManifest := fmt.Sprintf(`apiVersion: metallb.io/v1beta1
-kind: IPAddressPool
-metadata:
-  name: default-pool
-  namespace: metallb-system
-spec:
-  addresses:
-%s---
-apiVersion: metallb.io/v1beta1
-kind: L2Advertisement
-metadata:
-  name: default
-  namespace: metallb-system
-spec:
-  ipAddressPools:
-    - default-pool
-`, addressLines)
-
-	tmpFile, err := os.CreateTemp("", "metallb-pool-*.yaml")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
+	// Verify the pool was applied correctly
+	if err := verifyMetalLBPool(ctx, dynClient, ranges); err != nil {
+		logger.Error(err, "MetalLB pool read-back verification failed")
+		// Non-fatal: the apply succeeded, but we couldn't verify. Log and continue.
 	}
-	defer os.Remove(tmpFile.Name())
 
-	if _, err := tmpFile.WriteString(poolManifest); err != nil {
-		return fmt.Errorf("failed to write pool manifest: %w", err)
-	}
-	tmpFile.Close()
-
-	if err := i.runKubectl(ctx, kubeconfigPath, "apply", "-f", tmpFile.Name()); err != nil {
-		return fmt.Errorf("failed to apply MetalLB pool: %w", err)
+	// Apply L2Advertisement with retry
+	if err := applyWithRetry(ctx, func(ctx context.Context) error {
+		_, err := dynClient.Resource(metallbL2AdvGVR).Namespace("metallb-system").
+			Apply(ctx, "default", l2Adv, applyOpts)
+		return err
+	}); err != nil {
+		return fmt.Errorf("failed to apply MetalLB L2Advertisement: %w", err)
 	}
 
 	logger.Info("updated MetalLB IP pool", "ranges", ranges)
+	return nil
+}
+
+// applyWithRetry retries fn with exponential backoff on transient failures.
+// Backoff schedule: 1s, 2s, 4s (3 retries). Respects context cancellation.
+func applyWithRetry(ctx context.Context, fn func(ctx context.Context) error) error {
+	var lastErr error
+	backoff := 1 * time.Second
+
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("context cancelled during retry: %w", lastErr)
+			case <-time.After(backoff):
+				backoff *= 2
+			}
+		}
+
+		lastErr = fn(ctx)
+		if lastErr == nil {
+			return nil
+		}
+	}
+	return lastErr
+}
+
+// verifyMetalLBPool reads back the IPAddressPool and compares its addresses
+// against the expected ranges. Returns an error if they don't match.
+func verifyMetalLBPool(ctx context.Context, dynClient dynamic.Interface, expectedRanges []string) error {
+	result, err := dynClient.Resource(metallbPoolGVR).Namespace("metallb-system").
+		Get(ctx, "default-pool", metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read-back GET failed: %w", err)
+	}
+
+	spec, ok := result.Object["spec"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("read-back: missing or invalid spec")
+	}
+
+	addrs, ok := spec["addresses"].([]interface{})
+	if !ok {
+		return fmt.Errorf("read-back: missing or invalid spec.addresses")
+	}
+
+	actual := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		s, ok := a.(string)
+		if !ok {
+			return fmt.Errorf("read-back: non-string address entry")
+		}
+		actual = append(actual, s)
+	}
+
+	expected := make([]string, len(expectedRanges))
+	copy(expected, expectedRanges)
+	sort.Strings(expected)
+	sort.Strings(actual)
+
+	if len(actual) != len(expected) {
+		return fmt.Errorf("read-back: address count mismatch: got %d, want %d", len(actual), len(expected))
+	}
+	for i := range expected {
+		if actual[i] != expected[i] {
+			return fmt.Errorf("read-back: address mismatch at index %d: got %q, want %q", i, actual[i], expected[i])
+		}
+	}
+
 	return nil
 }
 
