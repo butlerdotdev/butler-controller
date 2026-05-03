@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -38,12 +39,29 @@ import (
 	"github.com/butlerdotdev/butler-controller/internal/ipam"
 )
 
+const (
+	// Capacity event reasons
+	reasonCapacityWarning   = "PoolCapacityWarning"
+	reasonCapacityCritical  = "PoolCapacityCritical"
+	reasonCapacityExhausted = "PoolCapacityExhausted"
+	reasonCapacityRecovered = "PoolCapacityRecovered"
+
+	// capacityEventInterval is the minimum time between repeated events
+	// of the same tier for the same pool.
+	capacityEventInterval = 10 * time.Minute
+)
+
 // Reconciler reconciles a NetworkPool object.
-// It is the sole allocator — it processes Pending IPAllocations.
+// It is the sole allocator -- it processes Pending IPAllocations.
 type Reconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
+
+	// lastEventTimes tracks when each capacity event tier was last emitted
+	// per pool, for rate limiting. Key format: "poolName/reason".
+	// Populated lazily; safe to leave zero-valued.
+	lastEventTimes sync.Map
 }
 
 // +kubebuilder:rbac:groups=butler.butlerlabs.dev,resources=networkpools,verbs=get;list;watch;update;patch
@@ -421,23 +439,78 @@ func (r *Reconciler) updatePoolStatus(ctx context.Context, pool *butlerv1alpha1.
 	poolFragmentationPercent.WithLabelValues(labels...).Set(float64(fragInfo.FragmentationPercent))
 	poolLargestFreeBlock.WithLabelValues(labels...).Set(float64(fragInfo.LargestFreeBlock))
 
-	// Emit capacity warning events at thresholds
+	// Emit tiered capacity events with rate limiting (one per tier per 10 minutes)
 	if totalIPs > 0 {
 		usagePercent := float64(allocatedIPs) / float64(totalIPs) * 100
-		switch {
-		case availableIPs == 0:
-			r.Recorder.Eventf(pool, "Warning", "PoolExhausted",
-				"NetworkPool is fully exhausted (%d/%d IPs allocated)", allocatedIPs, totalIPs)
-		case usagePercent >= 90:
-			r.Recorder.Eventf(pool, "Warning", "PoolCapacityDanger",
-				"NetworkPool is over 90%% utilized (%d/%d IPs allocated)", allocatedIPs, totalIPs)
-		case usagePercent >= 80:
-			r.Recorder.Eventf(pool, "Warning", "PoolCapacityWarning",
-				"NetworkPool is over 80%% utilized (%d/%d IPs allocated)", allocatedIPs, totalIPs)
-		}
+		r.emitCapacityEvents(pool, usagePercent, allocatedIPs, totalIPs)
 	}
 
 	return r.Status().Update(ctx, pool)
+}
+
+// emitCapacityEvents emits tiered capacity events with rate limiting.
+// Thresholds: Warning at 70%, Critical at 85%, Exhausted at 95%.
+// Emits a recovery event when utilization drops below all thresholds
+// after a previous warning was emitted.
+func (r *Reconciler) emitCapacityEvents(pool *butlerv1alpha1.NetworkPool, usagePercent float64, allocated, total int32) {
+	type tier struct {
+		threshold float64
+		reason    string
+		message   string
+	}
+
+	tiers := []tier{
+		{95, reasonCapacityExhausted, "NetworkPool is over 95%% utilized (%d/%d IPs allocated)"},
+		{85, reasonCapacityCritical, "NetworkPool is over 85%% utilized (%d/%d IPs allocated)"},
+		{70, reasonCapacityWarning, "NetworkPool is over 70%% utilized (%d/%d IPs allocated)"},
+	}
+
+	emitted := false
+	for _, t := range tiers {
+		if usagePercent >= t.threshold {
+			if r.shouldEmitEvent(pool.Name, t.reason) {
+				r.Recorder.Eventf(pool, "Warning", t.reason,
+					t.message, allocated, total)
+			}
+			emitted = true
+			break // Only emit the highest matching tier
+		}
+	}
+
+	// If no tier matched and we previously emitted a warning, emit recovery
+	if !emitted && r.hasPreviousEvent(pool.Name) {
+		if r.shouldEmitEvent(pool.Name, reasonCapacityRecovered) {
+			r.Recorder.Eventf(pool, "Normal", reasonCapacityRecovered,
+				"NetworkPool utilization recovered below 70%% (%d/%d IPs allocated)", allocated, total)
+		}
+	}
+}
+
+// shouldEmitEvent returns true if enough time has passed since the last event
+// of the given reason for the given pool. Updates the timestamp on emit.
+func (r *Reconciler) shouldEmitEvent(poolName, reason string) bool {
+	key := poolName + "/" + reason
+	now := time.Now()
+
+	if v, ok := r.lastEventTimes.Load(key); ok {
+		if last, ok := v.(time.Time); ok && now.Sub(last) < capacityEventInterval {
+			return false
+		}
+	}
+
+	r.lastEventTimes.Store(key, now)
+	return true
+}
+
+// hasPreviousEvent returns true if any capacity warning tier was previously
+// emitted for this pool (used to decide whether to emit a recovery event).
+func (r *Reconciler) hasPreviousEvent(poolName string) bool {
+	for _, reason := range []string{reasonCapacityWarning, reasonCapacityCritical, reasonCapacityExhausted} {
+		if _, ok := r.lastEventTimes.Load(poolName + "/" + reason); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // gcOrphanedAllocations deletes IPAllocations whose tenantClusterRef points
