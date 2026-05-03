@@ -39,7 +39,7 @@ Phase 1 improved observability and propagation speed. Phase 2, described by this
 
 The current system makes growth and shrink decisions based on speculative accounting. It mixes management-side state (IPAllocation.Spec.Count) with tenant-side state (LB Service counts) and triggers allocations based on arithmetic projections rather than observed demand. When the arithmetic has no stable equilibrium (as with `growthIncrement=1`), the system oscillates.
 
-The analysis behind this ADR is documented in the IPAM Redesign Plan, which includes a full current-state inventory of all IPAM components, a catalog of 10 known problems with severity and frequency assessments, functional and non-functional requirements, architectural premises, and five architecture decisions with recommended options. This ADR synthesizes Decisions 1, 2, and 3 from that plan into a design that will guide Phase 2 implementation.
+The analysis behind this ADR is documented in the IPAM Redesign Plan, which includes a full current-state inventory of all IPAM components, a catalog of 10 known problems with severity and frequency assessments, functional and non-functional requirements, architectural premises, and five architecture decisions with recommended options. This ADR synthesizes the allocation trigger, authority model, and state recovery decisions from that plan into a design that will guide Phase 2 implementation.
 
 ## Decision
 
