@@ -34,8 +34,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
 	"github.com/butlerdotdev/butler-controller/internal/addons"
@@ -387,9 +389,32 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Namespace{}).
 		Owns(&corev1.Secret{}).
 		Owns(&rbacv1.RoleBinding{}).
+		Watches(&butlerv1alpha1.IPAllocation{},
+			handler.EnqueueRequestsFromMapFunc(r.mapIPAllocationToTenantCluster),
+		).
 		Named("tenantcluster").
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: r.MaxConcurrentReconciles,
 		}).
 		Complete(r)
+}
+
+// mapIPAllocationToTenantCluster maps an IPAllocation to its owning TenantCluster
+// so that IPAM state changes (Pending -> Allocated, deletion, etc.) trigger a
+// TenantCluster reconcile without waiting for the timer-based requeue.
+func (r *Reconciler) mapIPAllocationToTenantCluster(_ context.Context, obj client.Object) []reconcile.Request {
+	alloc, ok := obj.(*butlerv1alpha1.IPAllocation)
+	if !ok {
+		return nil
+	}
+	ref := alloc.Spec.TenantClusterRef
+	if ref.Name == "" || ref.Namespace == "" {
+		return nil
+	}
+	return []reconcile.Request{
+		{NamespacedName: client.ObjectKey{
+			Name:      ref.Name,
+			Namespace: ref.Namespace,
+		}},
+	}
 }
