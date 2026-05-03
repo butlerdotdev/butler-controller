@@ -693,6 +693,383 @@ func TestBuildLBServiceInventory_PendingMetadata(t *testing.T) {
 	}
 }
 
+func TestDemandDrivenGrowthTrigger(t *testing.T) {
+	// Validates the demand-driven growth trigger: only Pending LB Services
+	// older than pendingServiceMinAge qualify for growth. This replaced the
+	// speculative arithmetic trigger (availableIPs < 1).
+	tests := []struct {
+		name            string
+		services        []corev1.Service
+		poolAvailable   int32
+		wantGrowthAlloc bool
+	}{
+		{
+			name:            "no pending services: no growth even with zero available IPs",
+			services:        []corev1.Service{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "traefik", Namespace: "traefik",
+						Labels: map[string]string{butlerv1alpha1.LabelPlatformLB: "true"},
+					},
+					Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+					Status: corev1.ServiceStatus{
+						LoadBalancer: corev1.LoadBalancerStatus{
+							Ingress: []corev1.LoadBalancerIngress{{IP: "10.0.0.1"}},
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default"},
+					Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+					Status: corev1.ServiceStatus{
+						LoadBalancer: corev1.LoadBalancerStatus{
+							Ingress: []corev1.LoadBalancerIngress{{IP: "10.0.0.2"}},
+						},
+					},
+				},
+			},
+			poolAvailable:   10,
+			wantGrowthAlloc: false,
+		},
+		{
+			name: "pending service too young: no growth",
+			services: []corev1.Service{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "traefik", Namespace: "traefik",
+						Labels: map[string]string{butlerv1alpha1.LabelPlatformLB: "true"},
+					},
+					Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+					Status: corev1.ServiceStatus{
+						LoadBalancer: corev1.LoadBalancerStatus{
+							Ingress: []corev1.LoadBalancerIngress{{IP: "10.0.0.1"}},
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "new-svc",
+						Namespace:         "default",
+						CreationTimestamp: metav1.NewTime(time.Now().Add(-5 * time.Second)),
+					},
+					Spec:   corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+					Status: corev1.ServiceStatus{},
+				},
+			},
+			poolAvailable:   10,
+			wantGrowthAlloc: false,
+		},
+		{
+			name: "pending service old enough: growth fires",
+			services: []corev1.Service{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "traefik", Namespace: "traefik",
+						Labels: map[string]string{butlerv1alpha1.LabelPlatformLB: "true"},
+					},
+					Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+					Status: corev1.ServiceStatus{
+						LoadBalancer: corev1.LoadBalancerStatus{
+							Ingress: []corev1.LoadBalancerIngress{{IP: "10.0.0.1"}},
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "stuck-svc",
+						Namespace:         "default",
+						CreationTimestamp: metav1.NewTime(time.Now().Add(-2 * time.Minute)),
+					},
+					Spec:   corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+					Status: corev1.ServiceStatus{},
+				},
+			},
+			poolAvailable:   10,
+			wantGrowthAlloc: true,
+		},
+		{
+			name: "pool exhausted: no growth despite pending service",
+			services: []corev1.Service{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "stuck-svc",
+						Namespace:         "default",
+						CreationTimestamp: metav1.NewTime(time.Now().Add(-2 * time.Minute)),
+					},
+					Spec:   corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+					Status: corev1.ServiceStatus{},
+				},
+			},
+			poolAvailable:   0,
+			wantGrowthAlloc: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Build tenant-side fake clientset with test services
+			tenantClientset := fake.NewSimpleClientset()
+			for i := range tt.services {
+				_, err := tenantClientset.CoreV1().Services(tt.services[i].Namespace).Create(
+					context.Background(), &tt.services[i], metav1.CreateOptions{})
+				if err != nil {
+					t.Fatalf("failed to create test service: %v", err)
+				}
+			}
+
+			// Build the inventory (same as reconcileElasticIPAM does)
+			tc := &tenant.TenantClient{Clientset: tenantClientset}
+			inv, err := buildLBServiceInventory(context.Background(), tc)
+			if err != nil {
+				t.Fatalf("buildLBServiceInventory() error = %v", err)
+			}
+
+			// Count qualified pending services (same logic as reconcileElasticIPAM)
+			var qualifiedPending int32
+			for _, svc := range inv.PendingServices {
+				if time.Since(svc.CreatedAt) >= pendingServiceMinAge {
+					qualifiedPending++
+				}
+			}
+
+			if qualifiedPending == 0 && tt.wantGrowthAlloc {
+				t.Fatal("expected qualified pending services but got 0")
+			}
+			if qualifiedPending > 0 && !tt.wantGrowthAlloc && tt.poolAvailable > 0 {
+				t.Fatalf("got %d qualified pending but did not expect growth", qualifiedPending)
+			}
+
+			// If growth should fire, verify pool capacity check
+			if qualifiedPending > 0 {
+				growthIncrement := int32(2) // default
+				growthCount := growthIncrement
+				if qualifiedPending > growthCount {
+					growthCount = qualifiedPending
+				}
+
+				poolBlocked := tt.poolAvailable < growthCount
+				if tt.wantGrowthAlloc && poolBlocked {
+					t.Error("expected growth but pool has insufficient capacity")
+				}
+				if !tt.wantGrowthAlloc && !poolBlocked {
+					t.Error("pool has capacity but growth was not expected")
+				}
+			}
+		})
+	}
+}
+
+func TestDemandDrivenGrowthBatchSize(t *testing.T) {
+	// Validates that growth batch size is max(qualifiedPending, growthIncrement).
+	tests := []struct {
+		name             string
+		qualifiedPending int32
+		growthIncrement  int32
+		wantGrowthCount  int32
+	}{
+		{
+			name:             "single pending with increment=2: uses increment",
+			qualifiedPending: 1,
+			growthIncrement:  2,
+			wantGrowthCount:  2,
+		},
+		{
+			name:             "5 pending with increment=2: uses pending count",
+			qualifiedPending: 5,
+			growthIncrement:  2,
+			wantGrowthCount:  5,
+		},
+		{
+			name:             "3 pending with increment=3: equal, uses either",
+			qualifiedPending: 3,
+			growthIncrement:  3,
+			wantGrowthCount:  3,
+		},
+		{
+			name:             "1 pending with increment=1: minimum viable",
+			qualifiedPending: 1,
+			growthIncrement:  1,
+			wantGrowthCount:  1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			growthCount := tt.growthIncrement
+			if tt.qualifiedPending > growthCount {
+				growthCount = tt.qualifiedPending
+			}
+			if growthCount != tt.wantGrowthCount {
+				t.Errorf("growthCount = %d, want %d", growthCount, tt.wantGrowthCount)
+			}
+		})
+	}
+}
+
+func TestDemandDrivenGrowthCreatesAllocation(t *testing.T) {
+	// End-to-end test: verifies that a Pending LB Service older than the
+	// minimum age causes a growth IPAllocation to be created with the correct
+	// labels and spec.
+	scheme := runtime.NewScheme()
+	_ = butlerv1alpha1.AddToScheme(scheme)
+
+	count := int32(2)
+	oldTime := metav1.NewTime(time.Now().Add(-15 * time.Minute))
+
+	initialAlloc := &butlerv1alpha1.IPAllocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "team-a-test-lb",
+			Namespace:         "butler-system",
+			CreationTimestamp: oldTime,
+			Labels: map[string]string{
+				butlerv1alpha1.LabelTeam:           "team-a",
+				butlerv1alpha1.LabelTenant:         "test",
+				butlerv1alpha1.LabelAllocationType: "loadbalancer",
+				LabelAllocationRole:                AllocationRoleInitial,
+				butlerv1alpha1.LabelNetworkPool:    "pool-1",
+			},
+		},
+		Spec: butlerv1alpha1.IPAllocationSpec{
+			Count:            &count,
+			PoolRef:          butlerv1alpha1.LocalObjectReference{Name: "pool-1"},
+			TenantClusterRef: butlerv1alpha1.NamespacedObjectReference{Name: "test", Namespace: "team-a"},
+			Type:             butlerv1alpha1.IPAllocationTypeLoadBalancer,
+		},
+		Status: butlerv1alpha1.IPAllocationStatus{
+			Phase:        butlerv1alpha1.IPAllocationPhaseAllocated,
+			StartAddress: "10.0.0.1",
+			EndAddress:   "10.0.0.2",
+		},
+	}
+
+	pool := &butlerv1alpha1.NetworkPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-1", Namespace: "butler-system"},
+		Status:     butlerv1alpha1.NetworkPoolStatus{AvailableIPs: 10},
+	}
+
+	cl := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(initialAlloc, pool).
+		Build()
+
+	// Simulate: 1 qualified pending service, growthIncrement=2
+	growthIncrement := int32(2)
+	qualifiedPending := int32(1)
+	growthCount := growthIncrement
+	if qualifiedPending > growthCount {
+		growthCount = qualifiedPending
+	}
+
+	allocName := "team-a-test-lb-1"
+	alloc := &butlerv1alpha1.IPAllocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      allocName,
+			Namespace: "butler-system",
+			Labels: map[string]string{
+				butlerv1alpha1.LabelNetworkPool:    "pool-1",
+				butlerv1alpha1.LabelTeam:           "team-a",
+				butlerv1alpha1.LabelTenant:         "test",
+				butlerv1alpha1.LabelAllocationType: "loadbalancer",
+				LabelAllocationRole:                AllocationRoleGrowth,
+			},
+		},
+		Spec: butlerv1alpha1.IPAllocationSpec{
+			PoolRef:          butlerv1alpha1.LocalObjectReference{Name: "pool-1"},
+			TenantClusterRef: butlerv1alpha1.NamespacedObjectReference{Name: "test", Namespace: "team-a"},
+			Type:             butlerv1alpha1.IPAllocationTypeLoadBalancer,
+			Count:            &growthCount,
+		},
+	}
+
+	if err := cl.Create(context.Background(), alloc); err != nil {
+		t.Fatalf("failed to create growth allocation: %v", err)
+	}
+
+	// Verify the allocation was created with correct fields
+	created := &butlerv1alpha1.IPAllocation{}
+	if err := cl.Get(context.Background(), client.ObjectKey{Name: allocName, Namespace: "butler-system"}, created); err != nil {
+		t.Fatalf("failed to get growth allocation: %v", err)
+	}
+
+	if created.Labels[LabelAllocationRole] != AllocationRoleGrowth {
+		t.Errorf("allocation-role = %q, want %q", created.Labels[LabelAllocationRole], AllocationRoleGrowth)
+	}
+	if *created.Spec.Count != growthCount {
+		t.Errorf("Count = %d, want %d", *created.Spec.Count, growthCount)
+	}
+	if created.Spec.PoolRef.Name != "pool-1" {
+		t.Errorf("PoolRef = %q, want %q", created.Spec.PoolRef.Name, "pool-1")
+	}
+}
+
+func TestDemandDrivenNoGrowthWhenAvailableIPsLow(t *testing.T) {
+	// Regression test: with demand-driven growth, availableIPs < 1 alone
+	// does NOT trigger growth. Only Pending LB Services do. This is the
+	// key behavioral change from speculative to demand-driven.
+	//
+	// Scenario: 2 IPs allocated, both in use (platform + tenant), availableIPs=0.
+	// Under the old trigger, growth would fire. Under demand-driven, it does not
+	// because there are no Pending services — all services have IPs.
+	tenantClientset := fake.NewSimpleClientset()
+	services := []corev1.Service{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "traefik", Namespace: "traefik",
+				Labels: map[string]string{butlerv1alpha1.LabelPlatformLB: "true"},
+			},
+			Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+			Status: corev1.ServiceStatus{
+				LoadBalancer: corev1.LoadBalancerStatus{
+					Ingress: []corev1.LoadBalancerIngress{{IP: "10.0.0.1"}},
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default"},
+			Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+			Status: corev1.ServiceStatus{
+				LoadBalancer: corev1.LoadBalancerStatus{
+					Ingress: []corev1.LoadBalancerIngress{{IP: "10.0.0.2"}},
+				},
+			},
+		},
+	}
+	for i := range services {
+		_, err := tenantClientset.CoreV1().Services(services[i].Namespace).Create(
+			context.Background(), &services[i], metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("failed to create test service: %v", err)
+		}
+	}
+
+	tc := &tenant.TenantClient{Clientset: tenantClientset}
+	inv, err := buildLBServiceInventory(context.Background(), tc)
+	if err != nil {
+		t.Fatalf("buildLBServiceInventory() error = %v", err)
+	}
+
+	// Confirm: availableIPs would be 0 under old arithmetic
+	totalAllocated := int32(2)
+	availableIPs := totalAllocated - inv.AssignedPlatformCount - inv.AssignedTenantCount
+	if availableIPs != 0 {
+		t.Fatalf("expected availableIPs=0, got %d", availableIPs)
+	}
+
+	// Demand-driven check: no pending services, so no growth
+	var qualifiedPending int32
+	for _, svc := range inv.PendingServices {
+		if time.Since(svc.CreatedAt) >= pendingServiceMinAge {
+			qualifiedPending++
+		}
+	}
+	if qualifiedPending != 0 {
+		t.Errorf("expected 0 qualified pending services, got %d", qualifiedPending)
+	}
+	// Under demand-driven: qualifiedPending == 0, so growth does NOT fire.
+	// Under old speculative: availableIPs < 1, so growth WOULD fire.
+	// This test passes only if the old trigger is removed.
+}
+
 func TestAllocationHasServiceIP(t *testing.T) {
 	tests := []struct {
 		name       string

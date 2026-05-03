@@ -21,6 +21,11 @@ import (
 	"github.com/butlerdotdev/butler-controller/internal/tenant"
 )
 
+// pendingServiceMinAge is the minimum age a Pending LB Service must reach
+// before it qualifies as demand for a growth allocation. This avoids racing
+// with MetalLB's normal IP assignment, which typically completes in seconds.
+const pendingServiceMinAge = 30 * time.Second
+
 // growthSuffixPattern matches the "-N" suffix on growth allocation names.
 var growthSuffixPattern = regexp.MustCompile(`-\d+$`)
 
@@ -211,11 +216,14 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 	// clusters provisioned before the label existed get correct IP accounting.
 	r.ensurePlatformLBLabels(ctx, tenantClient)
 
-	platformCount, tenantCount, serviceIPs, err := r.countLBIPs(ctx, tenantClient)
+	inv, err := buildLBServiceInventory(ctx, tenantClient)
 	if err != nil {
-		logger.V(1).Info("cannot count LB IPs, skipping", "error", err)
+		logger.V(1).Info("cannot build LB service inventory, skipping", "error", err)
 		return nil
 	}
+	platformCount := inv.AssignedPlatformCount
+	tenantCount := inv.AssignedTenantCount
+	serviceIPs := inv.ServiceIPs
 
 	availableIPs := totalAllocated - platformCount - tenantCount
 	growthIncrement := r.getGrowthIncrement(pc)
@@ -223,16 +231,35 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 	logger.V(1).Info("elastic IPAM status",
 		"totalAllocated", totalAllocated, "platformLBs", platformCount,
 		"tenantLBs", tenantCount, "availableIPs", availableIPs,
-		"growthIncrement", growthIncrement)
+		"growthIncrement", growthIncrement,
+		"pendingLBServices", len(inv.PendingServices))
 
-	// Grow: if fewer than 1 IP is available
-	if availableIPs < 1 {
+	// Grow: demand-driven — allocate when tenant LB Services are stuck Pending
+	// without an assigned IP for longer than the minimum age threshold. This
+	// replaces the speculative arithmetic trigger (availableIPs < 1) that caused
+	// the phantom growth cycle described in ADR-016.
+	var qualifiedPending int32
+	for _, svc := range inv.PendingServices {
+		if time.Since(svc.CreatedAt) >= pendingServiceMinAge {
+			qualifiedPending++
+		}
+	}
+
+	if qualifiedPending > 0 {
+		// Batch assessment: allocate enough IPs for all qualified Pending services,
+		// but at least growthIncrement to avoid undersized allocations.
+		growthCount := growthIncrement
+		if qualifiedPending > growthCount {
+			growthCount = qualifiedPending
+		}
+
 		// Check quota
 		if pc.Spec.Network.QuotaPerTenant != nil && pc.Spec.Network.QuotaPerTenant.MaxLoadBalancerIPs != nil {
 			maxLB := *pc.Spec.Network.QuotaPerTenant.MaxLoadBalancerIPs
-			if totalAllocated+growthIncrement > maxLB {
+			if totalAllocated+growthCount > maxLB {
 				logger.Info("elastic IPAM growth blocked by quota",
-					"totalAllocated", totalAllocated, "maxLB", maxLB)
+					"totalAllocated", totalAllocated, "maxLB", maxLB,
+					"pendingServices", qualifiedPending)
 				return nil
 			}
 		}
@@ -249,7 +276,7 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 			}, pool); err != nil {
 				continue
 			}
-			if pool.Status.AvailableIPs < growthIncrement {
+			if pool.Status.AvailableIPs < growthCount {
 				continue
 			}
 
@@ -269,18 +296,19 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 					PoolRef:          butlerv1alpha1.LocalObjectReference{Name: poolRef.Name},
 					TenantClusterRef: butlerv1alpha1.NamespacedObjectReference{Name: tc.Name, Namespace: tc.Namespace},
 					Type:             butlerv1alpha1.IPAllocationTypeLoadBalancer,
-					Count:            &growthIncrement,
+					Count:            &growthCount,
 				},
 			}
 
 			if err := r.Create(ctx, alloc); err != nil {
 				if apierrors.IsAlreadyExists(err) {
-					return nil // Already created
+					return nil
 				}
 				return fmt.Errorf("failed to create growth allocation: %w", err)
 			}
 			logger.Info("elastic IPAM: created growth allocation",
-				"allocation", allocName, "pool", poolRef.Name, "count", growthIncrement)
+				"allocation", allocName, "pool", poolRef.Name,
+				"count", growthCount, "pendingServices", qualifiedPending)
 			break
 		}
 	}
@@ -387,7 +415,7 @@ func (r *Reconciler) listLBAllocations(ctx context.Context, tc *butlerv1alpha1.T
 
 // LBServiceSummary is a lightweight representation of a LoadBalancer Service
 // on a tenant cluster. Used by the Service inventory to track Pending services
-// that PR 6 will use for demand-driven growth decisions.
+// for demand-driven growth decisions.
 type LBServiceSummary struct {
 	Name      string
 	Namespace string
@@ -396,9 +424,8 @@ type LBServiceSummary struct {
 
 // LBServiceInventory is a snapshot of LoadBalancer Service state on a tenant
 // cluster. Built from a single cross-cluster list call per reconcile.
-// countLBIPs delegates to this for backwards compatibility with the existing
-// arithmetic growth/shrink logic. PR 6 will consume the full inventory for
-// demand-driven growth decisions.
+// reconcileElasticIPAM consumes the full inventory for demand-driven growth
+// and the derived counts for shrink logic.
 type LBServiceInventory struct {
 	// PendingServices are LB Services without an assigned external IP.
 	PendingServices []LBServiceSummary
