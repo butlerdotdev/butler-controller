@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Date
 
@@ -24,16 +24,16 @@ Growth fires when `availableIPs < 1`. Shrink fires when `availableIPs >= growthI
 
 A 1Gi memory limit on the controller absorbs the burst allocation patterns this cycle creates, but the underlying bug persists.
 
-### Phase 1 foundation
+### Foundation work
 
-Phase 1 of the IPAM redesign shipped in butler-controller v0.18.0 (#84, #85, #86, #87). It addressed infrastructure gaps without changing allocation behavior:
+Several infrastructure improvements shipped in butler-controller v0.18.0 (#84, #85, #86, #87) to address gaps without changing allocation behavior:
 
 - **IPAllocation watch on TenantCluster controller** (#84): Eliminated the 1-15 minute propagation delay for IPAllocation state changes. The TenantCluster controller now reacts to allocation changes within seconds rather than waiting for timer-based requeue.
 - **Dynamic client for MetalLB sync** (#85): Replaced the kubectl subprocess with server-side apply via a dynamic client. Adds timeout, retry with exponential backoff, and read-back verification.
 - **Tiered capacity events** (#86): Rate-limited events at 70%, 85%, and 95% utilization with recovery events. Replaces the previous behavior of emitting an event every 60 seconds above 80%.
 - **Capacity status conditions** (#87): Always-present `CapacityWarning`, `CapacityCritical`, and `CapacityExhausted` conditions on NetworkPool, consumable by kubectl, ArgoCD, Flux, and butler-console.
 
-Phase 1 improved observability and propagation speed. Phase 2, described by this ADR, addresses the root cause: the allocation trigger model.
+These improvements addressed observability and propagation speed. This ADR addresses the root cause: the allocation trigger model.
 
 ### Root problem
 
@@ -69,7 +69,7 @@ This follows the standard Kubernetes pattern: desired state in CRs, controllers 
 
 **Drift correction.** On every MetalLB sync, the controller computes the expected pool state from IPAllocations and applies it to the tenant. If the tenant pool has been manually edited, the edit is overwritten. Operators who need custom MetalLB pools should create separate IPAddressPool resources with different names, not modify `default-pool`.
 
-Phase 1 already established the mechanism for this: PR #85 introduced server-side apply with the `butler-controller/ipam` field manager and `Force: true`, which overwrites fields managed by other actors. Phase 2 formalizes this as the authority model.
+The mechanism for this already exists: #85 introduced server-side apply with the `butler-controller/ipam` field manager and `Force: true`, which overwrites fields managed by other actors. This ADR formalizes that behavior as the authority model.
 
 ### 3. State recovery: full reconciliation from source with startup sweep
 
@@ -81,23 +81,21 @@ The startup sweep is rate-limited via the existing `MaxConcurrentReconciles` set
 
 ## Implementation Plan
 
-Phase 2 ships as four sequential PRs in butler-controller. Each builds on the previous but is independently deployable. The detailed per-PR specifications are in the IPAM Redesign Plan (Phase 5, PRs 5-8).
+The demand-driven IPAM changes ship as four sequential PRs in butler-controller. Each builds on the previous but is independently deployable.
 
-**PR 5: Tenant LB Service watch infrastructure.** Extends the existing tenant client with a structured Service inventory. Plumbing only, no behavior change. Required before PR 6.
+**Tenant LB Service inventory** (#89): Extends the existing tenant client with a structured Service inventory. Plumbing only, no behavior change. Required before the demand-driven growth trigger.
 
-**PR 6: Demand-driven growth.** Replaces the `availableIPs < 1` trigger with "any LB Service Pending without externalIP." Uses the Service inventory from PR 5. Batch assessment: count all Pending Services, allocate enough IPs for all in one growth event. The old shrink logic stays temporarily.
+**Demand-driven growth** (#90): Replaces the `availableIPs < 1` trigger with "any LB Service Pending without externalIP." Uses the Service inventory from #89. Batch assessment: count all Pending Services, allocate enough IPs for all in one growth event. The old shrink logic stays temporarily.
 
-**PR 7: Demand-driven shrink.** Replaces arithmetic shrink with "allocated IPs with no matching Service for sustained grace period." This eliminates the phantom growth cycle entirely. Configurable grace period (default 10 minutes).
+**Demand-driven shrink** (#91): Replaces arithmetic shrink with "allocated IPs with no matching Service for sustained grace period." This eliminates the phantom growth cycle entirely. Configurable grace period (default 10 minutes).
 
-**PR 8: Migration logic for existing allocations.** Ensures existing allocations created under speculative allocation remain valid under demand-driven allocation. Existing clusters are not disrupted during rollout. Idempotent on re-run.
-
-The sequence matters: PR 5 is a no-op behavior change; PR 6 changes the growth trigger; PR 7 eliminates the phantom cycle; PR 8 handles migration edge cases.
+**Migration hardening**: Ensures existing allocations created under speculative allocation remain valid under demand-driven allocation. Adds PinnedRange protection to the shrink path. Existing clusters are not disrupted during rollout. Idempotent on re-run.
 
 ## Validation Strategy
 
 ### Before merge
 
-Local validation against the Company 1 management cluster, following the same pattern Phase 1 used: scale the deployed controller to 0 replicas, run the local controller binary with `--leader-elect=false`, validate, then restore the deployed controller.
+Local validation against the Company 1 management cluster: scale the deployed controller to 0 replicas, run the local controller binary with `--leader-elect=false`, validate, then restore the deployed controller.
 
 Specific validation criteria:
 
@@ -115,11 +113,11 @@ Specific validation criteria:
 
 ## Rollback
 
-Phase 2 PRs ship independently. If PR 6 or PR 7 causes problems, revert to butler-controller v0.18.0 (Phase 1 foundation). The Phase 1 behavior (speculative arithmetic with the phantom cycle) resumes, absorbed by the 1Gi memory limit.
+Each demand-driven IPAM PR ships independently. If the growth trigger (#90) or shrink logic (#91) causes problems, revert to butler-controller v0.18.0. The v0.18.0 behavior (speculative arithmetic with the phantom cycle) resumes, absorbed by the 1Gi memory limit.
 
-Existing allocations remain functional under v0.18.0. The migration in PR 8 is forward-compatible: allocations created under speculative allocation are valid CRs under demand-driven allocation. Rolling back does not require reverse migration.
+Existing allocations remain functional under v0.18.0. Allocations created under speculative allocation are valid CRs under demand-driven allocation. Rolling back does not require reverse migration.
 
-If pure demand-driven shrink (PR 7) proves operationally risky during implementation, the documented fallback is hybrid: demand-driven growth with arithmetic shrink using an improved dead zone. See Alternatives Considered below.
+If pure demand-driven shrink proves operationally risky, the documented fallback is hybrid: demand-driven growth with arithmetic shrink using an improved dead zone. See Alternatives Considered below.
 
 ## Consequences
 
@@ -129,23 +127,23 @@ If pure demand-driven shrink (PR 7) proves operationally risky during implementa
 - **Allocation accuracy improves.** Growth fires on actual demand (a Service needs an IP), not on accounting projections that can have no stable equilibrium.
 - **Single source of truth with clear authority.** Management-side IPAllocations are authoritative. Tenant-side MetalLB pools are derived. No ambiguity about which state wins on disagreement.
 - **Controller stability improves.** No more cascade of phantom IPAllocation creates/deletes hitting the reclaim grace period simultaneously. Allocation count is stable at rest.
-- **Pool exhaustion becomes visible earlier.** Capacity conditions from Phase 1 surface utilization tiers before exhaustion. Combined with demand-driven allocation (which only allocates when needed), pools last longer because speculative allocations no longer waste IPs.
+- **Pool exhaustion becomes visible earlier.** Capacity conditions (#86, #87) surface utilization tiers before exhaustion. Combined with demand-driven allocation (which only allocates when needed), pools last longer because speculative allocations no longer waste IPs.
 
 ### Negative
 
 - **Tenant API server is a hot dependency for growth decisions.** If a tenant's API server is unreachable, growth stalls for that tenant. The current system already requires tenant API access for `countLBIPs`, so this is the same failure mode, not a new one. Other tenants are unaffected (failure isolation per the requirements).
 - **Manual edits to `default-pool` are reverted.** Operators who manually configure tenant MetalLB pools will see their edits overwritten on next reconcile. This must be documented. Operators needing custom pools should create additional IPAddressPool resources with different names.
-- **Migration requires careful sequencing.** PR 8 must validate that existing allocations (created under speculative logic) transition cleanly to demand-driven logic without disrupting Ready clusters.
-- **Polling latency for growth.** Growth latency depends on the TenantCluster reconcile interval. For a mature cluster (>24h), the worst case before a Pending Service is detected is the requeue interval. The IPAllocation watch from Phase 1 accelerates follow-up reconciles after the growth allocation is fulfilled, but the initial detection still depends on the timer. If this proves unacceptable, a dedicated cross-cluster Service watch could reduce latency further (future work, not in this phase).
+- **Migration requires careful sequencing.** Existing allocations created under speculative logic must transition cleanly to demand-driven logic without disrupting Ready clusters.
+- **Polling latency for growth.** Growth latency depends on the TenantCluster reconcile interval. For a mature cluster (>24h), the worst case before a Pending Service is detected is the requeue interval. The IPAllocation watch (#84) accelerates follow-up reconciles after the growth allocation is fulfilled, but the initial detection still depends on the timer. If this proves unacceptable, a dedicated cross-cluster Service watch could reduce latency further (future work).
 
 ### Deferred
 
-- **Multi-pool selection priority** (Phase 3 PR 11): Proper priority-ordered pool selection for growth allocations when ProviderConfig references multiple pools.
-- **Read-back verification with event emission** (Phase 3 PR 10): Extends Phase 1's logged-only MetalLB verification to emit a Kubernetes event on drift detection.
-- **Pool exhaustion queueing**: Admission queueing for new TenantClusters when pools are near capacity. Deferred unless pool exhaustion becomes a recurring operational problem despite tiered advance warning from Phase 1 conditions.
+- **Multi-pool selection priority**: Proper priority-ordered pool selection for growth allocations when ProviderConfig references multiple pools.
+- **Read-back verification with event emission**: Extends the logged-only MetalLB verification from #85 to emit a Kubernetes event on drift detection.
+- **Pool exhaustion queueing**: Admission queueing for new TenantClusters when pools are near capacity. Deferred unless pool exhaustion becomes a recurring operational problem despite tiered advance warning from capacity conditions.
 - **Drift detection checkpointing**: Persistent snapshots of expected-vs-actual state per tenant. Deferred unless operator-driven drift becomes a recurring support issue.
 - **IPv6 support**: All current on-prem providers use IPv4. Explicitly out of scope.
-- **Optional butler-ipam-metrics addon**: Prometheus-specific metrics endpoint, PrometheusRule, ServiceMonitor, and Grafana dashboard. Opt-in addon for operators using prometheus-operator. Butler core remains stack-agnostic (Phase 4, future).
+- **Optional butler-ipam-metrics addon**: Prometheus-specific metrics endpoint, PrometheusRule, ServiceMonitor, and Grafana dashboard. Opt-in addon for operators using prometheus-operator. Butler core remains stack-agnostic.
 
 ## Alternatives Considered
 
@@ -155,7 +153,7 @@ Growth is demand-driven (same as the decision above), but shrink uses improved a
 
 **Why not chosen as the primary approach:** The dead zone fixes the symptom (oscillation) but preserves the split source of truth for shrink decisions. Management-side accounting still mixes with tenant-side data. Pure demand-driven eliminates the speculative-allocation category of bug entirely.
 
-**Retained as fallback:** If pure demand-driven shrink proves operationally risky during PR 7 implementation (e.g., tenant-side Service inventory is unreliable for shrink decisions), hybrid is the documented fallback. The growth side is identical; only the shrink trigger changes.
+**Retained as fallback:** If pure demand-driven shrink proves operationally risky (e.g., tenant-side Service inventory is unreliable for shrink decisions), hybrid is the documented fallback. The growth side is identical; only the shrink trigger changes.
 
 ### Authority model: tenant authoritative, management derived
 
@@ -173,5 +171,5 @@ Both management and tenant can be modified independently. Reconciliation detects
 
 - [ADR-008: Enterprise Networking and IPAM](ADR-008-enterprise-networking-ipam.md): Established the PVC/PV pattern, bitmap allocator, and NetworkPool/IPAllocation CRDs that this ADR builds on.
 - [butler-controller#83](https://github.com/butlerdotdev/butler-controller/issues/83): Tracking issue for the IPAM redesign.
-- Phase 1 PRs (foundation): [#84](https://github.com/butlerdotdev/butler-controller/pull/84) (IPAllocation watch), [#85](https://github.com/butlerdotdev/butler-controller/pull/85) (dynamic MetalLB client), [#86](https://github.com/butlerdotdev/butler-controller/pull/86) (tiered events), [#87](https://github.com/butlerdotdev/butler-controller/pull/87) (capacity conditions).
-- IPAM Redesign Plan: Working document containing the full current-state inventory, problems catalog (10 items with severity assessment), requirements, architectural premises, and five architecture decisions with implementation sequencing. Source material for this ADR.
+- Foundation PRs: [#84](https://github.com/butlerdotdev/butler-controller/pull/84) (IPAllocation watch), [#85](https://github.com/butlerdotdev/butler-controller/pull/85) (dynamic MetalLB client), [#86](https://github.com/butlerdotdev/butler-controller/pull/86) (tiered events), [#87](https://github.com/butlerdotdev/butler-controller/pull/87) (capacity conditions).
+- Demand-driven PRs: [#89](https://github.com/butlerdotdev/butler-controller/pull/89) (Service inventory), [#90](https://github.com/butlerdotdev/butler-controller/pull/90) (demand-driven growth), [#91](https://github.com/butlerdotdev/butler-controller/pull/91) (demand-driven shrink).

@@ -1244,6 +1244,29 @@ func TestDemandDrivenShrink(t *testing.T) {
 			serviceIPs: map[string]bool{},
 			wantDelete: false,
 		},
+		{
+			name: "growth, pinned range, no IPs in use, grace exceeded: kept",
+			alloc: &butlerv1alpha1.IPAllocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "team-a-test-lb-1", Namespace: "butler-system",
+					CreationTimestamp: oldTime,
+					Labels:           map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+				},
+				Spec: butlerv1alpha1.IPAllocationSpec{
+					Count: &count,
+					PinnedRange: &butlerv1alpha1.PinnedIPRange{
+						StartAddress: "10.0.0.5",
+						EndAddress:   "10.0.0.5",
+					},
+				},
+				Status: butlerv1alpha1.IPAllocationStatus{
+					Phase: butlerv1alpha1.IPAllocationPhaseAllocated,
+					StartAddress: "10.0.0.5", EndAddress: "10.0.0.5",
+				},
+			},
+			serviceIPs: map[string]bool{},
+			wantDelete: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1256,6 +1279,9 @@ func TestDemandDrivenShrink(t *testing.T) {
 			for i := range allocs {
 				alloc := &allocs[i]
 				if alloc.Labels[LabelAllocationRole] != AllocationRoleGrowth {
+					continue
+				}
+				if alloc.Spec.PinnedRange != nil {
 					continue
 				}
 				if alloc.Status.Phase != butlerv1alpha1.IPAllocationPhaseAllocated {
@@ -1578,6 +1604,58 @@ func TestMigrateAllocationRoleLabels_AlreadyLabeled(t *testing.T) {
 	}
 	if updated.Labels[LabelAllocationRole] != AllocationRoleInitial {
 		t.Errorf("label changed unexpectedly: got %q", updated.Labels[LabelAllocationRole])
+	}
+}
+
+func TestMigrateAllocationRoleLabels_PinnedRange(t *testing.T) {
+	// A pinned allocation with a growth-like name pattern (-lb-1) should
+	// still be labeled as initial, because pinned allocations are operator-
+	// defined and must never be auto-released by shrink.
+	scheme := runtime.NewScheme()
+	_ = butlerv1alpha1.AddToScheme(scheme)
+
+	tc := &butlerv1alpha1.TenantCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "team-a"},
+	}
+	count := int32(2)
+
+	pinnedAlloc := &butlerv1alpha1.IPAllocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "team-a-test-lb-1",
+			Namespace: "butler-system",
+			Labels: map[string]string{
+				butlerv1alpha1.LabelTeam:           "team-a",
+				butlerv1alpha1.LabelTenant:         "test",
+				butlerv1alpha1.LabelAllocationType: "loadbalancer",
+				// No allocation-role label — needs migration
+			},
+		},
+		Spec: butlerv1alpha1.IPAllocationSpec{
+			Count: &count,
+			PinnedRange: &butlerv1alpha1.PinnedIPRange{
+				StartAddress: "10.0.0.100",
+				EndAddress:   "10.0.0.101",
+			},
+		},
+		Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhaseAllocated},
+	}
+
+	cl := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pinnedAlloc).
+		Build()
+	r := &Reconciler{Client: cl}
+
+	allocs := []butlerv1alpha1.IPAllocation{*pinnedAlloc}
+	r.migrateAllocationRoleLabels(context.Background(), allocs, tc)
+
+	updated := &butlerv1alpha1.IPAllocation{}
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(pinnedAlloc), updated); err != nil {
+		t.Fatalf("failed to get allocation: %v", err)
+	}
+	if updated.Labels[LabelAllocationRole] != AllocationRoleInitial {
+		t.Errorf("pinned allocation labeled %q, want %q (pinned allocations must be treated as initial)",
+			updated.Labels[LabelAllocationRole], AllocationRoleInitial)
 	}
 }
 
