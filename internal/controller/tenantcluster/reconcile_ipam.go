@@ -385,39 +385,91 @@ func (r *Reconciler) listLBAllocations(ctx context.Context, tc *butlerv1alpha1.T
 	return allocList.Items, nil
 }
 
-// countLBIPs counts LoadBalancer services with assigned IPs on a tenant cluster,
-// returning separate counts for platform-managed LBs and tenant workload LBs.
-// Platform LBs (labeled with LabelPlatformLB) consume pool capacity but should not
-// be treated as tenant workload demand for growth/shrink decisions.
-// Also returns the set of all assigned LB IPs for use in orphan detection.
-func (r *Reconciler) countLBIPs(ctx context.Context, tc *tenant.TenantClient) (platformCount, tenantCount int32, serviceIPs map[string]bool, err error) {
+// LBServiceSummary is a lightweight representation of a LoadBalancer Service
+// on a tenant cluster. Used by the Service inventory to track Pending services
+// that PR 6 will use for demand-driven growth decisions.
+type LBServiceSummary struct {
+	Name      string
+	Namespace string
+	CreatedAt time.Time
+}
+
+// LBServiceInventory is a snapshot of LoadBalancer Service state on a tenant
+// cluster. Built from a single cross-cluster list call per reconcile.
+// countLBIPs delegates to this for backwards compatibility with the existing
+// arithmetic growth/shrink logic. PR 6 will consume the full inventory for
+// demand-driven growth decisions.
+type LBServiceInventory struct {
+	// PendingServices are LB Services without an assigned external IP.
+	PendingServices []LBServiceSummary
+
+	// AssignedPlatformCount is the number of platform-labeled LB Services
+	// with at least one assigned external IP.
+	AssignedPlatformCount int32
+
+	// AssignedTenantCount is the number of non-platform LB Services with
+	// at least one assigned external IP.
+	AssignedTenantCount int32
+
+	// ServiceIPs is the set of all external IPs assigned to LB Services.
+	// Used by orphan detection to identify allocations with no matching service.
+	ServiceIPs map[string]bool
+}
+
+// buildLBServiceInventory fetches all Services from a tenant cluster and
+// returns a structured inventory of LoadBalancer Services. This is the single
+// cross-cluster read that growth, shrink, and orphan detection consume.
+func buildLBServiceInventory(ctx context.Context, tc *tenant.TenantClient) (*LBServiceInventory, error) {
 	svcList, err := tc.Clientset.CoreV1().Services("").List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return 0, 0, nil, fmt.Errorf("failed to list services: %w", err)
+		return nil, fmt.Errorf("failed to list services: %w", err)
 	}
 
-	serviceIPs = make(map[string]bool)
+	inv := &LBServiceInventory{
+		ServiceIPs: make(map[string]bool),
+	}
+
 	for _, svc := range svcList.Items {
 		if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
 			continue
 		}
-		hasIP := false
+
+		var hasIP bool
 		for _, ing := range svc.Status.LoadBalancer.Ingress {
 			if ing.IP != "" {
-				serviceIPs[ing.IP] = true
+				inv.ServiceIPs[ing.IP] = true
 				hasIP = true
 			}
 		}
+
 		if !hasIP {
+			inv.PendingServices = append(inv.PendingServices, LBServiceSummary{
+				Name:      svc.Name,
+				Namespace: svc.Namespace,
+				CreatedAt: svc.CreationTimestamp.Time,
+			})
 			continue
 		}
+
 		if svc.Labels[butlerv1alpha1.LabelPlatformLB] == "true" {
-			platformCount++
+			inv.AssignedPlatformCount++
 		} else {
-			tenantCount++
+			inv.AssignedTenantCount++
 		}
 	}
-	return platformCount, tenantCount, serviceIPs, nil
+
+	return inv, nil
+}
+
+// countLBIPs counts LoadBalancer services with assigned IPs on a tenant cluster,
+// returning separate counts for platform-managed LBs and tenant workload LBs.
+// Delegates to buildLBServiceInventory for the cross-cluster read.
+func (r *Reconciler) countLBIPs(ctx context.Context, tc *tenant.TenantClient) (platformCount, tenantCount int32, serviceIPs map[string]bool, err error) {
+	inv, err := buildLBServiceInventory(ctx, tc)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	return inv.AssignedPlatformCount, inv.AssignedTenantCount, inv.ServiceIPs, nil
 }
 
 // ensurePlatformLBLabels ensures the Traefik service on a tenant cluster has the platform-lb

@@ -467,6 +467,232 @@ func TestCountLBIPs_ServiceIPs(t *testing.T) {
 	}
 }
 
+func TestBuildLBServiceInventory(t *testing.T) {
+	tests := []struct {
+		name                 string
+		services             []corev1.Service
+		wantPendingCount     int
+		wantAssignedPlatform int32
+		wantAssignedTenant   int32
+		wantServiceIPCount   int
+	}{
+		{
+			name:                 "empty cluster",
+			services:             nil,
+			wantPendingCount:     0,
+			wantAssignedPlatform: 0,
+			wantAssignedTenant:   0,
+			wantServiceIPCount:   0,
+		},
+		{
+			name: "ClusterIP services filtered out",
+			services: []corev1.Service{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"},
+					Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP},
+				},
+			},
+			wantPendingCount:     0,
+			wantAssignedPlatform: 0,
+			wantAssignedTenant:   0,
+			wantServiceIPCount:   0,
+		},
+		{
+			name: "pending LB service captured",
+			services: []corev1.Service{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "new-svc",
+						Namespace:         "default",
+						CreationTimestamp: metav1.NewTime(time.Now().Add(-45 * time.Second)),
+					},
+					Spec:   corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+					Status: corev1.ServiceStatus{},
+				},
+			},
+			wantPendingCount:     1,
+			wantAssignedPlatform: 0,
+			wantAssignedTenant:   0,
+			wantServiceIPCount:   0,
+		},
+		{
+			name: "assigned tenant LB counted",
+			services: []corev1.Service{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "app-lb", Namespace: "default"},
+					Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+					Status: corev1.ServiceStatus{
+						LoadBalancer: corev1.LoadBalancerStatus{
+							Ingress: []corev1.LoadBalancerIngress{{IP: "10.0.0.1"}},
+						},
+					},
+				},
+			},
+			wantPendingCount:     0,
+			wantAssignedPlatform: 0,
+			wantAssignedTenant:   1,
+			wantServiceIPCount:   1,
+		},
+		{
+			name: "assigned platform LB counted",
+			services: []corev1.Service{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "traefik",
+						Namespace: "traefik",
+						Labels:    map[string]string{butlerv1alpha1.LabelPlatformLB: "true"},
+					},
+					Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+					Status: corev1.ServiceStatus{
+						LoadBalancer: corev1.LoadBalancerStatus{
+							Ingress: []corev1.LoadBalancerIngress{{IP: "10.0.0.2"}},
+						},
+					},
+				},
+			},
+			wantPendingCount:     0,
+			wantAssignedPlatform: 1,
+			wantAssignedTenant:   0,
+			wantServiceIPCount:   1,
+		},
+		{
+			name: "mixed: platform, tenant, pending, and non-LB",
+			services: []corev1.Service{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "traefik",
+						Namespace: "traefik",
+						Labels:    map[string]string{butlerv1alpha1.LabelPlatformLB: "true"},
+					},
+					Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+					Status: corev1.ServiceStatus{
+						LoadBalancer: corev1.LoadBalancerStatus{
+							Ingress: []corev1.LoadBalancerIngress{{IP: "10.0.0.1"}},
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default"},
+					Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+					Status: corev1.ServiceStatus{
+						LoadBalancer: corev1.LoadBalancerStatus{
+							Ingress: []corev1.LoadBalancerIngress{{IP: "10.0.0.2"}},
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "pending-svc",
+						Namespace:         "default",
+						CreationTimestamp: metav1.NewTime(time.Now().Add(-2 * time.Minute)),
+					},
+					Spec:   corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+					Status: corev1.ServiceStatus{},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "internal", Namespace: "default"},
+					Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP},
+				},
+			},
+			wantPendingCount:     1,
+			wantAssignedPlatform: 1,
+			wantAssignedTenant:   1,
+			wantServiceIPCount:   2,
+		},
+		{
+			name: "multiple pending services tracked separately",
+			services: []corev1.Service{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "svc-a",
+						Namespace:         "default",
+						CreationTimestamp: metav1.NewTime(time.Now().Add(-5 * time.Minute)),
+					},
+					Spec:   corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+					Status: corev1.ServiceStatus{},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "svc-b",
+						Namespace:         "other",
+						CreationTimestamp: metav1.NewTime(time.Now().Add(-10 * time.Second)),
+					},
+					Spec:   corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+					Status: corev1.ServiceStatus{},
+				},
+			},
+			wantPendingCount:     2,
+			wantAssignedPlatform: 0,
+			wantAssignedTenant:   0,
+			wantServiceIPCount:   0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientset := fake.NewSimpleClientset()
+			for i := range tt.services {
+				_, err := clientset.CoreV1().Services(tt.services[i].Namespace).Create(
+					context.Background(), &tt.services[i], metav1.CreateOptions{})
+				if err != nil {
+					t.Fatalf("failed to create test service: %v", err)
+				}
+			}
+
+			tc := &tenant.TenantClient{Clientset: clientset}
+			inv, err := buildLBServiceInventory(context.Background(), tc)
+			if err != nil {
+				t.Fatalf("buildLBServiceInventory() error = %v", err)
+			}
+			if len(inv.PendingServices) != tt.wantPendingCount {
+				t.Errorf("PendingServices count = %d, want %d", len(inv.PendingServices), tt.wantPendingCount)
+			}
+			if inv.AssignedPlatformCount != tt.wantAssignedPlatform {
+				t.Errorf("AssignedPlatformCount = %d, want %d", inv.AssignedPlatformCount, tt.wantAssignedPlatform)
+			}
+			if inv.AssignedTenantCount != tt.wantAssignedTenant {
+				t.Errorf("AssignedTenantCount = %d, want %d", inv.AssignedTenantCount, tt.wantAssignedTenant)
+			}
+			if len(inv.ServiceIPs) != tt.wantServiceIPCount {
+				t.Errorf("ServiceIPs count = %d, want %d", len(inv.ServiceIPs), tt.wantServiceIPCount)
+			}
+		})
+	}
+}
+
+func TestBuildLBServiceInventory_PendingMetadata(t *testing.T) {
+	createdAt := time.Now().Add(-90 * time.Second)
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "my-svc",
+			Namespace:         "my-ns",
+			CreationTimestamp: metav1.NewTime(createdAt),
+		},
+		Spec:   corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
+		Status: corev1.ServiceStatus{},
+	}
+
+	clientset := fake.NewSimpleClientset(svc)
+	tc := &tenant.TenantClient{Clientset: clientset}
+	inv, err := buildLBServiceInventory(context.Background(), tc)
+	if err != nil {
+		t.Fatalf("buildLBServiceInventory() error = %v", err)
+	}
+	if len(inv.PendingServices) != 1 {
+		t.Fatalf("expected 1 pending service, got %d", len(inv.PendingServices))
+	}
+	ps := inv.PendingServices[0]
+	if ps.Name != "my-svc" {
+		t.Errorf("Name = %q, want %q", ps.Name, "my-svc")
+	}
+	if ps.Namespace != "my-ns" {
+		t.Errorf("Namespace = %q, want %q", ps.Namespace, "my-ns")
+	}
+	if ps.CreatedAt.IsZero() {
+		t.Error("CreatedAt is zero")
+	}
+}
+
 func TestAllocationHasServiceIP(t *testing.T) {
 	tests := []struct {
 		name       string
