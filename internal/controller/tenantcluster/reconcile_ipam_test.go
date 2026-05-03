@@ -1145,234 +1145,205 @@ func TestAllocationHasServiceIP(t *testing.T) {
 	}
 }
 
-func TestReclaimOrphanAllocations(t *testing.T) {
+func TestDemandDrivenShrink(t *testing.T) {
+	// Validates the demand-driven shrink logic: growth allocations whose IPs
+	// are not in use by any tenant LB Service for longer than the grace period
+	// get released. Initial allocations are never released.
 	scheme := runtime.NewScheme()
 	_ = butlerv1alpha1.AddToScheme(scheme)
 
-	oldTime := metav1.NewTime(time.Now().Add(-10 * time.Minute))
-	newTime := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+	oldTime := metav1.NewTime(time.Now().Add(-15 * time.Minute))
+	youngTime := metav1.NewTime(time.Now().Add(-5 * time.Minute))
 	count := int32(1)
 
-	t.Run("reclaims allocation with no matching service IP", func(t *testing.T) {
-		alloc := &butlerv1alpha1.IPAllocation{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:              "test-orphan",
-				Namespace:         "butler-system",
-				CreationTimestamp: oldTime,
-			},
-			Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
-			Status: butlerv1alpha1.IPAllocationStatus{
-				Phase:        butlerv1alpha1.IPAllocationPhaseAllocated,
-				StartAddress: "10.0.0.5",
-				EndAddress:   "10.0.0.5",
-			},
-		}
-
-		cl := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(alloc).Build()
-		r := &Reconciler{Client: cl}
-
-		serviceIPs := map[string]bool{"10.0.0.1": true, "10.0.0.2": true}
-		r.reclaimOrphanAllocations(context.Background(), []butlerv1alpha1.IPAllocation{*alloc}, serviceIPs)
-
-		// Verify deletion
-		err := cl.Get(context.Background(), client.ObjectKeyFromObject(alloc), &butlerv1alpha1.IPAllocation{})
-		if err == nil {
-			t.Error("expected orphan allocation to be deleted")
-		}
-	})
-
-	t.Run("skips allocation with matching service IP", func(t *testing.T) {
-		alloc := &butlerv1alpha1.IPAllocation{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:              "test-used",
-				Namespace:         "butler-system",
-				CreationTimestamp: oldTime,
-			},
-			Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
-			Status: butlerv1alpha1.IPAllocationStatus{
-				Phase:        butlerv1alpha1.IPAllocationPhaseAllocated,
-				StartAddress: "10.0.0.1",
-				EndAddress:   "10.0.0.1",
-			},
-		}
-
-		cl := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(alloc).Build()
-		r := &Reconciler{Client: cl}
-
-		serviceIPs := map[string]bool{"10.0.0.1": true}
-		r.reclaimOrphanAllocations(context.Background(), []butlerv1alpha1.IPAllocation{*alloc}, serviceIPs)
-
-		// Verify NOT deleted
-		err := cl.Get(context.Background(), client.ObjectKeyFromObject(alloc), &butlerv1alpha1.IPAllocation{})
-		if err != nil {
-			t.Errorf("expected used allocation to remain, got error: %v", err)
-		}
-	})
-
-	t.Run("skips allocation younger than grace period", func(t *testing.T) {
-		alloc := &butlerv1alpha1.IPAllocation{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:              "test-young",
-				Namespace:         "butler-system",
-				CreationTimestamp: newTime, // 2 minutes old, under 5-minute grace
-			},
-			Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
-			Status: butlerv1alpha1.IPAllocationStatus{
-				Phase:        butlerv1alpha1.IPAllocationPhaseAllocated,
-				StartAddress: "10.0.0.9",
-				EndAddress:   "10.0.0.9",
-			},
-		}
-
-		cl := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(alloc).Build()
-		r := &Reconciler{Client: cl}
-
-		serviceIPs := map[string]bool{"10.0.0.1": true} // no match for .9
-		r.reclaimOrphanAllocations(context.Background(), []butlerv1alpha1.IPAllocation{*alloc}, serviceIPs)
-
-		// Verify NOT deleted (within grace period)
-		err := cl.Get(context.Background(), client.ObjectKeyFromObject(alloc), &butlerv1alpha1.IPAllocation{})
-		if err != nil {
-			t.Errorf("expected young allocation to remain, got error: %v", err)
-		}
-	})
-
-	t.Run("skips allocation in pending phase", func(t *testing.T) {
-		alloc := &butlerv1alpha1.IPAllocation{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:              "test-pending",
-				Namespace:         "butler-system",
-				CreationTimestamp: oldTime,
-			},
-			Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
-			Status: butlerv1alpha1.IPAllocationStatus{
-				Phase:        butlerv1alpha1.IPAllocationPhasePending,
-				StartAddress: "",
-				EndAddress:   "",
-			},
-		}
-
-		cl := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(alloc).Build()
-		r := &Reconciler{Client: cl}
-
-		serviceIPs := map[string]bool{}
-		r.reclaimOrphanAllocations(context.Background(), []butlerv1alpha1.IPAllocation{*alloc}, serviceIPs)
-
-		// Verify NOT deleted (not yet allocated)
-		err := cl.Get(context.Background(), client.ObjectKeyFromObject(alloc), &butlerv1alpha1.IPAllocation{})
-		if err != nil {
-			t.Errorf("expected pending allocation to remain, got error: %v", err)
-		}
-	})
-}
-
-func TestShrinkThreshold(t *testing.T) {
-	// Validates the off-by-one fix: with growthIncrement=1, shrink should fire
-	// when availableIPs == 1 (one orphan present).
 	tests := []struct {
-		name         string
-		availableIPs int32
-		increment    int32
-		wantShrink   bool
+		name       string
+		alloc      *butlerv1alpha1.IPAllocation
+		serviceIPs map[string]bool
+		wantDelete bool
 	}{
 		{
-			name:         "available equals increment: shrink fires",
-			availableIPs: 1,
-			increment:    1,
-			wantShrink:   true,
+			name: "growth, no IPs in use, grace exceeded: released",
+			alloc: &butlerv1alpha1.IPAllocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "team-a-test-lb-1", Namespace: "butler-system",
+					CreationTimestamp: oldTime,
+					Labels:           map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+				},
+				Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
+				Status: butlerv1alpha1.IPAllocationStatus{
+					Phase: butlerv1alpha1.IPAllocationPhaseAllocated,
+					StartAddress: "10.0.0.5", EndAddress: "10.0.0.5",
+				},
+			},
+			serviceIPs: map[string]bool{"10.0.0.1": true},
+			wantDelete: true,
 		},
 		{
-			name:         "available exceeds increment: shrink fires",
-			availableIPs: 2,
-			increment:    1,
-			wantShrink:   true,
+			name: "growth, no IPs in use, grace not exceeded: kept",
+			alloc: &butlerv1alpha1.IPAllocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "team-a-test-lb-1", Namespace: "butler-system",
+					CreationTimestamp: youngTime,
+					Labels:           map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+				},
+				Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
+				Status: butlerv1alpha1.IPAllocationStatus{
+					Phase: butlerv1alpha1.IPAllocationPhaseAllocated,
+					StartAddress: "10.0.0.5", EndAddress: "10.0.0.5",
+				},
+			},
+			serviceIPs: map[string]bool{"10.0.0.1": true},
+			wantDelete: false,
 		},
 		{
-			name:         "available below increment: no shrink",
-			availableIPs: 0,
-			increment:    1,
-			wantShrink:   false,
+			name: "growth, IPs actively in use: kept",
+			alloc: &butlerv1alpha1.IPAllocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "team-a-test-lb-1", Namespace: "butler-system",
+					CreationTimestamp: oldTime,
+					Labels:           map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+				},
+				Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
+				Status: butlerv1alpha1.IPAllocationStatus{
+					Phase: butlerv1alpha1.IPAllocationPhaseAllocated,
+					StartAddress: "10.0.0.5", EndAddress: "10.0.0.5",
+				},
+			},
+			serviceIPs: map[string]bool{"10.0.0.5": true},
+			wantDelete: false,
 		},
 		{
-			name:         "increment=2, available=2: shrink fires",
-			availableIPs: 2,
-			increment:    2,
-			wantShrink:   true,
+			name: "initial, no IPs in use, grace exceeded: kept (protection)",
+			alloc: &butlerv1alpha1.IPAllocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "team-a-test-lb", Namespace: "butler-system",
+					CreationTimestamp: oldTime,
+					Labels:           map[string]string{LabelAllocationRole: AllocationRoleInitial},
+				},
+				Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
+				Status: butlerv1alpha1.IPAllocationStatus{
+					Phase: butlerv1alpha1.IPAllocationPhaseAllocated,
+					StartAddress: "10.0.0.1", EndAddress: "10.0.0.1",
+				},
+			},
+			serviceIPs: map[string]bool{},
+			wantDelete: false,
 		},
 		{
-			name:         "increment=2, available=1: no shrink",
-			availableIPs: 1,
-			increment:    2,
-			wantShrink:   false,
+			name: "growth, pending phase: kept",
+			alloc: &butlerv1alpha1.IPAllocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "team-a-test-lb-1", Namespace: "butler-system",
+					CreationTimestamp: oldTime,
+					Labels:           map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+				},
+				Spec:   butlerv1alpha1.IPAllocationSpec{Count: &count},
+				Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhasePending},
+			},
+			serviceIPs: map[string]bool{},
+			wantDelete: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// The shrink condition from reconcileElasticIPAM:
-			// len(allocs) > 1 && availableIPs >= growthIncrement
-			allocCount := 2 // More than 1 to satisfy first condition
-			got := allocCount > 1 && tt.availableIPs >= tt.increment
-			if got != tt.wantShrink {
-				t.Errorf("shrink condition (available=%d >= increment=%d) = %v, want %v",
-					tt.availableIPs, tt.increment, got, tt.wantShrink)
+			cl := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(tt.alloc).Build()
+			r := &Reconciler{Client: cl}
+
+			// Run the shrink logic inline (same as reconcileElasticIPAM)
+			allocs := []butlerv1alpha1.IPAllocation{*tt.alloc}
+			for i := range allocs {
+				alloc := &allocs[i]
+				if alloc.Labels[LabelAllocationRole] != AllocationRoleGrowth {
+					continue
+				}
+				if alloc.Status.Phase != butlerv1alpha1.IPAllocationPhaseAllocated {
+					continue
+				}
+				if time.Since(alloc.CreationTimestamp.Time) < shrinkGracePeriod {
+					continue
+				}
+				if allocationHasServiceIP(alloc, tt.serviceIPs) {
+					continue
+				}
+				_ = r.Delete(context.Background(), alloc)
+			}
+
+			err := cl.Get(context.Background(), client.ObjectKeyFromObject(tt.alloc), &butlerv1alpha1.IPAllocation{})
+			deleted := err != nil
+			if deleted != tt.wantDelete {
+				t.Errorf("deleted = %v, want %v", deleted, tt.wantDelete)
 			}
 		})
 	}
 }
 
 func TestShrinkSelectsGrowthNotInitial(t *testing.T) {
-	// Verifies that the shrink loop only considers growth allocations, never
-	// the initial allocation, regardless of the order allocations appear in
-	// the slice (simulating undefined Kubernetes List ordering).
-	oldTime := metav1.NewTime(time.Now().Add(-15 * time.Minute))
-	count := int32(2)
+	// Verifies that the demand-driven shrink loop only considers growth
+	// allocations, never the initial allocation, regardless of the order
+	// allocations appear in the slice (simulating undefined Kubernetes List
+	// ordering). Both growth allocations have no matching service IPs and
+	// exceed the grace period, so both should be released. The initial
+	// allocation must survive even though it also has no matching service IP.
+	scheme := runtime.NewScheme()
+	_ = butlerv1alpha1.AddToScheme(scheme)
 
-	// Create 3 allocations: initial + 2 growth, deliberately in non-alphabetical
-	// order to prove we don't depend on ordering.
-	allocs := []butlerv1alpha1.IPAllocation{
-		{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:              "team-a-cluster-lb-2",
-				Namespace:         "butler-system",
-				CreationTimestamp: oldTime,
-				Labels: map[string]string{
-					LabelAllocationRole: AllocationRoleGrowth,
-				},
-			},
-			Spec:   butlerv1alpha1.IPAllocationSpec{Count: &count},
-			Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhaseAllocated},
+	oldTime := metav1.NewTime(time.Now().Add(-15 * time.Minute))
+	count := int32(1)
+
+	growthAlloc2 := &butlerv1alpha1.IPAllocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "team-a-cluster-lb-2",
+			Namespace:         "butler-system",
+			CreationTimestamp: oldTime,
+			Labels:            map[string]string{LabelAllocationRole: AllocationRoleGrowth},
 		},
-		{
-			// The initial allocation is at index 1 — not index 0.
-			ObjectMeta: metav1.ObjectMeta{
-				Name:              "team-a-cluster-lb",
-				Namespace:         "butler-system",
-				CreationTimestamp: oldTime,
-				Labels: map[string]string{
-					LabelAllocationRole: AllocationRoleInitial,
-				},
-			},
-			Spec:   butlerv1alpha1.IPAllocationSpec{Count: &count},
-			Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhaseAllocated},
+		Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
+		Status: butlerv1alpha1.IPAllocationStatus{
+			Phase:        butlerv1alpha1.IPAllocationPhaseAllocated,
+			StartAddress: "10.0.0.5", EndAddress: "10.0.0.5",
 		},
-		{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:              "team-a-cluster-lb-1",
-				Namespace:         "butler-system",
-				CreationTimestamp: oldTime,
-				Labels: map[string]string{
-					LabelAllocationRole: AllocationRoleGrowth,
-				},
-			},
-			Spec:   butlerv1alpha1.IPAllocationSpec{Count: &count},
-			Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhaseAllocated},
+	}
+	initialAlloc := &butlerv1alpha1.IPAllocation{
+		// The initial allocation is at index 1 — not index 0.
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "team-a-cluster-lb",
+			Namespace:         "butler-system",
+			CreationTimestamp: oldTime,
+			Labels:            map[string]string{LabelAllocationRole: AllocationRoleInitial},
+		},
+		Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
+		Status: butlerv1alpha1.IPAllocationStatus{
+			Phase:        butlerv1alpha1.IPAllocationPhaseAllocated,
+			StartAddress: "10.0.0.1", EndAddress: "10.0.0.1",
+		},
+	}
+	growthAlloc1 := &butlerv1alpha1.IPAllocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "team-a-cluster-lb-1",
+			Namespace:         "butler-system",
+			CreationTimestamp: oldTime,
+			Labels:            map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+		},
+		Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
+		Status: butlerv1alpha1.IPAllocationStatus{
+			Phase:        butlerv1alpha1.IPAllocationPhaseAllocated,
+			StartAddress: "10.0.0.3", EndAddress: "10.0.0.3",
 		},
 	}
 
-	// Simulate the shrink selection logic from reconcileElasticIPAM
-	var shrinkCandidate *butlerv1alpha1.IPAllocation
-	for i := len(allocs) - 1; i >= 0; i-- {
+	cl := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(growthAlloc2, initialAlloc, growthAlloc1).
+		Build()
+
+	// No service IPs — all allocations are unused.
+	serviceIPs := map[string]bool{}
+
+	// Run the demand-driven shrink loop (same logic as reconcileElasticIPAM).
+	allocs := []butlerv1alpha1.IPAllocation{*growthAlloc2, *initialAlloc, *growthAlloc1}
+	for i := range allocs {
 		alloc := &allocs[i]
 		if alloc.Labels[LabelAllocationRole] != AllocationRoleGrowth {
 			continue
@@ -1380,33 +1351,33 @@ func TestShrinkSelectsGrowthNotInitial(t *testing.T) {
 		if alloc.Status.Phase != butlerv1alpha1.IPAllocationPhaseAllocated {
 			continue
 		}
-		if alloc.Spec.Count == nil {
+		if time.Since(alloc.CreationTimestamp.Time) < shrinkGracePeriod {
 			continue
 		}
-		if time.Since(alloc.CreationTimestamp.Time) < 10*time.Minute {
+		if allocationHasServiceIP(alloc, serviceIPs) {
 			continue
 		}
-		shrinkCandidate = alloc
-		break
+		_ = cl.Delete(context.Background(), alloc)
 	}
 
-	if shrinkCandidate == nil {
-		t.Fatal("expected a shrink candidate but got nil")
+	// Both growth allocations should be deleted.
+	for _, name := range []string{"team-a-cluster-lb-1", "team-a-cluster-lb-2"} {
+		err := cl.Get(context.Background(), client.ObjectKey{Name: name, Namespace: "butler-system"}, &butlerv1alpha1.IPAllocation{})
+		if err == nil {
+			t.Errorf("growth allocation %s should have been deleted but still exists", name)
+		}
 	}
-	if shrinkCandidate.Labels[LabelAllocationRole] != AllocationRoleGrowth {
-		t.Errorf("expected shrink candidate to be a growth allocation, got role=%q",
-			shrinkCandidate.Labels[LabelAllocationRole])
-	}
-	// Verify initial was never selected
-	if shrinkCandidate.Name == "team-a-cluster-lb" {
-		t.Error("shrink selected the initial allocation; this must never happen")
+
+	// Initial allocation must survive.
+	err := cl.Get(context.Background(), client.ObjectKey{Name: "team-a-cluster-lb", Namespace: "butler-system"}, &butlerv1alpha1.IPAllocation{})
+	if err != nil {
+		t.Error("initial allocation was deleted; this must never happen")
 	}
 }
 
-func TestShrinkThenReclaimUsesFreshData(t *testing.T) {
-	// Verifies that after shrink deletes an allocation, reclaim uses a fresh
-	// slice rather than the stale one. We simulate this by checking that a
-	// deleted allocation's name does not appear in the fresh slice.
+func TestShrinkRefetchesAfterDelete(t *testing.T) {
+	// Verifies that after shrink deletes an allocation, the re-fetch via
+	// listLBAllocations returns a fresh slice without the deleted object.
 	scheme := runtime.NewScheme()
 	_ = butlerv1alpha1.AddToScheme(scheme)
 
@@ -1714,102 +1685,73 @@ func TestListLBAllocations_Labels(t *testing.T) {
 	}
 }
 
-// TestReclaimSkipsInitialAllocation verifies that reclaimOrphanAllocations
-// does not discriminate by role label — it uses service IPs. This is a
-// regression guard to confirm reclaim logic is orthogonal to the role label.
-func TestReclaimSkipsInitialAllocation(t *testing.T) {
+func TestShrinkFiltersMixedAllocations(t *testing.T) {
+	// Test demand-driven shrink with a mix of initial, growth, pending, and
+	// young allocations. Only the growth allocation that is Allocated, past
+	// the grace period, and has no matching service IP should be deleted.
 	scheme := runtime.NewScheme()
 	_ = butlerv1alpha1.AddToScheme(scheme)
 
-	oldTime := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+	oldTime := metav1.NewTime(time.Now().Add(-15 * time.Minute))
+	youngTime := metav1.NewTime(time.Now().Add(-2 * time.Minute))
 	count := int32(1)
 
-	// Initial allocation with a service IP — should NOT be reclaimed
-	initial := &butlerv1alpha1.IPAllocation{
+	initialAlloc := &butlerv1alpha1.IPAllocation{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:              "team-a-test-lb",
-			Namespace:         "butler-system",
+			Name: "team-a-c-lb", Namespace: "butler-system",
 			CreationTimestamp: oldTime,
-			Labels: map[string]string{
-				LabelAllocationRole: AllocationRoleInitial,
-			},
+			Labels:            map[string]string{LabelAllocationRole: AllocationRoleInitial},
 		},
 		Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
 		Status: butlerv1alpha1.IPAllocationStatus{
-			Phase:        butlerv1alpha1.IPAllocationPhaseAllocated,
-			StartAddress: "10.0.0.1",
-			EndAddress:   "10.0.0.1",
+			Phase: butlerv1alpha1.IPAllocationPhaseAllocated,
+			StartAddress: "10.0.0.1", EndAddress: "10.0.0.1",
+		},
+	}
+	youngGrowth := &butlerv1alpha1.IPAllocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "team-a-c-lb-1", Namespace: "butler-system",
+			CreationTimestamp: youngTime,
+			Labels:            map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+		},
+		Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
+		Status: butlerv1alpha1.IPAllocationStatus{
+			Phase: butlerv1alpha1.IPAllocationPhaseAllocated,
+			StartAddress: "10.0.0.3", EndAddress: "10.0.0.3",
+		},
+	}
+	pendingGrowth := &butlerv1alpha1.IPAllocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "team-a-c-lb-2", Namespace: "butler-system",
+			CreationTimestamp: oldTime,
+			Labels:            map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+		},
+		Spec:   butlerv1alpha1.IPAllocationSpec{Count: &count},
+		Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhasePending},
+	}
+	eligibleGrowth := &butlerv1alpha1.IPAllocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "team-a-c-lb-3", Namespace: "butler-system",
+			CreationTimestamp: oldTime,
+			Labels:            map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+		},
+		Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
+		Status: butlerv1alpha1.IPAllocationStatus{
+			Phase: butlerv1alpha1.IPAllocationPhaseAllocated,
+			StartAddress: "10.0.0.5", EndAddress: "10.0.0.5",
 		},
 	}
 
-	cl := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(initial).Build()
-	r := &Reconciler{Client: cl}
+	cl := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(initialAlloc, youngGrowth, pendingGrowth, eligibleGrowth).
+		Build()
 
-	serviceIPs := map[string]bool{"10.0.0.1": true}
-	r.reclaimOrphanAllocations(context.Background(), []butlerv1alpha1.IPAllocation{*initial}, serviceIPs)
+	// No service IPs — all allocations are unused.
+	serviceIPs := map[string]bool{}
 
-	// Verify NOT deleted
-	err := cl.Get(context.Background(), client.ObjectKeyFromObject(initial), &butlerv1alpha1.IPAllocation{})
-	if err != nil {
-		t.Errorf("initial allocation with active service IP was deleted: %v", err)
-	}
-}
-
-func TestShrinkCandidateSelection_MultipleMixed(t *testing.T) {
-	// Test with a mix of initial, growth, pending, and young allocations
-	// to verify the full filtering logic.
-	oldTime := metav1.NewTime(time.Now().Add(-15 * time.Minute))
-	youngTime := metav1.NewTime(time.Now().Add(-2 * time.Minute))
-	count := int32(2)
-
-	allocs := []butlerv1alpha1.IPAllocation{
-		{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:              "team-a-c-lb",
-				Namespace:         "butler-system",
-				CreationTimestamp: oldTime,
-				Labels:            map[string]string{LabelAllocationRole: AllocationRoleInitial},
-			},
-			Spec:   butlerv1alpha1.IPAllocationSpec{Count: &count},
-			Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhaseAllocated},
-		},
-		{
-			// Growth but too young
-			ObjectMeta: metav1.ObjectMeta{
-				Name:              "team-a-c-lb-1",
-				Namespace:         "butler-system",
-				CreationTimestamp: youngTime,
-				Labels:            map[string]string{LabelAllocationRole: AllocationRoleGrowth},
-			},
-			Spec:   butlerv1alpha1.IPAllocationSpec{Count: &count},
-			Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhaseAllocated},
-		},
-		{
-			// Growth, old enough, pending phase — should be skipped
-			ObjectMeta: metav1.ObjectMeta{
-				Name:              "team-a-c-lb-2",
-				Namespace:         "butler-system",
-				CreationTimestamp: oldTime,
-				Labels:            map[string]string{LabelAllocationRole: AllocationRoleGrowth},
-			},
-			Spec:   butlerv1alpha1.IPAllocationSpec{Count: &count},
-			Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhasePending},
-		},
-		{
-			// Growth, old enough, allocated — this is the only valid candidate
-			ObjectMeta: metav1.ObjectMeta{
-				Name:              "team-a-c-lb-3",
-				Namespace:         "butler-system",
-				CreationTimestamp: oldTime,
-				Labels:            map[string]string{LabelAllocationRole: AllocationRoleGrowth},
-			},
-			Spec:   butlerv1alpha1.IPAllocationSpec{Count: &count},
-			Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhaseAllocated},
-		},
-	}
-
-	var shrinkCandidate *butlerv1alpha1.IPAllocation
-	for i := len(allocs) - 1; i >= 0; i-- {
+	allocs := []butlerv1alpha1.IPAllocation{*initialAlloc, *youngGrowth, *pendingGrowth, *eligibleGrowth}
+	for i := range allocs {
 		alloc := &allocs[i]
 		if alloc.Labels[LabelAllocationRole] != AllocationRoleGrowth {
 			continue
@@ -1817,21 +1759,27 @@ func TestShrinkCandidateSelection_MultipleMixed(t *testing.T) {
 		if alloc.Status.Phase != butlerv1alpha1.IPAllocationPhaseAllocated {
 			continue
 		}
-		if alloc.Spec.Count == nil {
+		if time.Since(alloc.CreationTimestamp.Time) < shrinkGracePeriod {
 			continue
 		}
-		if time.Since(alloc.CreationTimestamp.Time) < 10*time.Minute {
+		if allocationHasServiceIP(alloc, serviceIPs) {
 			continue
 		}
-		shrinkCandidate = alloc
-		break
+		_ = cl.Delete(context.Background(), alloc)
 	}
 
-	if shrinkCandidate == nil {
-		t.Fatal("expected a shrink candidate")
+	// Only the eligible growth allocation should be deleted.
+	err := cl.Get(context.Background(), client.ObjectKey{Name: "team-a-c-lb-3", Namespace: "butler-system"}, &butlerv1alpha1.IPAllocation{})
+	if err == nil {
+		t.Error("eligible growth allocation should have been deleted but still exists")
 	}
-	if shrinkCandidate.Name != "team-a-c-lb-3" {
-		t.Errorf("expected shrink candidate team-a-c-lb-3, got %s", shrinkCandidate.Name)
+
+	// All others should survive.
+	for _, name := range []string{"team-a-c-lb", "team-a-c-lb-1", "team-a-c-lb-2"} {
+		err := cl.Get(context.Background(), client.ObjectKey{Name: name, Namespace: "butler-system"}, &butlerv1alpha1.IPAllocation{})
+		if err != nil {
+			t.Errorf("allocation %s should have survived but was deleted", name)
+		}
 	}
 }
 

@@ -26,6 +26,12 @@ import (
 // with MetalLB's normal IP assignment, which typically completes in seconds.
 const pendingServiceMinAge = 30 * time.Second
 
+// shrinkGracePeriod is the minimum age a growth allocation must reach before
+// it can be released for having no matching tenant LB Service. This prevents
+// releasing allocations that were just created and haven't propagated to
+// MetalLB yet, or whose Services were briefly restarted.
+const shrinkGracePeriod = 10 * time.Minute
+
 // growthSuffixPattern matches the "-N" suffix on growth allocation names.
 var growthSuffixPattern = regexp.MustCompile(`-\d+$`)
 
@@ -225,13 +231,11 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 	tenantCount := inv.AssignedTenantCount
 	serviceIPs := inv.ServiceIPs
 
-	availableIPs := totalAllocated - platformCount - tenantCount
 	growthIncrement := r.getGrowthIncrement(pc)
 
 	logger.V(1).Info("elastic IPAM status",
 		"totalAllocated", totalAllocated, "platformLBs", platformCount,
-		"tenantLBs", tenantCount, "availableIPs", availableIPs,
-		"growthIncrement", growthIncrement,
+		"tenantLBs", tenantCount, "growthIncrement", growthIncrement,
 		"pendingLBServices", len(inv.PendingServices))
 
 	// Grow: demand-driven — allocate when tenant LB Services are stuck Pending
@@ -313,49 +317,47 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 		}
 	}
 
-	// Shrink: if we have more than 1 allocation and at least one growth-increment of spare capacity.
-	// Only growth allocations are shrink candidates — the initial allocation is never deleted
-	// regardless of its position in the List result (Kubernetes List ordering is undefined).
-	if len(allocs) > 1 && availableIPs >= growthIncrement {
-		var shrinkCandidate *butlerv1alpha1.IPAllocation
-		for i := len(allocs) - 1; i >= 0; i-- {
-			alloc := &allocs[i]
-			if alloc.Labels[LabelAllocationRole] != AllocationRoleGrowth {
-				continue
-			}
-			if alloc.Status.Phase != butlerv1alpha1.IPAllocationPhaseAllocated {
-				continue
-			}
-			if alloc.Spec.Count == nil {
-				continue
-			}
-			// Only shrink allocations older than 10 minutes to avoid thrashing
-			if time.Since(alloc.CreationTimestamp.Time) < 10*time.Minute {
-				continue
-			}
-			shrinkCandidate = alloc
-			break
+	// Shrink: demand-driven — release growth allocations whose IPs are not in
+	// use by any tenant LB Service for longer than the grace period. Only growth
+	// allocations are candidates; the initial allocation is never released. This
+	// replaces both the old arithmetic shrink and the separate orphan reclaim
+	// into a single demand-driven mechanism (ADR-016).
+	var shrunk bool
+	for i := range allocs {
+		alloc := &allocs[i]
+		if alloc.Labels[LabelAllocationRole] != AllocationRoleGrowth {
+			continue
 		}
-
-		if shrinkCandidate != nil {
-			logger.Info("elastic IPAM: shrinking unused allocation",
-				"allocation", shrinkCandidate.Name, "availableIPs", availableIPs)
-			if err := r.Delete(ctx, shrinkCandidate); err != nil && !apierrors.IsNotFound(err) {
-				return fmt.Errorf("failed to delete shrink allocation: %w", err)
-			}
+		if alloc.Status.Phase != butlerv1alpha1.IPAllocationPhaseAllocated {
+			continue
 		}
+		if time.Since(alloc.CreationTimestamp.Time) < shrinkGracePeriod {
+			continue
+		}
+		if allocationHasServiceIP(alloc, serviceIPs) {
+			continue
+		}
+		logger.Info("elastic IPAM: releasing unused growth allocation",
+			"allocation", alloc.Name,
+			"start", alloc.Status.StartAddress,
+			"end", alloc.Status.EndAddress,
+			"age", time.Since(alloc.CreationTimestamp.Time).Round(time.Second))
+		if err := r.Delete(ctx, alloc); err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to delete unused growth allocation", "allocation", alloc.Name)
+			continue
+		}
+		shrunk = true
 	}
 
-	// Re-fetch allocations to get a fresh slice. The shrink phase above may
-	// have deleted an allocation, so the original slice is stale. Using stale
-	// data for reclaim or MetalLB pool updates causes brief pool corruption.
-	allocs, err = r.listLBAllocations(ctx, tc)
-	if err != nil {
-		return fmt.Errorf("failed to re-list LB allocations after shrink: %w", err)
+	// Re-fetch allocations if any were deleted. The shrink phase above may have
+	// deleted allocations, so the original slice is stale. Using stale data for
+	// the MetalLB pool update causes brief pool corruption.
+	if shrunk {
+		allocs, err = r.listLBAllocations(ctx, tc)
+		if err != nil {
+			return fmt.Errorf("failed to re-list LB allocations after shrink: %w", err)
+		}
 	}
-
-	// Reclaim orphan allocations whose IPs are not used by any service on the tenant
-	r.reclaimOrphanAllocations(ctx, allocs, serviceIPs)
 
 	// Update MetalLB pool with all current allocated ranges
 	if err := r.updateMetalLBPool(ctx, tc, butlerConfig, allocs); err != nil {
@@ -521,36 +523,6 @@ func (r *Reconciler) ensurePlatformLBLabels(ctx context.Context, tc *tenant.Tena
 	svc.Labels[butlerv1alpha1.LabelPlatformLB] = "true"
 	if _, err := tc.Clientset.CoreV1().Services("traefik").Update(ctx, svc, metav1.UpdateOptions{}); err != nil {
 		logger.V(1).Info("ensurePlatformLBLabels: failed to patch label", "error", err)
-	}
-}
-
-// reclaimOrphanAllocations deletes IPAllocations whose IPs are not used by any
-// LoadBalancer service on the tenant cluster. Only allocations older than 5 minutes
-// are considered, to avoid racing normal allocation propagation.
-func (r *Reconciler) reclaimOrphanAllocations(ctx context.Context, allocs []butlerv1alpha1.IPAllocation, serviceIPs map[string]bool) {
-	logger := log.FromContext(ctx)
-
-	const orphanGracePeriod = 5 * time.Minute
-
-	for i := range allocs {
-		alloc := &allocs[i]
-		if alloc.Status.Phase != butlerv1alpha1.IPAllocationPhaseAllocated {
-			continue
-		}
-		if time.Since(alloc.CreationTimestamp.Time) < orphanGracePeriod {
-			continue
-		}
-		if allocationHasServiceIP(alloc, serviceIPs) {
-			continue
-		}
-		logger.Info("reclaiming orphan IPAllocation",
-			"allocation", alloc.Name,
-			"start", alloc.Status.StartAddress,
-			"end", alloc.Status.EndAddress,
-			"age", time.Since(alloc.CreationTimestamp.Time).Round(time.Second))
-		if err := r.Delete(ctx, alloc); err != nil && !apierrors.IsNotFound(err) {
-			logger.Error(err, "failed to delete orphan IPAllocation", "allocation", alloc.Name)
-		}
 	}
 }
 
