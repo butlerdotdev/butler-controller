@@ -51,6 +51,15 @@ const (
 	capacityEventInterval = 10 * time.Minute
 )
 
+// Capacity condition types. These are set on NetworkPool.Status.Conditions
+// to surface utilization state to integrations (kubectl, ArgoCD, Flux, etc.).
+// Intended for promotion to butler-api once the thresholds are validated.
+const (
+	ConditionCapacityWarning   = "CapacityWarning"
+	ConditionCapacityCritical  = "CapacityCritical"
+	ConditionCapacityExhausted = "CapacityExhausted"
+)
+
 // Reconciler reconciles a NetworkPool object.
 // It is the sole allocator -- it processes Pending IPAllocations.
 type Reconciler struct {
@@ -430,6 +439,13 @@ func (r *Reconciler) updatePoolStatus(ctx context.Context, pool *butlerv1alpha1.
 		ObservedGeneration: pool.Generation,
 	})
 
+	// Set capacity tier conditions based on utilization thresholds.
+	// Each condition is True when utilization exceeds its threshold.
+	if totalIPs > 0 {
+		usagePercent := float64(allocatedIPs) / float64(totalIPs) * 100
+		setCapacityConditions(pool, usagePercent, allocatedIPs, totalIPs)
+	}
+
 	// Update Prometheus metrics
 	labels := []string{pool.Name, pool.Namespace}
 	poolTotalIPs.WithLabelValues(labels...).Set(float64(totalIPs))
@@ -513,6 +529,37 @@ func (r *Reconciler) hasPreviousEvent(poolName string) bool {
 	return false
 }
 
+// setCapacityConditions sets CapacityWarning, CapacityCritical, and
+// CapacityExhausted conditions based on pool utilization thresholds.
+func setCapacityConditions(pool *butlerv1alpha1.NetworkPool, usagePercent float64, allocated, total int32) {
+	msg := fmt.Sprintf("Pool utilization is %.0f%% (%d/%d IPs)", usagePercent, allocated, total)
+
+	thresholds := []struct {
+		condType  string
+		threshold float64
+	}{
+		{ConditionCapacityWarning, 70},
+		{ConditionCapacityCritical, 85},
+		{ConditionCapacityExhausted, 95},
+	}
+
+	for _, t := range thresholds {
+		status := metav1.ConditionFalse
+		reason := "UtilizationBelowThreshold"
+		if usagePercent >= t.threshold {
+			status = metav1.ConditionTrue
+			reason = "UtilizationAboveThreshold"
+		}
+
+		meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
+			Type:               t.condType,
+			Status:             status,
+			Reason:             reason,
+			Message:            msg,
+			ObservedGeneration: pool.Generation,
+		})
+	}
+}
 // gcOrphanedAllocations deletes IPAllocations whose tenantClusterRef points
 // to a TenantCluster that no longer exists. Returns the number of allocations deleted.
 func (r *Reconciler) gcOrphanedAllocations(ctx context.Context, pool *butlerv1alpha1.NetworkPool, allocList *butlerv1alpha1.IPAllocationList) int {
