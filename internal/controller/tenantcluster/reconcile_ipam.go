@@ -317,15 +317,17 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 		}
 	}
 
-	// Shrink: demand-driven — release growth allocations whose IPs are not in
-	// use by any tenant LB Service for longer than the grace period. Only growth
-	// allocations are candidates; the initial allocation is never released. This
-	// replaces both the old arithmetic shrink and the separate orphan reclaim
-	// into a single demand-driven mechanism (ADR-016).
+	// Shrink: release growth allocations whose IPs are not in use by any tenant
+	// LB Service for longer than the grace period. Only growth allocations are
+	// candidates; the initial allocation is never released, and pinned
+	// allocations are always preserved regardless of role label.
 	var shrunk bool
 	for i := range allocs {
 		alloc := &allocs[i]
 		if alloc.Labels[LabelAllocationRole] != AllocationRoleGrowth {
+			continue
+		}
+		if alloc.Spec.PinnedRange != nil {
 			continue
 		}
 		if alloc.Status.Phase != butlerv1alpha1.IPAllocationPhaseAllocated {
@@ -658,6 +660,10 @@ func (r *Reconciler) migrateAllocationRoleLabels(ctx context.Context, allocs []b
 
 		role := AllocationRoleGrowth
 		if alloc.Name == initialName {
+			role = AllocationRoleInitial
+		} else if alloc.Spec.PinnedRange != nil {
+			// Pinned allocations are operator-defined and must never be
+			// auto-released by shrink, regardless of naming pattern.
 			role = AllocationRoleInitial
 		} else if !growthSuffixPattern.MatchString(alloc.Name) {
 			// Name doesn't match the growth pattern either — treat as initial
