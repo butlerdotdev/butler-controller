@@ -1324,3 +1324,76 @@ func TestReconcileIPAllocation_InitialLabelPresent(t *testing.T) {
 			alloc.Labels[LabelAllocationRole], AllocationRoleInitial)
 	}
 }
+
+func TestMapIPAllocationToTenantCluster(t *testing.T) {
+	r := &Reconciler{}
+
+	tests := []struct {
+		name     string
+		obj      client.Object
+		wantLen  int
+		wantName string
+		wantNS   string
+	}{
+		{
+			name: "valid allocation maps to tenant cluster",
+			obj: &butlerv1alpha1.IPAllocation{
+				Spec: butlerv1alpha1.IPAllocationSpec{
+					TenantClusterRef: butlerv1alpha1.NamespacedObjectReference{
+						Name:      "my-cluster",
+						Namespace: "team-alpha",
+					},
+				},
+			},
+			wantLen:  1,
+			wantName: "my-cluster",
+			wantNS:   "team-alpha",
+		},
+		{
+			name: "empty name returns nothing",
+			obj: &butlerv1alpha1.IPAllocation{
+				Spec: butlerv1alpha1.IPAllocationSpec{
+					TenantClusterRef: butlerv1alpha1.NamespacedObjectReference{
+						Name:      "",
+						Namespace: "team-alpha",
+					},
+				},
+			},
+			wantLen: 0,
+		},
+		{
+			name: "empty namespace returns nothing",
+			obj: &butlerv1alpha1.IPAllocation{
+				Spec: butlerv1alpha1.IPAllocationSpec{
+					TenantClusterRef: butlerv1alpha1.NamespacedObjectReference{
+						Name:      "my-cluster",
+						Namespace: "",
+					},
+				},
+			},
+			wantLen: 0,
+		},
+		{
+			name:    "wrong type returns nothing",
+			obj:     &corev1.ConfigMap{},
+			wantLen: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := r.mapIPAllocationToTenantCluster(context.Background(), tt.obj)
+			if len(result) != tt.wantLen {
+				t.Fatalf("got %d requests, want %d", len(result), tt.wantLen)
+			}
+			if tt.wantLen > 0 {
+				if result[0].Name != tt.wantName {
+					t.Errorf("name = %q, want %q", result[0].Name, tt.wantName)
+				}
+				if result[0].Namespace != tt.wantNS {
+					t.Errorf("namespace = %q, want %q", result[0].Namespace, tt.wantNS)
+				}
+			}
+		})
+	}
+}
