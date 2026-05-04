@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -43,6 +44,7 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 	}
 
 	var addonStatuses []butlerv1alpha1.AddonStatus
+	var failedAddons []string
 
 	// 1. CNI - REQUIRED, nodes won't be Ready without it
 	ciliumVersion := addons.DefaultCiliumVersion
@@ -108,6 +110,12 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 	logger.Info("installing cert-manager", "version", certManagerVersion)
 	if err := r.Installer.InstallCertManager(ctx, kubeconfigData, certManagerVersion); err != nil {
 		logger.Error(err, "failed to install cert-manager")
+		failedAddons = append(failedAddons, "cert-manager")
+		r.Recorder.Eventf(tc, corev1.EventTypeWarning, "AddonInstallFailed",
+			"cert-manager %s installation failed: %s", certManagerVersion, truncateError(err))
+		addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
+			Name: "cert-manager", Version: certManagerVersion, Status: "Failed", ManagedBy: "butler",
+		})
 	} else {
 		addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
 			Name: "cert-manager", Version: certManagerVersion, Status: "Healthy", ManagedBy: "butler",
@@ -122,6 +130,12 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 	logger.Info("installing Longhorn", "version", longhornVersion)
 	if err := r.Installer.InstallLonghorn(ctx, kubeconfigData, longhornVersion); err != nil {
 		logger.Error(err, "failed to install Longhorn")
+		failedAddons = append(failedAddons, "longhorn")
+		r.Recorder.Eventf(tc, corev1.EventTypeWarning, "AddonInstallFailed",
+			"longhorn %s installation failed: %s", longhornVersion, truncateError(err))
+		addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
+			Name: "longhorn", Version: longhornVersion, Status: "Failed", ManagedBy: "butler",
+		})
 	} else {
 		addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
 			Name: "longhorn", Version: longhornVersion, Status: "Healthy", ManagedBy: "butler",
@@ -133,25 +147,16 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 	if tc.Spec.Addons.LoadBalancer != nil && tc.Spec.Addons.LoadBalancer.Version != "" {
 		metallbVersion = tc.Spec.Addons.LoadBalancer.Version
 	}
-	var poolStart, poolEnd string
-	// Check IPAM allocation first, fall back to manual loadBalancerPool
-	if tc.Status.LBAllocationRef != nil {
-		lbAlloc := &butlerv1alpha1.IPAllocation{}
-		if err := r.Get(ctx, types.NamespacedName{
-			Name:      tc.Status.LBAllocationRef.Name,
-			Namespace: "butler-system",
-		}, lbAlloc); err == nil && lbAlloc.Status.Phase == butlerv1alpha1.IPAllocationPhaseAllocated {
-			poolStart = lbAlloc.Status.StartAddress
-			poolEnd = lbAlloc.Status.EndAddress
-		}
-	}
-	if poolStart == "" && tc.Spec.Networking.LoadBalancerPool != nil {
-		poolStart = tc.Spec.Networking.LoadBalancerPool.Start
-		poolEnd = tc.Spec.Networking.LoadBalancerPool.End
-	}
+	poolStart, poolEnd := r.resolveMetalLBPool(ctx, tc)
 	logger.Info("installing MetalLB", "version", metallbVersion, "poolStart", poolStart, "poolEnd", poolEnd)
 	if err := r.Installer.InstallMetalLB(ctx, kubeconfigData, metallbVersion, poolStart, poolEnd); err != nil {
 		logger.Error(err, "failed to install MetalLB")
+		failedAddons = append(failedAddons, "metallb")
+		r.Recorder.Eventf(tc, corev1.EventTypeWarning, "AddonInstallFailed",
+			"metallb %s installation failed: %s", metallbVersion, truncateError(err))
+		addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
+			Name: "metallb", Version: metallbVersion, Status: "Failed", ManagedBy: "butler",
+		})
 	} else {
 		addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
 			Name: "metallb", Version: metallbVersion, Status: "Healthy", ManagedBy: "butler",
@@ -167,6 +172,12 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 		logger.Info("installing Traefik", "version", traefikVersion)
 		if err := r.Installer.InstallTraefik(ctx, kubeconfigData, traefikVersion); err != nil {
 			logger.Error(err, "failed to install Traefik")
+			failedAddons = append(failedAddons, "traefik")
+			r.Recorder.Eventf(tc, corev1.EventTypeWarning, "AddonInstallFailed",
+				"traefik %s installation failed: %s", traefikVersion, truncateError(err))
+			addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
+				Name: "traefik", Version: traefikVersion, Status: "Failed", ManagedBy: "butler",
+			})
 		} else {
 			addonStatuses = append(addonStatuses, butlerv1alpha1.AddonStatus{
 				Name: "traefik", Version: traefikVersion, Status: "Healthy", ManagedBy: "butler",
@@ -182,14 +193,22 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 	}
 	tc.Status.ObservedState.Addons = addonStatuses
 
-	r.setCondition(tc, butlerv1alpha1.TenantClusterConditionAddonsReady,
-		metav1.ConditionTrue, "AddonsInstalled", "All addons installed successfully")
+	if len(failedAddons) > 0 {
+		msg := fmt.Sprintf("failed to install: %s", strings.Join(failedAddons, ", "))
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionAddonsReady,
+			metav1.ConditionFalse, ReasonAddonInstallFailed, msg)
+	} else {
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionAddonsReady,
+			metav1.ConditionTrue, "AddonsInstalled", "All addons installed successfully")
+	}
 
 	// Set kubeconfig secret reference for TenantAddon controller
 	tc.Status.KubeconfigSecretRef = &butlerv1alpha1.LocalObjectReference{
 		Name: fmt.Sprintf("%s-admin-kubeconfig", tc.Name),
 	}
 
+	// Transition to Ready even with addon failures -- the cluster is functional
+	// and the steady-state retry loop will attempt to heal failed addons.
 	tc.Status.Phase = butlerv1alpha1.TenantClusterPhaseReady
 	now := metav1.Now()
 	tc.Status.LastTransitionTime = &now
@@ -202,6 +221,106 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 	logger.Info("TenantCluster is ready", "name", tc.Name)
 
 	return ctrl.Result{}, nil
+}
+
+// resolveMetalLBPool determines the MetalLB IP pool range for a tenant cluster.
+// It checks the IPAM allocation first, then falls back to the manual loadBalancerPool spec.
+func (r *Reconciler) resolveMetalLBPool(ctx context.Context, tc *butlerv1alpha1.TenantCluster) (string, string) {
+	var poolStart, poolEnd string
+	if tc.Status.LBAllocationRef != nil {
+		lbAlloc := &butlerv1alpha1.IPAllocation{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      tc.Status.LBAllocationRef.Name,
+			Namespace: "butler-system",
+		}, lbAlloc); err == nil && lbAlloc.Status.Phase == butlerv1alpha1.IPAllocationPhaseAllocated {
+			poolStart = lbAlloc.Status.StartAddress
+			poolEnd = lbAlloc.Status.EndAddress
+		}
+	}
+	if poolStart == "" && tc.Spec.Networking.LoadBalancerPool != nil {
+		poolStart = tc.Spec.Networking.LoadBalancerPool.Start
+		poolEnd = tc.Spec.Networking.LoadBalancerPool.End
+	}
+	return poolStart, poolEnd
+}
+
+// reconcileAddonHealth checks for failed platform addons on a Ready cluster and
+// attempts to reinstall them. Returns true if any addons still need retry, which
+// signals the caller to cap the requeue interval.
+func (r *Reconciler) reconcileAddonHealth(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) (bool, error) {
+	logger := log.FromContext(ctx)
+
+	if tc.Status.ObservedState == nil || len(tc.Status.ObservedState.Addons) == 0 {
+		return false, nil
+	}
+
+	// Collect failed addons from observed state
+	var failed []butlerv1alpha1.AddonStatus
+	for _, a := range tc.Status.ObservedState.Addons {
+		if a.Status == "Failed" {
+			failed = append(failed, a)
+		}
+	}
+	if len(failed) == 0 {
+		return false, nil
+	}
+
+	kubeconfigData, err := r.getTenantKubeconfig(ctx, tc, butlerConfig)
+	if err != nil {
+		return true, fmt.Errorf("addon health: failed to get tenant kubeconfig: %w", err)
+	}
+
+	var stillFailed []string
+	updated := make(map[string]string) // addon name -> new status
+
+	for _, addon := range failed {
+		var installErr error
+		switch addon.Name {
+		case "cert-manager":
+			installErr = r.Installer.InstallCertManager(ctx, kubeconfigData, addon.Version)
+		case "longhorn":
+			installErr = r.Installer.InstallLonghorn(ctx, kubeconfigData, addon.Version)
+		case "metallb":
+			poolStart, poolEnd := r.resolveMetalLBPool(ctx, tc)
+			installErr = r.Installer.InstallMetalLB(ctx, kubeconfigData, addon.Version, poolStart, poolEnd)
+		case "traefik":
+			installErr = r.Installer.InstallTraefik(ctx, kubeconfigData, addon.Version)
+		default:
+			logger.V(1).Info("skipping unknown addon for retry", "addon", addon.Name)
+			continue
+		}
+
+		if installErr != nil {
+			logger.Error(installErr, "addon retry failed", "addon", addon.Name)
+			stillFailed = append(stillFailed, addon.Name)
+		} else {
+			logger.Info("addon retry succeeded", "addon", addon.Name)
+			r.Recorder.Eventf(tc, corev1.EventTypeNormal, "AddonRetrySucceeded",
+				"%s installed successfully on retry", addon.Name)
+			updated[addon.Name] = "Healthy"
+		}
+	}
+
+	// Apply status changes to observed state
+	if len(updated) > 0 {
+		for i := range tc.Status.ObservedState.Addons {
+			if newStatus, ok := updated[tc.Status.ObservedState.Addons[i].Name]; ok {
+				tc.Status.ObservedState.Addons[i].Status = newStatus
+			}
+		}
+	}
+
+	// Update AddonsReady condition
+	if len(stillFailed) > 0 {
+		msg := fmt.Sprintf("failed to install: %s", strings.Join(stillFailed, ", "))
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionAddonsReady,
+			metav1.ConditionFalse, ReasonAddonInstallFailed, msg)
+	} else {
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionAddonsReady,
+			metav1.ConditionTrue, "AddonsInstalled", "All addons installed successfully")
+	}
+
+	return len(stillFailed) > 0, nil
 }
 
 // reconcileAutoEnrollObservability creates TenantAddon resources for observability
