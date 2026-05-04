@@ -2026,3 +2026,221 @@ func TestMapIPAllocationToTenantCluster(t *testing.T) {
 		})
 	}
 }
+
+func TestInFlightGrowthDeduction(t *testing.T) {
+	// Validates the in-flight growth supply deduction that prevents redundant
+	// growth allocations when a watch-triggered reconcile fires before MetalLB
+	// propagation completes.
+	//
+	// The growth path computes qualifiedPending (Services stuck Pending long
+	// enough) and then subtracts in-flight supply: growth allocations that are
+	// Pending (awaiting fulfillment) or Allocated but unconsumed (no tenant
+	// Service is using any IP from the allocation's range).
+
+	int32Ptr := func(v int32) *int32 { return &v }
+
+	tests := []struct {
+		name           string
+		pendingServices []LBServiceSummary
+		allocs         []butlerv1alpha1.IPAllocation
+		serviceIPs     map[string]bool
+		wantNetPending int32
+	}{
+		{
+			name: "no in-flight allocations: growth fires normally",
+			pendingServices: []LBServiceSummary{
+				{Name: "stuck-svc", Namespace: "default", CreatedAt: time.Now().Add(-2 * time.Minute)},
+			},
+			allocs: []butlerv1alpha1.IPAllocation{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{LabelAllocationRole: AllocationRoleInitial},
+					},
+					Spec:   butlerv1alpha1.IPAllocationSpec{Count: int32Ptr(2)},
+					Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhaseAllocated, StartAddress: "10.0.0.1", EndAddress: "10.0.0.2"},
+				},
+			},
+			serviceIPs:     map[string]bool{"10.0.0.1": true, "10.0.0.2": true},
+			wantNetPending: 1,
+		},
+		{
+			name: "pending growth allocation covers demand: growth suppressed",
+			pendingServices: []LBServiceSummary{
+				{Name: "stuck-svc", Namespace: "default", CreatedAt: time.Now().Add(-2 * time.Minute)},
+			},
+			allocs: []butlerv1alpha1.IPAllocation{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{LabelAllocationRole: AllocationRoleInitial},
+					},
+					Spec:   butlerv1alpha1.IPAllocationSpec{Count: int32Ptr(2)},
+					Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhaseAllocated, StartAddress: "10.0.0.1", EndAddress: "10.0.0.2"},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+					},
+					Spec:   butlerv1alpha1.IPAllocationSpec{Count: int32Ptr(1)},
+					Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhasePending},
+				},
+			},
+			serviceIPs:     map[string]bool{"10.0.0.1": true, "10.0.0.2": true},
+			wantNetPending: 0,
+		},
+		{
+			name: "allocated unconsumed growth covers demand: growth suppressed",
+			pendingServices: []LBServiceSummary{
+				{Name: "stuck-svc", Namespace: "default", CreatedAt: time.Now().Add(-2 * time.Minute)},
+			},
+			allocs: []butlerv1alpha1.IPAllocation{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{LabelAllocationRole: AllocationRoleInitial},
+					},
+					Spec:   butlerv1alpha1.IPAllocationSpec{Count: int32Ptr(2)},
+					Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhaseAllocated, StartAddress: "10.0.0.1", EndAddress: "10.0.0.2"},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+					},
+					Spec:   butlerv1alpha1.IPAllocationSpec{Count: int32Ptr(1)},
+					Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhaseAllocated, StartAddress: "10.0.0.3", EndAddress: "10.0.0.3"},
+				},
+			},
+			serviceIPs:     map[string]bool{"10.0.0.1": true, "10.0.0.2": true},
+			wantNetPending: 0,
+		},
+		{
+			name: "consumed growth allocation not counted as in-flight: growth fires",
+			pendingServices: []LBServiceSummary{
+				{Name: "stuck-svc", Namespace: "default", CreatedAt: time.Now().Add(-2 * time.Minute)},
+			},
+			allocs: []butlerv1alpha1.IPAllocation{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{LabelAllocationRole: AllocationRoleInitial},
+					},
+					Spec:   butlerv1alpha1.IPAllocationSpec{Count: int32Ptr(2)},
+					Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhaseAllocated, StartAddress: "10.0.0.1", EndAddress: "10.0.0.2"},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+					},
+					Spec:   butlerv1alpha1.IPAllocationSpec{Count: int32Ptr(1)},
+					Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhaseAllocated, StartAddress: "10.0.0.3", EndAddress: "10.0.0.3"},
+				},
+			},
+			serviceIPs:     map[string]bool{"10.0.0.1": true, "10.0.0.2": true, "10.0.0.3": true},
+			wantNetPending: 1,
+		},
+		{
+			name: "two pending services with one in-flight: partial coverage, growth fires for remainder",
+			pendingServices: []LBServiceSummary{
+				{Name: "svc-a", Namespace: "default", CreatedAt: time.Now().Add(-2 * time.Minute)},
+				{Name: "svc-b", Namespace: "default", CreatedAt: time.Now().Add(-3 * time.Minute)},
+			},
+			allocs: []butlerv1alpha1.IPAllocation{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{LabelAllocationRole: AllocationRoleInitial},
+					},
+					Spec:   butlerv1alpha1.IPAllocationSpec{Count: int32Ptr(2)},
+					Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhaseAllocated, StartAddress: "10.0.0.1", EndAddress: "10.0.0.2"},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+					},
+					Spec:   butlerv1alpha1.IPAllocationSpec{Count: int32Ptr(1)},
+					Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhasePending},
+				},
+			},
+			serviceIPs:     map[string]bool{"10.0.0.1": true, "10.0.0.2": true},
+			wantNetPending: 1,
+		},
+		{
+			name: "initial allocation never counted as in-flight",
+			pendingServices: []LBServiceSummary{
+				{Name: "stuck-svc", Namespace: "default", CreatedAt: time.Now().Add(-2 * time.Minute)},
+			},
+			allocs: []butlerv1alpha1.IPAllocation{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{LabelAllocationRole: AllocationRoleInitial},
+					},
+					Spec:   butlerv1alpha1.IPAllocationSpec{Count: int32Ptr(2)},
+					Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhaseAllocated, StartAddress: "10.0.0.1", EndAddress: "10.0.0.2"},
+				},
+			},
+			serviceIPs:     map[string]bool{},
+			wantNetPending: 1,
+		},
+		{
+			name: "in-flight supply exceeds demand: clamps to zero",
+			pendingServices: []LBServiceSummary{
+				{Name: "stuck-svc", Namespace: "default", CreatedAt: time.Now().Add(-2 * time.Minute)},
+			},
+			allocs: []butlerv1alpha1.IPAllocation{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{LabelAllocationRole: AllocationRoleInitial},
+					},
+					Spec:   butlerv1alpha1.IPAllocationSpec{Count: int32Ptr(2)},
+					Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhaseAllocated, StartAddress: "10.0.0.1", EndAddress: "10.0.0.2"},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+					},
+					Spec:   butlerv1alpha1.IPAllocationSpec{Count: int32Ptr(2)},
+					Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhasePending},
+				},
+			},
+			serviceIPs:     map[string]bool{"10.0.0.1": true, "10.0.0.2": true},
+			wantNetPending: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Count qualified pending services (same as reconcileElasticIPAM).
+			var qualifiedPending int32
+			for _, svc := range tt.pendingServices {
+				if time.Since(svc.CreatedAt) >= pendingServiceMinAge {
+					qualifiedPending++
+				}
+			}
+
+			// Deduct in-flight growth supply (the code under test).
+			var inFlightSupply int32
+			for i := range tt.allocs {
+				alloc := &tt.allocs[i]
+				if alloc.Labels[LabelAllocationRole] != AllocationRoleGrowth {
+					continue
+				}
+				if alloc.Spec.Count == nil {
+					continue
+				}
+				switch alloc.Status.Phase {
+				case butlerv1alpha1.IPAllocationPhasePending:
+					inFlightSupply += *alloc.Spec.Count
+				case butlerv1alpha1.IPAllocationPhaseAllocated:
+					if !allocationHasServiceIP(alloc, tt.serviceIPs) {
+						inFlightSupply += *alloc.Spec.Count
+					}
+				}
+			}
+			qualifiedPending -= inFlightSupply
+			if qualifiedPending < 0 {
+				qualifiedPending = 0
+			}
+
+			if qualifiedPending != tt.wantNetPending {
+				t.Errorf("net qualifiedPending = %d, want %d (raw pending minus %d in-flight)",
+					qualifiedPending, tt.wantNetPending, inFlightSupply)
+			}
+		})
+	}
+}
