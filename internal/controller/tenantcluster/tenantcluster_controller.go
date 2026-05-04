@@ -77,10 +77,15 @@ const (
 	ReasonAddonInstallFailed     = "AddonInstallFailed"
 )
 
-// PlatformAddonInstaller abstracts the addon installation methods used by the
-// TenantCluster controller. The concrete implementation is *addons.Installer;
-// tests can supply a mock.
-type PlatformAddonInstaller interface {
+// AddonInstaller abstracts the addon installation methods consumed by the
+// TenantCluster controller. Defined here (consumer side) rather than in the
+// addons package so the interface stays narrow to actual usage. The concrete
+// implementation is *addons.Installer, which shells out to Helm; this interface
+// enables unit testing of retry logic, condition setting, and event emission
+// without requiring Helm or kubectl. Other controllers that install addons
+// (tenantaddon, managementaddon) use the concrete type directly today but
+// could adopt this pattern in follow-up work.
+type AddonInstaller interface {
 	InstallCilium(ctx context.Context, kubeconfig []byte, cfg addons.CiliumConfig) error
 	InstallCertManager(ctx context.Context, kubeconfig []byte, version string) error
 	InstallLonghorn(ctx context.Context, kubeconfig []byte, version string) error
@@ -92,7 +97,7 @@ type PlatformAddonInstaller interface {
 type Reconciler struct {
 	client.Client
 	Scheme                  *runtime.Scheme
-	Installer               PlatformAddonInstaller
+	Installer               AddonInstaller
 	ClientManager           *tenant.ClientManager
 	Recorder                record.EventRecorder
 	MaxConcurrentReconciles int

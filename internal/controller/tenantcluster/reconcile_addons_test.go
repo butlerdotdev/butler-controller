@@ -18,7 +18,7 @@ import (
 	"github.com/butlerdotdev/butler-controller/internal/addons"
 )
 
-// mockInstaller implements PlatformAddonInstaller for testing.
+// mockInstaller implements AddonInstaller for testing.
 type mockInstaller struct {
 	installCertManagerErr error
 	installLonghornErr    error
