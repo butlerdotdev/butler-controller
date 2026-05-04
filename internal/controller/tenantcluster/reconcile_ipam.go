@@ -249,6 +249,42 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 		}
 	}
 
+	// Deduct in-flight growth allocations whose IPs haven't been consumed
+	// by any tenant LB Service yet. A Pending growth allocation means the
+	// NetworkPool controller hasn't fulfilled it. An Allocated growth
+	// allocation with no matching Service IP means the IPs reached the pool
+	// but MetalLB hasn't assigned them to a Service. Both represent supply
+	// already committed to satisfy demand — counting them prevents redundant
+	// growth when a watch-triggered reconcile fires before MetalLB
+	// propagation completes.
+	var inFlightSupply int32
+	for i := range allocs {
+		alloc := &allocs[i]
+		if alloc.Labels[LabelAllocationRole] != AllocationRoleGrowth {
+			continue
+		}
+		if alloc.Spec.Count == nil {
+			continue
+		}
+		switch alloc.Status.Phase {
+		case butlerv1alpha1.IPAllocationPhasePending:
+			inFlightSupply += *alloc.Spec.Count
+		case butlerv1alpha1.IPAllocationPhaseAllocated:
+			if !allocationHasServiceIP(alloc, serviceIPs) {
+				inFlightSupply += *alloc.Spec.Count
+			}
+		}
+	}
+	qualifiedPending -= inFlightSupply
+	if qualifiedPending < 0 {
+		qualifiedPending = 0
+	}
+	if inFlightSupply > 0 {
+		logger.V(1).Info("elastic IPAM: in-flight growth supply deducted from demand",
+			"rawPending", qualifiedPending+inFlightSupply, "inFlightSupply", inFlightSupply,
+			"netPending", qualifiedPending)
+	}
+
 	if qualifiedPending > 0 {
 		// Batch assessment: allocate enough IPs for all qualified Pending services,
 		// but at least growthIncrement to avoid undersized allocations.
