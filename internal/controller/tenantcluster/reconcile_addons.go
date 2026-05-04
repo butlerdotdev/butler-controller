@@ -244,24 +244,66 @@ func (r *Reconciler) resolveMetalLBPool(ctx context.Context, tc *butlerv1alpha1.
 	return poolStart, poolEnd
 }
 
-// reconcileAddonHealth checks for failed platform addons on a Ready cluster and
-// attempts to reinstall them. Returns true if any addons still need retry, which
-// signals the caller to cap the requeue interval.
+// reconcileAddonHealth checks for failed or missing platform addons on a Ready
+// cluster and attempts to reinstall them. An addon needs retry if it is recorded
+// as Failed in observedState OR if it is expected by the spec but absent from
+// observedState entirely (e.g., it failed silently during initial install before
+// failure tracking was added). Returns true if any addons still need retry,
+// which signals the caller to cap the requeue interval.
 func (r *Reconciler) reconcileAddonHealth(ctx context.Context, tc *butlerv1alpha1.TenantCluster, butlerConfig *butlerv1alpha1.ButlerConfig) (bool, error) {
 	logger := log.FromContext(ctx)
 
-	if tc.Status.ObservedState == nil || len(tc.Status.ObservedState.Addons) == 0 {
-		return false, nil
+	// Build the expected non-CNI addons list from the spec. Cilium is excluded
+	// because its failure is fatal during initial install and it requires
+	// CiliumConfig (not just a version string).
+	type expectedAddon struct {
+		name    string
+		version string
 	}
 
-	// Collect failed addons from observed state
-	var failed []butlerv1alpha1.AddonStatus
-	for _, a := range tc.Status.ObservedState.Addons {
-		if a.Status == "Failed" {
-			failed = append(failed, a)
+	certManagerVersion := addons.DefaultCertManagerVersion
+	if tc.Spec.Addons.CertManager != nil && tc.Spec.Addons.CertManager.Version != "" {
+		certManagerVersion = tc.Spec.Addons.CertManager.Version
+	}
+	longhornVersion := addons.DefaultLonghornVersion
+	if tc.Spec.Addons.Storage != nil && tc.Spec.Addons.Storage.Version != "" {
+		longhornVersion = tc.Spec.Addons.Storage.Version
+	}
+	metallbVersion := addons.DefaultMetalLBVersion
+	if tc.Spec.Addons.LoadBalancer != nil && tc.Spec.Addons.LoadBalancer.Version != "" {
+		metallbVersion = tc.Spec.Addons.LoadBalancer.Version
+	}
+
+	expected := []expectedAddon{
+		{"cert-manager", certManagerVersion},
+		{"longhorn", longhornVersion},
+		{"metallb", metallbVersion},
+	}
+	if tc.Spec.Addons.Ingress.IsIngressEnabled() {
+		traefikVersion := addons.DefaultTraefikVersion
+		if tc.Spec.Addons.Ingress != nil && tc.Spec.Addons.Ingress.Version != "" {
+			traefikVersion = tc.Spec.Addons.Ingress.Version
+		}
+		expected = append(expected, expectedAddon{"traefik", traefikVersion})
+	}
+
+	// Index observed state by addon name for lookup.
+	observed := make(map[string]string) // name -> status
+	if tc.Status.ObservedState != nil {
+		for _, a := range tc.Status.ObservedState.Addons {
+			observed[a.Name] = a.Status
 		}
 	}
-	if len(failed) == 0 {
+
+	// Collect addons that need retry: Failed in observedState OR absent entirely.
+	var needsRetry []expectedAddon
+	for _, ea := range expected {
+		status, present := observed[ea.name]
+		if !present || status == "Failed" {
+			needsRetry = append(needsRetry, ea)
+		}
+	}
+	if len(needsRetry) == 0 {
 		return false, nil
 	}
 
@@ -271,43 +313,31 @@ func (r *Reconciler) reconcileAddonHealth(ctx context.Context, tc *butlerv1alpha
 	}
 
 	var stillFailed []string
-	updated := make(map[string]string) // addon name -> new status
 
-	for _, addon := range failed {
+	for _, addon := range needsRetry {
 		var installErr error
-		switch addon.Name {
+		switch addon.name {
 		case "cert-manager":
-			installErr = r.Installer.InstallCertManager(ctx, kubeconfigData, addon.Version)
+			installErr = r.Installer.InstallCertManager(ctx, kubeconfigData, addon.version)
 		case "longhorn":
-			installErr = r.Installer.InstallLonghorn(ctx, kubeconfigData, addon.Version)
+			installErr = r.Installer.InstallLonghorn(ctx, kubeconfigData, addon.version)
 		case "metallb":
 			poolStart, poolEnd := r.resolveMetalLBPool(ctx, tc)
-			installErr = r.Installer.InstallMetalLB(ctx, kubeconfigData, addon.Version, poolStart, poolEnd)
+			installErr = r.Installer.InstallMetalLB(ctx, kubeconfigData, addon.version, poolStart, poolEnd)
 		case "traefik":
-			installErr = r.Installer.InstallTraefik(ctx, kubeconfigData, addon.Version)
-		default:
-			logger.V(1).Info("skipping unknown addon for retry", "addon", addon.Name)
-			continue
+			installErr = r.Installer.InstallTraefik(ctx, kubeconfigData, addon.version)
 		}
 
 		if installErr != nil {
-			logger.Error(installErr, "addon retry failed", "addon", addon.Name)
-			stillFailed = append(stillFailed, addon.Name)
+			logger.Error(installErr, "addon retry failed", "addon", addon.name)
+			stillFailed = append(stillFailed, addon.name)
 		} else {
-			logger.Info("addon retry succeeded", "addon", addon.Name)
+			logger.Info("addon retry succeeded", "addon", addon.name)
 			r.Recorder.Eventf(tc, corev1.EventTypeNormal, "AddonRetrySucceeded",
-				"%s installed successfully on retry", addon.Name)
-			updated[addon.Name] = "Healthy"
+				"%s installed successfully on retry", addon.name)
 		}
-	}
-
-	// Apply status changes to observed state
-	if len(updated) > 0 {
-		for i := range tc.Status.ObservedState.Addons {
-			if newStatus, ok := updated[tc.Status.ObservedState.Addons[i].Name]; ok {
-				tc.Status.ObservedState.Addons[i].Status = newStatus
-			}
-		}
+		// Update or append observedState entry.
+		r.upsertAddonStatus(tc, addon.name, addon.version, installErr)
 	}
 
 	// Update AddonsReady condition
@@ -321,6 +351,31 @@ func (r *Reconciler) reconcileAddonHealth(ctx context.Context, tc *butlerv1alpha
 	}
 
 	return len(stillFailed) > 0, nil
+}
+
+// upsertAddonStatus updates an existing addon entry in observedState or appends
+// a new one if the addon was absent.
+func (r *Reconciler) upsertAddonStatus(tc *butlerv1alpha1.TenantCluster, name, version string, installErr error) {
+	status := "Healthy"
+	if installErr != nil {
+		status = "Failed"
+	}
+
+	if tc.Status.ObservedState == nil {
+		tc.Status.ObservedState = &butlerv1alpha1.ObservedClusterState{}
+	}
+
+	for i := range tc.Status.ObservedState.Addons {
+		if tc.Status.ObservedState.Addons[i].Name == name {
+			tc.Status.ObservedState.Addons[i].Status = status
+			tc.Status.ObservedState.Addons[i].Version = version
+			return
+		}
+	}
+	// Absent: append new entry.
+	tc.Status.ObservedState.Addons = append(tc.Status.ObservedState.Addons, butlerv1alpha1.AddonStatus{
+		Name: name, Version: version, Status: status, ManagedBy: "butler",
+	})
 }
 
 // reconcileAutoEnrollObservability creates TenantAddon resources for observability
