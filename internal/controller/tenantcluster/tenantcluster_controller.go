@@ -74,12 +74,25 @@ const (
 	ReasonProviderConfigNotFound = "ProviderConfigNotFound"
 	ReasonCAPIResourceError      = "CAPIResourceError"
 	ReasonReady                  = "Ready"
+	ReasonAddonInstallFailed     = "AddonInstallFailed"
 )
+
+// PlatformAddonInstaller abstracts the addon installation methods used by the
+// TenantCluster controller. The concrete implementation is *addons.Installer;
+// tests can supply a mock.
+type PlatformAddonInstaller interface {
+	InstallCilium(ctx context.Context, kubeconfig []byte, cfg addons.CiliumConfig) error
+	InstallCertManager(ctx context.Context, kubeconfig []byte, version string) error
+	InstallLonghorn(ctx context.Context, kubeconfig []byte, version string) error
+	InstallMetalLB(ctx context.Context, kubeconfig []byte, version, poolStart, poolEnd string) error
+	InstallTraefik(ctx context.Context, kubeconfig []byte, version string) error
+	UpdateMetalLBPool(ctx context.Context, kubeconfig []byte, ranges []string) error
+}
 
 type Reconciler struct {
 	client.Client
 	Scheme                  *runtime.Scheme
-	Installer               *addons.Installer
+	Installer               PlatformAddonInstaller
 	ClientManager           *tenant.ClientManager
 	Recorder                record.EventRecorder
 	MaxConcurrentReconciles int
@@ -257,12 +270,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// failing the reconcile. The cluster remains Ready but operators can see
 	// which background operations need attention.
 	var degraded []string
+	addonRetryNeeded := false
 
 	if tc.Status.Phase == butlerv1alpha1.TenantClusterPhaseReady {
 		if err := r.reconcileAutoEnrollObservability(ctx, tc, butlerConfig); err != nil {
 			logger.Error(err, "failed to auto-enroll observability agents")
 			degraded = append(degraded, "observability sync failed ("+truncateError(err)+")")
 		}
+
+		retryNeeded, err := r.reconcileAddonHealth(ctx, tc, butlerConfig)
+		if err != nil {
+			logger.Error(err, "addon health check failed")
+			degraded = append(degraded, "addon health failed ("+truncateError(err)+")")
+		}
+		addonRetryNeeded = retryNeeded
 	}
 
 	if err := r.reconcileMachineDeploymentReplicas(ctx, tc, butlerConfig); err != nil {
@@ -325,7 +346,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{RequeueAfter: r.calculateRequeueInterval(tc)}, nil
+	requeueAfter := r.calculateRequeueInterval(tc)
+	// When addons need retry, cap requeue at 10 minutes so failed addons
+	// don't wait the full 15-minute mature-cluster interval.
+	if addonRetryNeeded && requeueAfter > 10*time.Minute {
+		requeueAfter = 10 * time.Minute
+	}
+
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 func (r *Reconciler) setFailedStatus(ctx context.Context, tc *butlerv1alpha1.TenantCluster, reason, message string) (ctrl.Result, error) {
