@@ -93,6 +93,14 @@ func (r *Reconciler) reconcileIPAllocation(ctx context.Context, tc *butlerv1alph
 	// Create new allocation — try pools in priority order
 	lbCount := r.getInitialLBPoolSize(tc, pc)
 
+	if lbCount == 0 {
+		logger.Info("initial LB pool size is zero, skipping LB IP allocation")
+		r.setCondition(tc, butlerv1alpha1.TenantClusterConditionNetworkReady,
+			metav1.ConditionTrue, butlerv1alpha1.ReasonReady,
+			"LB IP allocation skipped (initial pool size 0)")
+		return true, nil
+	}
+
 	// Enforce quota on initial allocation
 	if pc.Spec.Network.QuotaPerTenant != nil && pc.Spec.Network.QuotaPerTenant.MaxLoadBalancerIPs != nil {
 		maxLB := *pc.Spec.Network.QuotaPerTenant.MaxLoadBalancerIPs
@@ -190,10 +198,6 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 	allocs, err := r.listLBAllocations(ctx, tc)
 	if err != nil {
 		return fmt.Errorf("failed to list LB allocations: %w", err)
-	}
-
-	if len(allocs) == 0 {
-		return nil // No allocations yet, initial allocation handles this
 	}
 
 	// Migration: label any pre-existing allocations that lack the allocation-role label.
@@ -406,10 +410,18 @@ func (r *Reconciler) reconcileElasticIPAM(ctx context.Context, tc *butlerv1alpha
 }
 
 func (r *Reconciler) getInitialLBPoolSize(tc *butlerv1alpha1.TenantCluster, pc *butlerv1alpha1.ProviderConfig) int32 {
-	// TC override takes priority
+	// TC override takes priority -- explicit pool size means the user
+	// wants LB IPs regardless of ingress configuration.
 	if tc.Spec.Networking.LBPoolSize != nil {
 		return *tc.Spec.Networking.LBPoolSize
 	}
+
+	// In elastic mode, ingress-disabled tenants start with 0 IPs.
+	// Elastic growth allocates on-demand when LB Services appear.
+	if r.isElasticIPAM(pc) && !tc.Spec.Addons.Ingress.IsIngressEnabled() {
+		return 0
+	}
+
 	if pc.Spec.Network != nil && pc.Spec.Network.LoadBalancer != nil {
 		lb := pc.Spec.Network.LoadBalancer
 		if lb.AllocationMode == "elastic" {
