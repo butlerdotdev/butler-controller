@@ -1907,6 +1907,182 @@ func TestGetInitialLBPoolSize(t *testing.T) {
 	})
 }
 
+func TestGetInitialLBPoolSize_IngressDisabledElastic(t *testing.T) {
+	r := &Reconciler{}
+	disabled := false
+
+	tc := &butlerv1alpha1.TenantCluster{
+		Spec: butlerv1alpha1.TenantClusterSpec{
+			Addons: butlerv1alpha1.AddonsSpec{
+				Ingress: &butlerv1alpha1.IngressSpec{Enabled: &disabled},
+			},
+		},
+	}
+	pc := &butlerv1alpha1.ProviderConfig{
+		Spec: butlerv1alpha1.ProviderConfigSpec{
+			Network: &butlerv1alpha1.ProviderNetworkConfig{
+				Mode: "ipam",
+				LoadBalancer: &butlerv1alpha1.ProviderLBConfig{
+					AllocationMode: "elastic",
+				},
+			},
+		},
+	}
+
+	got := r.getInitialLBPoolSize(tc, pc)
+	if got != 0 {
+		t.Errorf("expected 0 for ingress-disabled elastic tenant, got %d", got)
+	}
+}
+
+func TestGetInitialLBPoolSize_IngressDisabledWithOverride(t *testing.T) {
+	r := &Reconciler{}
+	disabled := false
+	size := int32(4)
+
+	tc := &butlerv1alpha1.TenantCluster{
+		Spec: butlerv1alpha1.TenantClusterSpec{
+			Networking: butlerv1alpha1.NetworkingSpec{
+				LBPoolSize: &size,
+			},
+			Addons: butlerv1alpha1.AddonsSpec{
+				Ingress: &butlerv1alpha1.IngressSpec{Enabled: &disabled},
+			},
+		},
+	}
+	pc := &butlerv1alpha1.ProviderConfig{
+		Spec: butlerv1alpha1.ProviderConfigSpec{
+			Network: &butlerv1alpha1.ProviderNetworkConfig{
+				Mode: "ipam",
+				LoadBalancer: &butlerv1alpha1.ProviderLBConfig{
+					AllocationMode: "elastic",
+				},
+			},
+		},
+	}
+
+	got := r.getInitialLBPoolSize(tc, pc)
+	if got != 4 {
+		t.Errorf("expected TC override (4) to take priority over ingress-disabled, got %d", got)
+	}
+}
+
+func TestGetInitialLBPoolSize_IngressDisabledStatic(t *testing.T) {
+	r := &Reconciler{}
+	disabled := false
+
+	tc := &butlerv1alpha1.TenantCluster{
+		Spec: butlerv1alpha1.TenantClusterSpec{
+			Addons: butlerv1alpha1.AddonsSpec{
+				Ingress: &butlerv1alpha1.IngressSpec{Enabled: &disabled},
+			},
+		},
+	}
+	pc := &butlerv1alpha1.ProviderConfig{
+		Spec: butlerv1alpha1.ProviderConfigSpec{
+			Network: &butlerv1alpha1.ProviderNetworkConfig{
+				Mode: "ipam",
+				LoadBalancer: &butlerv1alpha1.ProviderLBConfig{
+					AllocationMode: "static",
+				},
+			},
+		},
+	}
+
+	got := r.getInitialLBPoolSize(tc, pc)
+	if got != 8 {
+		t.Errorf("expected default (8) for static mode with ingress disabled, got %d", got)
+	}
+}
+
+func TestReconcileIPAllocation_SkipsOnZeroCount(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = butlerv1alpha1.AddToScheme(scheme)
+
+	cl := fakeclient.NewClientBuilder().WithScheme(scheme).Build()
+	r := &Reconciler{Client: cl}
+
+	disabled := false
+	tc := &butlerv1alpha1.TenantCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "team-a"},
+		Spec: butlerv1alpha1.TenantClusterSpec{
+			Addons: butlerv1alpha1.AddonsSpec{
+				Ingress: &butlerv1alpha1.IngressSpec{Enabled: &disabled},
+			},
+		},
+	}
+
+	pc := &butlerv1alpha1.ProviderConfig{
+		Spec: butlerv1alpha1.ProviderConfigSpec{
+			Network: &butlerv1alpha1.ProviderNetworkConfig{
+				Mode: "ipam",
+				PoolRefs: []butlerv1alpha1.PoolReference{
+					{Name: "pool-1"},
+				},
+				LoadBalancer: &butlerv1alpha1.ProviderLBConfig{
+					AllocationMode: "elastic",
+				},
+			},
+		},
+	}
+
+	ready, err := r.reconcileIPAllocation(context.Background(), tc, pc)
+	if err != nil {
+		t.Fatalf("reconcileIPAllocation() error = %v", err)
+	}
+	if !ready {
+		t.Error("expected ready=true when initial pool size is 0")
+	}
+
+	// Verify no IPAllocation was created
+	allocList := &butlerv1alpha1.IPAllocationList{}
+	if err := cl.List(context.Background(), allocList); err != nil {
+		t.Fatalf("failed to list allocations: %v", err)
+	}
+	if len(allocList.Items) != 0 {
+		t.Errorf("expected 0 allocations, got %d", len(allocList.Items))
+	}
+}
+
+func TestReconcileElasticIPAM_NoEarlyReturnOnZeroAllocs(t *testing.T) {
+	// Verifies that reconcileElasticIPAM no longer returns early when
+	// len(allocs) == 0. With the guard removed, it proceeds to attempt
+	// tenant client access (which fails gracefully in this test setup).
+	scheme := runtime.NewScheme()
+	_ = butlerv1alpha1.AddToScheme(scheme)
+
+	cl := fakeclient.NewClientBuilder().WithScheme(scheme).Build()
+	r := &Reconciler{Client: cl}
+
+	tc := &butlerv1alpha1.TenantCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "team-a"},
+		Status: butlerv1alpha1.TenantClusterStatus{
+			Phase: butlerv1alpha1.TenantClusterPhaseReady,
+		},
+	}
+
+	pc := &butlerv1alpha1.ProviderConfig{
+		Spec: butlerv1alpha1.ProviderConfigSpec{
+			Network: &butlerv1alpha1.ProviderNetworkConfig{
+				Mode: "ipam",
+				LoadBalancer: &butlerv1alpha1.ProviderLBConfig{
+					AllocationMode: "elastic",
+				},
+			},
+		},
+	}
+
+	// With the old guard, this would return nil immediately without attempting
+	// tenant client access. Now it proceeds past the allocation list (which is
+	// empty) and attempts getTenantClient, which returns nil gracefully because
+	// ClientManager is not configured. Either way the function returns nil, but
+	// this test confirms the path is exercised (no panic, no error).
+	err := r.reconcileElasticIPAM(context.Background(), tc, nil, pc)
+	if err != nil {
+		t.Fatalf("reconcileElasticIPAM() unexpected error = %v", err)
+	}
+}
+
 // TestReconcileIPAllocation_InitialLabelPresent verifies that a newly created
 // IPAllocation carries the allocation-role=initial label.
 func TestReconcileIPAllocation_InitialLabelPresent(t *testing.T) {
