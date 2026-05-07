@@ -5,6 +5,7 @@ package tenantcluster
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -12,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
@@ -783,5 +785,340 @@ func TestResolveMetalLBPool_NoPool(t *testing.T) {
 	}
 	if end != "" {
 		t.Errorf("poolEnd = %q, want empty", end)
+	}
+}
+
+func makeExtensionValues(t *testing.T, v map[string]interface{}) *butlerv1alpha1.ExtensionValues {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("failed to marshal values: %v", err)
+	}
+	return &butlerv1alpha1.ExtensionValues{Raw: raw}
+}
+
+func TestEnsureAutoEnrolledAddon_CreatesNew(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = butlerv1alpha1.AddToScheme(scheme)
+
+	tc := &butlerv1alpha1.TenantCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "team-a",
+			UID:       "abc-123",
+			Labels:    map[string]string{butlerv1alpha1.LabelTeam: "team-a"},
+		},
+	}
+
+	cl := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(tc).
+		Build()
+
+	r := &Reconciler{Client: cl, Scheme: scheme}
+
+	values := makeExtensionValues(t, map[string]interface{}{
+		"customConfig": map[string]interface{}{
+			"sinks": map[string]interface{}{
+				"aggregator": map[string]interface{}{"uri": "http://10.0.0.1:8080"},
+			},
+		},
+	})
+
+	err := r.ensureAutoEnrolledAddon(context.Background(), tc, "vector-agent", values)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	created := &butlerv1alpha1.TenantAddon{}
+	err = cl.Get(context.Background(), client.ObjectKey{Name: "test-cluster-vector-agent", Namespace: "team-a"}, created)
+	if err != nil {
+		t.Fatalf("TenantAddon not created: %v", err)
+	}
+	if created.Spec.Addon != "vector-agent" {
+		t.Errorf("addon = %q, want vector-agent", created.Spec.Addon)
+	}
+	if created.Labels["butler.butlerlabs.dev/auto-enrolled"] != "true" {
+		t.Error("missing auto-enrolled label")
+	}
+}
+
+func TestEnsureAutoEnrolledAddon_UpdatesChangedValues(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = butlerv1alpha1.AddToScheme(scheme)
+
+	tc := &butlerv1alpha1.TenantCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "team-a",
+			UID:       "abc-123",
+			Labels:    map[string]string{butlerv1alpha1.LabelTeam: "team-a"},
+		},
+	}
+
+	oldValues := makeExtensionValues(t, map[string]interface{}{
+		"customConfig": map[string]interface{}{
+			"sinks": map[string]interface{}{
+				"aggregator": map[string]interface{}{"uri": "http://10.0.0.1:8080"},
+			},
+		},
+	})
+
+	existing := &butlerv1alpha1.TenantAddon{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-vector-agent",
+			Namespace: "team-a",
+			Labels: map[string]string{
+				"butler.butlerlabs.dev/auto-enrolled": "true",
+			},
+		},
+		Spec: butlerv1alpha1.TenantAddonSpec{
+			ClusterRef: butlerv1alpha1.LocalObjectReference{Name: "test-cluster"},
+			Addon:      "vector-agent",
+			Values:     oldValues,
+		},
+	}
+
+	cl := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(tc, existing).
+		Build()
+
+	r := &Reconciler{Client: cl, Scheme: scheme}
+
+	newValues := makeExtensionValues(t, map[string]interface{}{
+		"customConfig": map[string]interface{}{
+			"sinks": map[string]interface{}{
+				"aggregator": map[string]interface{}{"uri": "http://10.0.0.2:8080"},
+			},
+		},
+	})
+
+	err := r.ensureAutoEnrolledAddon(context.Background(), tc, "vector-agent", newValues)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	updated := &butlerv1alpha1.TenantAddon{}
+	err = cl.Get(context.Background(), client.ObjectKey{Name: "test-cluster-vector-agent", Namespace: "team-a"}, updated)
+	if err != nil {
+		t.Fatalf("failed to get TenantAddon: %v", err)
+	}
+
+	var vals map[string]interface{}
+	if err := json.Unmarshal(updated.Spec.Values.Raw, &vals); err != nil {
+		t.Fatalf("failed to unmarshal updated values: %v", err)
+	}
+
+	uri := vals["customConfig"].(map[string]interface{})["sinks"].(map[string]interface{})["aggregator"].(map[string]interface{})["uri"]
+	if uri != "http://10.0.0.2:8080" {
+		t.Errorf("uri = %v, want http://10.0.0.2:8080", uri)
+	}
+}
+
+func TestEnsureAutoEnrolledAddon_SkipsIdenticalValues(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = butlerv1alpha1.AddToScheme(scheme)
+
+	tc := &butlerv1alpha1.TenantCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "team-a",
+			UID:       "abc-123",
+			Labels:    map[string]string{butlerv1alpha1.LabelTeam: "team-a"},
+		},
+	}
+
+	values := makeExtensionValues(t, map[string]interface{}{
+		"customConfig": map[string]interface{}{
+			"sinks": map[string]interface{}{
+				"aggregator": map[string]interface{}{"uri": "http://10.0.0.1:8080"},
+			},
+		},
+	})
+
+	existing := &butlerv1alpha1.TenantAddon{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-vector-agent",
+			Namespace: "team-a",
+			Labels: map[string]string{
+				"butler.butlerlabs.dev/auto-enrolled": "true",
+			},
+		},
+		Spec: butlerv1alpha1.TenantAddonSpec{
+			ClusterRef: butlerv1alpha1.LocalObjectReference{Name: "test-cluster"},
+			Addon:      "vector-agent",
+			Values:     values,
+		},
+	}
+
+	cl := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(tc, existing).
+		Build()
+
+	r := &Reconciler{Client: cl, Scheme: scheme}
+
+	// Pass identical values — should not trigger an update.
+	sameValues := makeExtensionValues(t, map[string]interface{}{
+		"customConfig": map[string]interface{}{
+			"sinks": map[string]interface{}{
+				"aggregator": map[string]interface{}{"uri": "http://10.0.0.1:8080"},
+			},
+		},
+	})
+
+	err := r.ensureAutoEnrolledAddon(context.Background(), tc, "vector-agent", sameValues)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify the resource version hasn't changed (no update was made).
+	after := &butlerv1alpha1.TenantAddon{}
+	_ = cl.Get(context.Background(), client.ObjectKey{Name: "test-cluster-vector-agent", Namespace: "team-a"}, after)
+	if after.ResourceVersion != existing.ResourceVersion {
+		t.Error("resource version changed — update was triggered for identical values")
+	}
+}
+
+func TestEnsureAutoEnrolledAddon_SkipsManuallyCreated(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = butlerv1alpha1.AddToScheme(scheme)
+
+	tc := &butlerv1alpha1.TenantCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "team-a",
+			UID:       "abc-123",
+			Labels:    map[string]string{butlerv1alpha1.LabelTeam: "team-a"},
+		},
+	}
+
+	oldValues := makeExtensionValues(t, map[string]interface{}{
+		"customConfig": map[string]interface{}{
+			"sinks": map[string]interface{}{
+				"aggregator": map[string]interface{}{"uri": "http://10.0.0.1:8080"},
+			},
+		},
+	})
+
+	// Manually created TenantAddon (no auto-enrolled label).
+	existing := &butlerv1alpha1.TenantAddon{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-vector-agent",
+			Namespace: "team-a",
+			Labels:    map[string]string{},
+		},
+		Spec: butlerv1alpha1.TenantAddonSpec{
+			ClusterRef: butlerv1alpha1.LocalObjectReference{Name: "test-cluster"},
+			Addon:      "vector-agent",
+			Values:     oldValues,
+		},
+	}
+
+	cl := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(tc, existing).
+		Build()
+
+	r := &Reconciler{Client: cl, Scheme: scheme}
+
+	newValues := makeExtensionValues(t, map[string]interface{}{
+		"customConfig": map[string]interface{}{
+			"sinks": map[string]interface{}{
+				"aggregator": map[string]interface{}{"uri": "http://10.0.0.2:8080"},
+			},
+		},
+	})
+
+	err := r.ensureAutoEnrolledAddon(context.Background(), tc, "vector-agent", newValues)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Values should NOT be updated on a manually created addon.
+	after := &butlerv1alpha1.TenantAddon{}
+	_ = cl.Get(context.Background(), client.ObjectKey{Name: "test-cluster-vector-agent", Namespace: "team-a"}, after)
+
+	var vals map[string]interface{}
+	_ = json.Unmarshal(after.Spec.Values.Raw, &vals)
+	uri := vals["customConfig"].(map[string]interface{})["sinks"].(map[string]interface{})["aggregator"].(map[string]interface{})["uri"]
+	if uri != "http://10.0.0.1:8080" {
+		t.Errorf("uri was updated to %v — should not update manually created addons", uri)
+	}
+}
+
+func TestBuildPrometheusValues_IncludesExternalLabels(t *testing.T) {
+	pipeline := &butlerv1alpha1.ObservabilityPipelineConfig{
+		MetricEndpoint: "http://10.0.0.1:9000/insert/0/prometheus/api/v1/write",
+	}
+
+	ev := buildPrometheusValues(pipeline, "my-tenant-cluster")
+	if ev == nil {
+		t.Fatal("expected non-nil ExtensionValues")
+	}
+
+	var vals map[string]interface{}
+	if err := json.Unmarshal(ev.Raw, &vals); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	promSpec := vals["prometheus"].(map[string]interface{})["prometheusSpec"].(map[string]interface{})
+
+	// Check externalLabels.cluster
+	extLabels, ok := promSpec["externalLabels"].(map[string]interface{})
+	if !ok {
+		t.Fatal("externalLabels missing from prometheusSpec")
+	}
+	if extLabels["cluster"] != "my-tenant-cluster" {
+		t.Errorf("cluster label = %v, want my-tenant-cluster", extLabels["cluster"])
+	}
+
+	// Check remoteWrite URL is still present
+	rw, ok := promSpec["remoteWrite"].([]interface{})
+	if !ok || len(rw) == 0 {
+		t.Fatal("remoteWrite missing from prometheusSpec")
+	}
+	rwEntry := rw[0].(map[string]interface{})
+	if rwEntry["url"] != "http://10.0.0.1:9000/insert/0/prometheus/api/v1/write" {
+		t.Errorf("remoteWrite url = %v, want the pipeline metric endpoint", rwEntry["url"])
+	}
+}
+
+func TestBuildPrometheusValues_NilPipeline(t *testing.T) {
+	ev := buildPrometheusValues(nil, "cluster-1")
+	if ev != nil {
+		t.Error("expected nil ExtensionValues for nil pipeline")
+	}
+}
+
+func TestBuildPrometheusValues_EmptyEndpoint(t *testing.T) {
+	pipeline := &butlerv1alpha1.ObservabilityPipelineConfig{
+		MetricEndpoint: "",
+	}
+	ev := buildPrometheusValues(pipeline, "cluster-1")
+	if ev != nil {
+		t.Error("expected nil ExtensionValues for empty endpoint")
+	}
+}
+
+func TestBuildVectorAgentValues_HTTPSinkURI(t *testing.T) {
+	pipeline := &butlerv1alpha1.ObservabilityPipelineConfig{
+		LogEndpoint: "http://10.0.0.1:8080",
+	}
+
+	ev := buildVectorAgentValues(pipeline)
+	if ev == nil {
+		t.Fatal("expected non-nil ExtensionValues")
+	}
+
+	var vals map[string]interface{}
+	if err := json.Unmarshal(ev.Raw, &vals); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	uri := vals["customConfig"].(map[string]interface{})["sinks"].(map[string]interface{})["aggregator"].(map[string]interface{})["uri"]
+	if uri != "http://10.0.0.1:8080" {
+		t.Errorf("uri = %v, want http://10.0.0.1:8080", uri)
 	}
 }
