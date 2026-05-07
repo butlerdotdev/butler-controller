@@ -4,6 +4,7 @@
 package tenantcluster
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -412,7 +413,7 @@ func (r *Reconciler) reconcileAutoEnrollObservability(ctx context.Context, tc *b
 	}
 
 	if enroll.Prometheus && obs.Pipeline.MetricEndpoint != "" {
-		if err := r.ensureAutoEnrolledAddon(ctx, tc, "prometheus-operator", buildPrometheusValues(obs.Pipeline)); err != nil {
+		if err := r.ensureAutoEnrolledAddon(ctx, tc, "prometheus-operator", buildPrometheusValues(obs.Pipeline, tc.Name)); err != nil {
 			logger.Error(err, "failed to auto-enroll prometheus-operator")
 		}
 	}
@@ -426,7 +427,9 @@ func (r *Reconciler) reconcileAutoEnrollObservability(ctx context.Context, tc *b
 	return nil
 }
 
-// ensureAutoEnrolledAddon creates a TenantAddon if it doesn't already exist.
+// ensureAutoEnrolledAddon creates a TenantAddon if it doesn't already exist,
+// or updates its values if the desired configuration has changed (e.g., a
+// pipeline endpoint was modified in ButlerConfig).
 func (r *Reconciler) ensureAutoEnrolledAddon(ctx context.Context, tc *butlerv1alpha1.TenantCluster, addonDefName string, values *butlerv1alpha1.ExtensionValues) error {
 	logger := log.FromContext(ctx)
 	addonName := fmt.Sprintf("%s-%s", tc.Name, addonDefName)
@@ -434,7 +437,7 @@ func (r *Reconciler) ensureAutoEnrolledAddon(ctx context.Context, tc *butlerv1al
 	existing := &butlerv1alpha1.TenantAddon{}
 	err := r.Get(ctx, client.ObjectKey{Name: addonName, Namespace: tc.Namespace}, existing)
 	if err == nil {
-		return nil // already exists
+		return r.updateAutoEnrolledAddonIfNeeded(ctx, existing, values)
 	}
 	if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed to check TenantAddon %s: %w", addonName, err)
@@ -477,6 +480,39 @@ func (r *Reconciler) ensureAutoEnrolledAddon(ctx context.Context, tc *butlerv1al
 	return nil
 }
 
+// updateAutoEnrolledAddonIfNeeded compares the desired values with the existing
+// TenantAddon and updates if they differ. Only auto-enrolled addons are updated;
+// manually created TenantAddons (missing the auto-enrolled label) are left alone.
+func (r *Reconciler) updateAutoEnrolledAddonIfNeeded(ctx context.Context, existing *butlerv1alpha1.TenantAddon, desired *butlerv1alpha1.ExtensionValues) error {
+	if existing.Labels["butler.butlerlabs.dev/auto-enrolled"] != "true" {
+		return nil
+	}
+
+	existingRaw := rawOrEmpty(existing.Spec.Values)
+	desiredRaw := rawOrEmpty(desired)
+	if bytes.Equal(existingRaw, desiredRaw) {
+		return nil
+	}
+
+	logger := log.FromContext(ctx)
+	logger.Info("updating auto-enrolled addon values",
+		"addon", existing.Name, "cluster", existing.Spec.ClusterRef.Name)
+
+	existing.Spec.Values = desired
+	if err := r.Update(ctx, existing); err != nil {
+		return fmt.Errorf("failed to update TenantAddon %s: %w", existing.Name, err)
+	}
+	return nil
+}
+
+// rawOrEmpty returns the Raw bytes from an ExtensionValues, or an empty slice if nil.
+func rawOrEmpty(v *butlerv1alpha1.ExtensionValues) []byte {
+	if v == nil {
+		return nil
+	}
+	return v.Raw
+}
+
 // buildVectorAgentValues configures the vector-agent sink to forward to the pipeline aggregator.
 func buildVectorAgentValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig) *butlerv1alpha1.ExtensionValues {
 	if pipeline == nil || pipeline.LogEndpoint == "" {
@@ -500,8 +536,10 @@ func buildVectorAgentValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig
 	return &butlerv1alpha1.ExtensionValues{Raw: raw}
 }
 
-// buildPrometheusValues configures remote-write to the pipeline metric endpoint.
-func buildPrometheusValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig) *butlerv1alpha1.ExtensionValues {
+// buildPrometheusValues configures remote-write to the pipeline metric endpoint
+// and sets externalLabels.cluster so metrics are identifiable by source cluster
+// in the backend.
+func buildPrometheusValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig, clusterName string) *butlerv1alpha1.ExtensionValues {
 	if pipeline == nil || pipeline.MetricEndpoint == "" {
 		return nil
 	}
@@ -509,6 +547,9 @@ func buildPrometheusValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig)
 	values := map[string]interface{}{
 		"prometheus": map[string]interface{}{
 			"prometheusSpec": map[string]interface{}{
+				"externalLabels": map[string]interface{}{
+					"cluster": clusterName,
+				},
 				"remoteWrite": []map[string]interface{}{
 					{"url": pipeline.MetricEndpoint},
 				},

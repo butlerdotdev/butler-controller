@@ -130,7 +130,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	if addon.Status.Phase == butlerv1alpha1.TenantAddonPhaseInstalled &&
-		addon.Status.InstalledVersion == version {
+		addon.Status.InstalledVersion == version &&
+		addon.Status.ObservedGeneration == addon.Generation {
 		logger.V(1).Info("addon already installed", "version", version)
 		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 	}
