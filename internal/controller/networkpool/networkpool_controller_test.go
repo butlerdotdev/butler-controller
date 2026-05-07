@@ -43,8 +43,9 @@ var _ = Describe("NetworkPool Controller", func() {
 	// newStandardTenantAllocation returns the tenantAllocation config used across most tests.
 	newStandardTenantAllocation := func() *butlerv1alpha1.TenantAllocationConfig {
 		return &butlerv1alpha1.TenantAllocationConfig{
-			Start: allocStart,
-			End:   allocEnd,
+			Ranges: []butlerv1alpha1.AllocationRange{
+				{Start: allocStart, End: allocEnd},
+			},
 		}
 	}
 
