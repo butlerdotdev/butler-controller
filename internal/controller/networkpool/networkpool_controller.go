@@ -221,13 +221,14 @@ func (r *Reconciler) validatePool(pool *butlerv1alpha1.NetworkPool) []string {
 		reservedCIDRs = append(reservedCIDRs, reserved.CIDR)
 	}
 
-	var allocStart, allocEnd string
+	var ranges []ipam.AllocatedRange
 	if pool.Spec.TenantAllocation != nil {
-		allocStart = pool.Spec.TenantAllocation.Start
-		allocEnd = pool.Spec.TenantAllocation.End
+		for _, r := range pool.Spec.TenantAllocation.GetEffectiveRanges() {
+			ranges = append(ranges, ipam.AllocatedRange{Start: r.Start, End: r.End})
+		}
 	}
 
-	return ipam.ValidatePoolSpec(pool.Spec.CIDR, reservedCIDRs, allocStart, allocEnd)
+	return ipam.ValidatePoolSpec(pool.Spec.CIDR, ranges, reservedCIDRs)
 }
 
 func (r *Reconciler) processPendingAllocations(ctx context.Context, pool *butlerv1alpha1.NetworkPool, allocList *butlerv1alpha1.IPAllocationList) int {
@@ -339,18 +340,25 @@ func (r *Reconciler) processPendingAllocations(ctx context.Context, pool *butler
 func (r *Reconciler) buildPoolState(pool *butlerv1alpha1.NetworkPool, allocated []butlerv1alpha1.IPAllocation) ipam.PoolState {
 	state := ipam.PoolState{}
 
-	// Set allocatable range
+	// Set allocatable ranges from GetEffectiveRanges or fall back to full CIDR.
 	if pool.Spec.TenantAllocation != nil {
-		state.AllocatableStart = pool.Spec.TenantAllocation.Start
-		state.AllocatableEnd = pool.Spec.TenantAllocation.End
-	} else {
+		effectiveRanges := pool.Spec.TenantAllocation.GetEffectiveRanges()
+		for _, r := range effectiveRanges {
+			state.AllocatableRanges = append(state.AllocatableRanges, ipam.AllocatedRange{
+				Start: r.Start,
+				End:   r.End,
+			})
+		}
+	}
+	if len(state.AllocatableRanges) == 0 {
 		// Use full CIDR range
 		start, end, _, err := ipam.ParseCIDR(pool.Spec.CIDR)
 		if err != nil {
 			return state
 		}
-		state.AllocatableStart = start.String()
-		state.AllocatableEnd = end.String()
+		state.AllocatableRanges = []ipam.AllocatedRange{
+			{Start: start.String(), End: end.String()},
+		}
 	}
 
 	// Add reserved CIDRs
@@ -560,6 +568,7 @@ func setCapacityConditions(pool *butlerv1alpha1.NetworkPool, usagePercent float6
 		})
 	}
 }
+
 // gcOrphanedAllocations deletes IPAllocations whose tenantClusterRef points
 // to a TenantCluster that no longer exists. Returns the number of allocations deleted.
 func (r *Reconciler) gcOrphanedAllocations(ctx context.Context, pool *butlerv1alpha1.NetworkPool, allocList *butlerv1alpha1.IPAllocationList) int {

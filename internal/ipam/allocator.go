@@ -44,10 +44,11 @@ var (
 // PoolState represents the current state of a network pool for allocation purposes.
 // It decouples the allocator from Kubernetes types.
 type PoolState struct {
-	// AllocatableStart is the first IP available for tenant allocation.
-	AllocatableStart string
-	// AllocatableEnd is the last IP available for tenant allocation.
-	AllocatableEnd string
+	// AllocatableRanges defines the allocatable IP ranges. The bitmap spans
+	// from the minimum start to the maximum end, with inter-range gaps
+	// marked as used. Ranges must be sorted by Start ascending and
+	// non-overlapping.
+	AllocatableRanges []AllocatedRange
 	// ReservedCIDRs are CIDR ranges excluded from allocation (e.g., management cluster IPs).
 	ReservedCIDRs []string
 	// ExistingAllocs are currently allocated ranges.
@@ -79,9 +80,9 @@ type FreeBlock struct {
 // FragmentationInfo contains pool health metrics.
 type FragmentationInfo struct {
 	FragmentationPercent int32
-	LargestFreeBlock    int32
-	FreeBlockCount      int32
-	TotalFreeIPs        int32
+	LargestFreeBlock     int32
+	FreeBlockCount       int32
+	TotalFreeIPs         int32
 }
 
 // IPToUint32 converts a 4-byte IPv4 address to a uint32.
@@ -236,19 +237,34 @@ func ValidateRangeWithinCIDR(cidr, start, end string) (bool, error) {
 	return network.Contains(startIP) && network.Contains(endIP), nil
 }
 
-// BuildBitmap creates a bitmap representing the allocatable range.
-// true = used/reserved, false = free.
+// BuildBitmap creates a bitmap spanning all allocatable ranges.
+// true = used/reserved/gap, false = free. The bitmap spans from the minimum
+// range start to the maximum range end. Inter-range gaps are marked as used
+// so the allocator's free-block scan only finds free space within ranges.
 func BuildBitmap(pool PoolState) ([]bool, uint32, error) {
-	startIP := net.ParseIP(pool.AllocatableStart).To4()
-	endIP := net.ParseIP(pool.AllocatableEnd).To4()
-	if startIP == nil || endIP == nil {
-		return nil, 0, fmt.Errorf("invalid pool range")
+	if len(pool.AllocatableRanges) == 0 {
+		return nil, 0, fmt.Errorf("no allocatable ranges defined")
 	}
 
-	poolStart := IPToUint32(startIP)
-	poolEnd := IPToUint32(endIP)
-	if poolStart > poolEnd {
-		return nil, 0, ErrInvalidRange
+	// Compute spanning bounds across all ranges.
+	var poolStart, poolEnd uint32
+	for i, r := range pool.AllocatableRanges {
+		sIP := net.ParseIP(r.Start).To4()
+		eIP := net.ParseIP(r.End).To4()
+		if sIP == nil || eIP == nil {
+			return nil, 0, fmt.Errorf("invalid IP in range %d: %s-%s", i, r.Start, r.End)
+		}
+		s := IPToUint32(sIP)
+		e := IPToUint32(eIP)
+		if s > e {
+			return nil, 0, fmt.Errorf("%w: range %d start %s is after end %s", ErrInvalidRange, i, r.Start, r.End)
+		}
+		if i == 0 || s < poolStart {
+			poolStart = s
+		}
+		if i == 0 || e > poolEnd {
+			poolEnd = e
+		}
 	}
 
 	size := poolEnd - poolStart + 1
@@ -257,6 +273,18 @@ func BuildBitmap(pool PoolState) ([]bool, uint32, error) {
 	}
 
 	bitmap := make([]bool, size)
+
+	// Mark inter-range gaps as used. Ranges are sorted by start ascending,
+	// so gaps are between ranges[i].End+1 and ranges[i+1].Start-1.
+	for i := 0; i < len(pool.AllocatableRanges)-1; i++ {
+		gapStartIP := net.ParseIP(pool.AllocatableRanges[i].End).To4()
+		gapEndIP := net.ParseIP(pool.AllocatableRanges[i+1].Start).To4()
+		gapStart := IPToUint32(gapStartIP) + 1
+		gapEnd := IPToUint32(gapEndIP) - 1
+		for ip := gapStart; ip <= gapEnd; ip++ {
+			bitmap[ip-poolStart] = true
+		}
+	}
 
 	// Mark reserved CIDRs
 	for _, reserved := range pool.ReservedCIDRs {
@@ -398,18 +426,46 @@ func AllocatePinnedRange(pool PoolState, start, end string) (*AllocationResult, 
 		return nil, fmt.Errorf("%w: pinned start %s is after end %s", ErrInvalidRange, start, end)
 	}
 
-	// Verify the range is within the allocatable pool
-	poolStartIP := net.ParseIP(pool.AllocatableStart).To4()
-	poolEndIP := net.ParseIP(pool.AllocatableEnd).To4()
-	if poolStartIP == nil || poolEndIP == nil {
-		return nil, fmt.Errorf("invalid pool range")
+	// Verify the range falls within at least one allocatable range.
+	withinRange := false
+	var overlappingIndices []int
+	for i, r := range pool.AllocatableRanges {
+		rStartIP := net.ParseIP(r.Start).To4()
+		rEndIP := net.ParseIP(r.End).To4()
+		if rStartIP == nil || rEndIP == nil {
+			continue
+		}
+		rs := IPToUint32(rStartIP)
+		re := IPToUint32(rEndIP)
+		if pinnedStart >= rs && pinnedEnd <= re {
+			withinRange = true
+			break
+		}
+		// Track ranges that partially overlap the pinned range.
+		if pinnedStart <= re && pinnedEnd >= rs {
+			overlappingIndices = append(overlappingIndices, i)
+		}
 	}
-
-	poolStart := IPToUint32(poolStartIP)
-	poolEnd := IPToUint32(poolEndIP)
-	if pinnedStart < poolStart || pinnedEnd > poolEnd {
-		return nil, fmt.Errorf("%w: pinned range %s-%s is outside pool %s-%s",
-			ErrOutOfRange, start, end, pool.AllocatableStart, pool.AllocatableEnd)
+	if !withinRange {
+		if len(overlappingIndices) > 1 {
+			// Pinned range straddles multiple allocatable ranges.
+			var boundaries []string
+			for _, idx := range overlappingIndices {
+				r := pool.AllocatableRanges[idx]
+				boundaries = append(boundaries,
+					fmt.Sprintf("ranges[%d] %s-%s", idx, r.Start, r.End))
+			}
+			return nil, fmt.Errorf("%w: pinned range %s-%s straddles allocatable ranges; "+
+				"must fit entirely within one range. Overlapping ranges: %s",
+				ErrOutOfRange, start, end, strings.Join(boundaries, ", "))
+		}
+		// Completely outside all ranges — list available ranges.
+		var available []string
+		for i, r := range pool.AllocatableRanges {
+			available = append(available, fmt.Sprintf("ranges[%d] %s-%s", i, r.Start, r.End))
+		}
+		return nil, fmt.Errorf("%w: pinned range %s-%s is outside allocatable ranges [%s]",
+			ErrOutOfRange, start, end, strings.Join(available, ", "))
 	}
 
 	// Build bitmap and check for conflicts
@@ -488,7 +544,8 @@ func ComputeFragmentation(pool PoolState) (*FragmentationInfo, error) {
 }
 
 // ValidatePoolSpec validates the internal consistency of a network pool specification.
-func ValidatePoolSpec(cidr string, reservedCIDRs []string, allocStart, allocEnd string) []string {
+// Ranges must be sorted by start IP ascending and non-overlapping.
+func ValidatePoolSpec(cidr string, ranges []AllocatedRange, reservedCIDRs []string) []string {
 	var errs []string
 
 	_, _, _, err := ParseCIDR(cidr)
@@ -507,20 +564,76 @@ func ValidatePoolSpec(cidr string, reservedCIDRs []string, allocStart, allocEnd 
 		}
 	}
 
-	// Validate allocation range is within pool CIDR
-	if allocStart != "" && allocEnd != "" {
-		within, err := ValidateRangeWithinCIDR(cidr, allocStart, allocEnd)
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("invalid allocation range: %v", err))
-		} else if !within {
-			errs = append(errs, fmt.Sprintf("allocation range %s-%s is not within pool CIDR %q", allocStart, allocEnd, cidr))
+	// Validate each allocation range
+	for i, r := range ranges {
+		startIP := net.ParseIP(r.Start).To4()
+		endIP := net.ParseIP(r.End).To4()
+		if startIP == nil {
+			errs = append(errs, fmt.Sprintf("ranges[%d].start %q is not a valid IPv4 address", i, r.Start))
+			continue
+		}
+		if endIP == nil {
+			errs = append(errs, fmt.Sprintf("ranges[%d].end %q is not a valid IPv4 address", i, r.End))
+			continue
 		}
 
-		startIP := net.ParseIP(allocStart).To4()
-		endIP := net.ParseIP(allocEnd).To4()
-		if startIP != nil && endIP != nil {
-			if IPToUint32(startIP) > IPToUint32(endIP) {
-				errs = append(errs, fmt.Sprintf("allocation start %s is after end %s", allocStart, allocEnd))
+		s := IPToUint32(startIP)
+		e := IPToUint32(endIP)
+
+		if s > e {
+			errs = append(errs, fmt.Sprintf("ranges[%d] start %s is after end %s", i, r.Start, r.End))
+			continue
+		}
+
+		within, err := ValidateRangeWithinCIDR(cidr, r.Start, r.End)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("ranges[%d]: invalid range: %v", i, err))
+		} else if !within {
+			errs = append(errs, fmt.Sprintf("ranges[%d] (%s-%s) falls outside pool CIDR %s", i, r.Start, r.End, cidr))
+		}
+
+		// Sorted order and non-overlap: ranges[i].Start must be > ranges[i-1].End
+		if i > 0 {
+			prevEndIP := net.ParseIP(ranges[i-1].End).To4()
+			if prevEndIP != nil {
+				prevEnd := IPToUint32(prevEndIP)
+				if s <= prevEnd {
+					errs = append(errs, fmt.Sprintf(
+						"ranges must be sorted by start IP and non-overlapping; ranges[%d].start (%s) must be greater than ranges[%d].end (%s)",
+						i, r.Start, i-1, ranges[i-1].End))
+				}
+			}
+		}
+	}
+
+	// Validate reserved CIDRs do not straddle range boundaries.
+	// A reserved CIDR can be fully inside a range or fully outside all ranges,
+	// but must not span across a range boundary.
+	for _, reserved := range reservedCIDRs {
+		rStart, rEnd, _, parseErr := ParseCIDR(reserved)
+		if parseErr != nil {
+			continue // already reported above
+		}
+		rs := IPToUint32(rStart.To4())
+		re := IPToUint32(rEnd.To4())
+
+		for i, r := range ranges {
+			rangeStartIP := net.ParseIP(r.Start).To4()
+			rangeEndIP := net.ParseIP(r.End).To4()
+			if rangeStartIP == nil || rangeEndIP == nil {
+				continue
+			}
+			rangeStart := IPToUint32(rangeStartIP)
+			rangeEnd := IPToUint32(rangeEndIP)
+
+			// Check if reserved straddles the range boundary:
+			// partially inside and partially outside.
+			startsInside := rs >= rangeStart && rs <= rangeEnd
+			endsInside := re >= rangeStart && re <= rangeEnd
+			if startsInside != endsInside {
+				errs = append(errs, fmt.Sprintf(
+					"reserved CIDR %s straddles ranges[%d] boundary (%s-%s)",
+					reserved, i, r.Start, r.End))
 			}
 		}
 	}
@@ -529,21 +642,15 @@ func ValidatePoolSpec(cidr string, reservedCIDRs []string, allocStart, allocEnd 
 }
 
 // PoolCapacityInfo computes capacity information for a pool.
+// Total is the sum of all range sizes (not the spanning bitmap size).
+// Reserved and allocated counts are computed only within allocatable ranges.
 func PoolCapacityInfo(pool PoolState) (totalIPs int32, allocatedIPs int32, availableIPs int32, err error) {
-	bitmap, _, err := BuildBitmap(pool)
+	bitmap, bitmapStart, err := BuildBitmap(pool)
 	if err != nil {
 		return 0, 0, 0, err
 	}
 
-	total := int32(len(bitmap))
-	reserved := int32(0)
-	allocated := int32(0)
-
-	// Count reserved IPs (from reserved CIDRs — always marked, even if no allocations exist)
-	// We need to distinguish reserved from allocated. Build a separate bitmap for just reserved.
-	startIP := net.ParseIP(pool.AllocatableStart).To4()
-	poolStartUint := IPToUint32(startIP)
-
+	// Build reserved bitmap to distinguish reserved from allocated.
 	reservedBitmap := make([]bool, len(bitmap))
 	for _, cidr := range pool.ReservedCIDRs {
 		rStart, rEnd, _, parseErr := ParseCIDR(cidr)
@@ -552,18 +659,37 @@ func PoolCapacityInfo(pool PoolState) (totalIPs int32, allocatedIPs int32, avail
 		}
 		rs := IPToUint32(rStart.To4())
 		re := IPToUint32(rEnd.To4())
+		bitmapEnd := bitmapStart + uint32(len(bitmap)) - 1
 		for i := rs; i <= re; i++ {
-			if i >= poolStartUint && i <= poolStartUint+uint32(len(bitmap))-1 {
-				reservedBitmap[i-poolStartUint] = true
+			if i >= bitmapStart && i <= bitmapEnd {
+				reservedBitmap[i-bitmapStart] = true
 			}
 		}
 	}
 
-	for i, used := range bitmap {
-		if reservedBitmap[i] {
-			reserved++
-		} else if used {
-			allocated++
+	// Count total, reserved, and allocated within allocatable ranges only.
+	// Inter-range gaps are excluded from all counts.
+	total := int32(0)
+	reserved := int32(0)
+	allocated := int32(0)
+
+	for _, r := range pool.AllocatableRanges {
+		rStartIP := net.ParseIP(r.Start).To4()
+		rEndIP := net.ParseIP(r.End).To4()
+		if rStartIP == nil || rEndIP == nil {
+			continue
+		}
+		rs := IPToUint32(rStartIP)
+		re := IPToUint32(rEndIP)
+
+		for ip := rs; ip <= re; ip++ {
+			offset := ip - bitmapStart
+			total++
+			if reservedBitmap[offset] {
+				reserved++
+			} else if bitmap[offset] {
+				allocated++
+			}
 		}
 	}
 

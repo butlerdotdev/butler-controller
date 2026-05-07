@@ -322,8 +322,7 @@ func TestValidateRangeWithinCIDR(t *testing.T) {
 func TestBuildBitmap(t *testing.T) {
 	t.Run("empty pool", func(t *testing.T) {
 		pool := PoolState{
-			AllocatableStart: "10.0.0.0",
-			AllocatableEnd:   "10.0.0.7",
+			AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.7"}},
 		}
 		bitmap, startUint, err := BuildBitmap(pool)
 		if err != nil {
@@ -344,9 +343,8 @@ func TestBuildBitmap(t *testing.T) {
 
 	t.Run("with reserved CIDR", func(t *testing.T) {
 		pool := PoolState{
-			AllocatableStart: "10.0.0.0",
-			AllocatableEnd:   "10.0.0.15",
-			ReservedCIDRs:    []string{"10.0.0.0/30"}, // reserves .0-.3
+			AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.15"}},
+			ReservedCIDRs:     []string{"10.0.0.0/30"}, // reserves .0-.3
 		}
 		bitmap, _, err := BuildBitmap(pool)
 		if err != nil {
@@ -367,8 +365,7 @@ func TestBuildBitmap(t *testing.T) {
 
 	t.Run("with existing allocation", func(t *testing.T) {
 		pool := PoolState{
-			AllocatableStart: "10.0.0.0",
-			AllocatableEnd:   "10.0.0.15",
+			AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.15"}},
 			ExistingAllocs: []AllocatedRange{
 				{Start: "10.0.0.4", End: "10.0.0.7"},
 			},
@@ -396,9 +393,8 @@ func TestBuildBitmap(t *testing.T) {
 
 	t.Run("reserved outside allocatable range ignored", func(t *testing.T) {
 		pool := PoolState{
-			AllocatableStart: "10.0.0.128",
-			AllocatableEnd:   "10.0.0.135",
-			ReservedCIDRs:    []string{"10.0.0.0/25"}, // entirely before allocatable range
+			AllocatableRanges: []AllocatedRange{{Start: "10.0.0.128", End: "10.0.0.135"}},
+			ReservedCIDRs:     []string{"10.0.0.0/25"}, // entirely before allocatable range
 		}
 		bitmap, _, err := BuildBitmap(pool)
 		if err != nil {
@@ -413,8 +409,7 @@ func TestBuildBitmap(t *testing.T) {
 
 	t.Run("invalid range", func(t *testing.T) {
 		pool := PoolState{
-			AllocatableStart: "10.0.0.10",
-			AllocatableEnd:   "10.0.0.5",
+			AllocatableRanges: []AllocatedRange{{Start: "10.0.0.10", End: "10.0.0.5"}},
 		}
 		_, _, err := BuildBitmap(pool)
 		if err == nil {
@@ -424,8 +419,7 @@ func TestBuildBitmap(t *testing.T) {
 
 	t.Run("pool too large", func(t *testing.T) {
 		pool := PoolState{
-			AllocatableStart: "10.0.0.0",
-			AllocatableEnd:   "10.255.255.255", // ~16M IPs
+			AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.255.255.255"}}, // ~16M IPs
 		}
 		_, _, err := BuildBitmap(pool)
 		if err == nil {
@@ -448,8 +442,7 @@ func TestAllocateRange(t *testing.T) {
 		{
 			name: "empty pool first allocation",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.255",
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.255"}},
 			},
 			requestedCount: 8,
 			wantStart:      "10.0.0.0",
@@ -458,8 +451,7 @@ func TestAllocateRange(t *testing.T) {
 		{
 			name: "single IP allocation",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.255",
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.255"}},
 			},
 			requestedCount: 1,
 			wantStart:      "10.0.0.0",
@@ -468,8 +460,7 @@ func TestAllocateRange(t *testing.T) {
 		{
 			name: "skips existing allocation",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.31",
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.31"}},
 				ExistingAllocs: []AllocatedRange{
 					{Start: "10.0.0.0", End: "10.0.0.7"},
 				},
@@ -481,9 +472,8 @@ func TestAllocateRange(t *testing.T) {
 		{
 			name: "skips reserved range",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.31",
-				ReservedCIDRs:    []string{"10.0.0.0/29"}, // .0-.7
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.31"}},
+				ReservedCIDRs:     []string{"10.0.0.0/29"}, // .0-.7
 			},
 			requestedCount: 4,
 			wantStart:      "10.0.0.8",
@@ -492,8 +482,7 @@ func TestAllocateRange(t *testing.T) {
 		{
 			name: "fills gap between allocations",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.31",
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.31"}},
 				ExistingAllocs: []AllocatedRange{
 					{Start: "10.0.0.0", End: "10.0.0.3"},
 					{Start: "10.0.0.12", End: "10.0.0.15"},
@@ -508,13 +497,12 @@ func TestAllocateRange(t *testing.T) {
 		{
 			name: "best-fit picks smallest fitting gap",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.63",
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.63"}},
 				ExistingAllocs: []AllocatedRange{
 					{Start: "10.0.0.0", End: "10.0.0.2"},   // uses .0-.2
-					{Start: "10.0.0.13", End: "10.0.0.14"},  // uses .13-.14 → gap .3-.12 = 10 IPs
-					{Start: "10.0.0.15", End: "10.0.0.17"},  // gap = 0 after .14
-					{Start: "10.0.0.68", End: "10.0.0.68"},  // outside pool, ignored
+					{Start: "10.0.0.13", End: "10.0.0.14"}, // uses .13-.14 → gap .3-.12 = 10 IPs
+					{Start: "10.0.0.15", End: "10.0.0.17"}, // gap = 0 after .14
+					{Start: "10.0.0.68", End: "10.0.0.68"}, // outside pool, ignored
 				},
 			},
 			// Free blocks: .3-.12 (10 IPs), .18-.63 (46 IPs)
@@ -526,8 +514,7 @@ func TestAllocateRange(t *testing.T) {
 		{
 			name: "best-fit with gaps of 10, 50, 3 - request 5 picks 10",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.99",
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.99"}},
 				ExistingAllocs: []AllocatedRange{
 					// Layout: [10 free][5 alloc][3 free][2 alloc][50 free][30 alloc]
 					// .0-.9 free (10)
@@ -547,8 +534,7 @@ func TestAllocateRange(t *testing.T) {
 		{
 			name: "exhausted pool",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.7",
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.7"}},
 				ExistingAllocs: []AllocatedRange{
 					{Start: "10.0.0.0", End: "10.0.0.7"},
 				},
@@ -559,8 +545,7 @@ func TestAllocateRange(t *testing.T) {
 		{
 			name: "no block large enough",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.31",
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.31"}},
 				ExistingAllocs: []AllocatedRange{
 					{Start: "10.0.0.4", End: "10.0.0.7"},
 					{Start: "10.0.0.12", End: "10.0.0.15"},
@@ -576,8 +561,7 @@ func TestAllocateRange(t *testing.T) {
 		{
 			name: "full pool minus one",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.7",
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.7"}},
 				ExistingAllocs: []AllocatedRange{
 					{Start: "10.0.0.0", End: "10.0.0.6"},
 				},
@@ -589,8 +573,7 @@ func TestAllocateRange(t *testing.T) {
 		{
 			name: "entire pool as one allocation",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.255",
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.255"}},
 			},
 			requestedCount: 256,
 			wantStart:      "10.0.0.0",
@@ -628,8 +611,7 @@ func TestAllocateRange(t *testing.T) {
 
 func TestAllocateRange_InvalidCount(t *testing.T) {
 	pool := PoolState{
-		AllocatableStart: "10.0.0.0",
-		AllocatableEnd:   "10.0.0.255",
+		AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.255"}},
 	}
 
 	_, err := AllocateRange(pool, 0)
@@ -646,8 +628,7 @@ func TestAllocateRange_InvalidCount(t *testing.T) {
 func TestAllocateRange_NoOverlap(t *testing.T) {
 	// Simulate sequential allocations and verify no overlap
 	pool := PoolState{
-		AllocatableStart: "10.0.0.0",
-		AllocatableEnd:   "10.0.0.255",
+		AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.255"}},
 	}
 
 	allocations := make([]AllocationResult, 0)
@@ -688,9 +669,8 @@ func TestAllocateRange_NoOverlap(t *testing.T) {
 func TestAllocateRange_WithReservedAndAllocated(t *testing.T) {
 	// Complex scenario: reserved range in the middle, existing allocations around it
 	pool := PoolState{
-		AllocatableStart: "10.0.0.0",
-		AllocatableEnd:   "10.0.0.63",
-		ReservedCIDRs:    []string{"10.0.0.16/28"}, // .16-.31 reserved
+		AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.63"}},
+		ReservedCIDRs:     []string{"10.0.0.16/28"}, // .16-.31 reserved
 		ExistingAllocs: []AllocatedRange{
 			{Start: "10.0.0.0", End: "10.0.0.7"}, // .0-.7 allocated
 		},
@@ -710,8 +690,7 @@ func TestAllocateRange_WithReservedAndAllocated(t *testing.T) {
 func TestAllocateRange_LargePool(t *testing.T) {
 	// /16 = 65536 IPs — verify it doesn't OOM and completes quickly
 	pool := PoolState{
-		AllocatableStart: "10.40.0.0",
-		AllocatableEnd:   "10.40.255.255",
+		AllocatableRanges: []AllocatedRange{{Start: "10.40.0.0", End: "10.40.255.255"}},
 	}
 
 	start := time.Now()
@@ -732,8 +711,7 @@ func TestAllocateRange_LargePool(t *testing.T) {
 func TestAllocateRange_LargePoolFragmented(t *testing.T) {
 	// /16 pool with every other 8-block allocated (severe fragmentation)
 	pool := PoolState{
-		AllocatableStart: "10.40.0.0",
-		AllocatableEnd:   "10.40.255.255",
+		AllocatableRanges: []AllocatedRange{{Start: "10.40.0.0", End: "10.40.255.255"}},
 	}
 
 	// Allocate every other 8-IP block for first 1024 IPs
@@ -777,8 +755,7 @@ func TestComputeFragmentation(t *testing.T) {
 		{
 			name: "empty pool - no fragmentation",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.31",
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.31"}},
 			},
 			wantFragPercent:    0,
 			wantLargestFree:    32,
@@ -788,8 +765,7 @@ func TestComputeFragmentation(t *testing.T) {
 		{
 			name: "full pool - no fragmentation",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.31",
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.31"}},
 				ExistingAllocs: []AllocatedRange{
 					{Start: "10.0.0.0", End: "10.0.0.31"},
 				},
@@ -802,8 +778,7 @@ func TestComputeFragmentation(t *testing.T) {
 		{
 			name: "one allocation in middle - two free blocks",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.31",
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.31"}},
 				ExistingAllocs: []AllocatedRange{
 					{Start: "10.0.0.8", End: "10.0.0.15"},
 				},
@@ -818,8 +793,7 @@ func TestComputeFragmentation(t *testing.T) {
 		{
 			name: "alternating allocated/free - high fragmentation",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.31",
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.31"}},
 				ExistingAllocs: []AllocatedRange{
 					{Start: "10.0.0.2", End: "10.0.0.3"},
 					{Start: "10.0.0.6", End: "10.0.0.7"},
@@ -841,8 +815,7 @@ func TestComputeFragmentation(t *testing.T) {
 		{
 			name: "single contiguous free block at end",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.31",
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.31"}},
 				ExistingAllocs: []AllocatedRange{
 					{Start: "10.0.0.0", End: "10.0.0.15"},
 				},
@@ -883,23 +856,48 @@ func TestValidatePoolSpec(t *testing.T) {
 		name         string
 		cidr         string
 		reserved     []string
-		allocStart   string
-		allocEnd     string
+		ranges       []AllocatedRange
 		wantErrCount int
 	}{
-		{"valid spec", "10.40.0.0/24", []string{"10.40.0.0/26"}, "10.40.0.128", "10.40.0.255", 0},
-		{"invalid CIDR", "bad", nil, "", "", 1},
-		{"reserved outside pool", "10.40.0.0/24", []string{"10.41.0.0/24"}, "", "", 1},
-		{"alloc range outside pool", "10.40.0.0/24", nil, "10.41.0.0", "10.41.0.255", 1},
-		{"alloc start after end", "10.40.0.0/24", nil, "10.40.0.200", "10.40.0.100", 1},
-		{"multiple errors", "10.40.0.0/24", []string{"10.41.0.0/24"}, "10.42.0.0", "10.42.0.255", 2},
-		{"no alloc range", "10.40.0.0/24", []string{"10.40.0.0/26"}, "", "", 0},
-		{"invalid reserved CIDR", "10.40.0.0/24", []string{"bad"}, "", "", 1},
+		{"valid single range", "10.40.0.0/24", []string{"10.40.0.0/26"}, []AllocatedRange{{Start: "10.40.0.128", End: "10.40.0.255"}}, 0},
+		{"invalid CIDR", "bad", nil, nil, 1},
+		{"reserved outside pool", "10.40.0.0/24", []string{"10.41.0.0/24"}, nil, 1},
+		{"range outside pool", "10.40.0.0/24", nil, []AllocatedRange{{Start: "10.41.0.0", End: "10.41.0.255"}}, 1},
+		{"range start after end", "10.40.0.0/24", nil, []AllocatedRange{{Start: "10.40.0.200", End: "10.40.0.100"}}, 1},
+		{"multiple errors", "10.40.0.0/24", []string{"10.41.0.0/24"}, []AllocatedRange{{Start: "10.42.0.0", End: "10.42.0.255"}}, 2},
+		{"no ranges", "10.40.0.0/24", []string{"10.40.0.0/26"}, nil, 0},
+		{"invalid reserved CIDR", "10.40.0.0/24", []string{"bad"}, nil, 1},
+		// Multi-range validation
+		{"valid multi-range sorted", "10.40.0.0/24", nil, []AllocatedRange{
+			{Start: "10.40.0.0", End: "10.40.0.63"},
+			{Start: "10.40.0.128", End: "10.40.0.255"},
+		}, 0},
+		{"multi-range unsorted", "10.40.0.0/24", nil, []AllocatedRange{
+			{Start: "10.40.0.128", End: "10.40.0.255"},
+			{Start: "10.40.0.0", End: "10.40.0.63"},
+		}, 1},
+		{"multi-range overlapping", "10.40.0.0/24", nil, []AllocatedRange{
+			{Start: "10.40.0.0", End: "10.40.0.100"},
+			{Start: "10.40.0.50", End: "10.40.0.200"},
+		}, 1},
+		{"multi-range one outside CIDR", "10.40.0.0/24", nil, []AllocatedRange{
+			{Start: "10.40.0.0", End: "10.40.0.63"},
+			{Start: "10.40.1.0", End: "10.40.1.50"},
+		}, 1},
+		{"reserved within range", "10.40.0.0/24", []string{"10.40.0.8/29"}, []AllocatedRange{
+			{Start: "10.40.0.0", End: "10.40.0.63"},
+		}, 0},
+		{"reserved outside all ranges", "10.40.0.0/24", []string{"10.40.0.200/29"}, []AllocatedRange{
+			{Start: "10.40.0.0", End: "10.40.0.63"},
+		}, 0},
+		{"reserved straddles range boundary", "10.40.0.0/24", []string{"10.40.0.0/26"}, []AllocatedRange{
+			{Start: "10.40.0.0", End: "10.40.0.31"},
+		}, 1},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			errs := ValidatePoolSpec(tt.cidr, tt.reserved, tt.allocStart, tt.allocEnd)
+			errs := ValidatePoolSpec(tt.cidr, tt.ranges, tt.reserved)
 			if len(errs) != tt.wantErrCount {
 				t.Errorf("got %d errors, want %d: %v", len(errs), tt.wantErrCount, errs)
 			}
@@ -920,26 +918,23 @@ func TestPoolCapacityInfo(t *testing.T) {
 		{
 			name: "empty pool no reserved",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.31",
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.31"}},
 			},
 			wantTotal: 32, wantAllocated: 0, wantAvailable: 32,
 		},
 		{
 			name: "with reserved IPs",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.31",
-				ReservedCIDRs:    []string{"10.0.0.0/29"}, // 8 reserved
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.31"}},
+				ReservedCIDRs:     []string{"10.0.0.0/29"}, // 8 reserved
 			},
 			wantTotal: 24, wantAllocated: 0, wantAvailable: 24,
 		},
 		{
 			name: "with reserved and allocated",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.31",
-				ReservedCIDRs:    []string{"10.0.0.0/29"}, // 8 reserved
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.31"}},
+				ReservedCIDRs:     []string{"10.0.0.0/29"}, // 8 reserved
 				ExistingAllocs: []AllocatedRange{
 					{Start: "10.0.0.8", End: "10.0.0.15"}, // 8 allocated
 				},
@@ -949,9 +944,8 @@ func TestPoolCapacityInfo(t *testing.T) {
 		{
 			name: "fully allocated (non-reserved)",
 			pool: PoolState{
-				AllocatableStart: "10.0.0.0",
-				AllocatableEnd:   "10.0.0.15",
-				ReservedCIDRs:    []string{"10.0.0.0/29"}, // 8 reserved
+				AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.15"}},
+				ReservedCIDRs:     []string{"10.0.0.0/29"}, // 8 reserved
 				ExistingAllocs: []AllocatedRange{
 					{Start: "10.0.0.8", End: "10.0.0.15"}, // 8 allocated
 				},
@@ -1105,8 +1099,7 @@ func TestAllocateAndRelease_Workflow(t *testing.T) {
 	// 4. Allocate 8 IPs — should use remaining space
 
 	pool := PoolState{
-		AllocatableStart: "10.0.0.0",
-		AllocatableEnd:   "10.0.0.63",
+		AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.63"}},
 	}
 
 	// Step 1: 4 allocations of 8
@@ -1166,8 +1159,7 @@ func TestAllocateAndRelease_Workflow(t *testing.T) {
 func TestAllocateRange_CIDRNotation(t *testing.T) {
 	// Verify power-of-2 aligned allocations produce CIDR notation
 	pool := PoolState{
-		AllocatableStart: "10.0.0.0",
-		AllocatableEnd:   "10.0.0.255",
+		AllocatableRanges: []AllocatedRange{{Start: "10.0.0.0", End: "10.0.0.255"}},
 	}
 
 	// Allocate 8 IPs starting at .0 — should be 10.0.0.0/29
@@ -1194,8 +1186,7 @@ func TestAllocateRange_CIDRNotation(t *testing.T) {
 
 func TestAllocatePinnedRange(t *testing.T) {
 	pool := PoolState{
-		AllocatableStart: "10.40.0.0",
-		AllocatableEnd:   "10.40.0.255",
+		AllocatableRanges: []AllocatedRange{{Start: "10.40.0.0", End: "10.40.0.255"}},
 	}
 
 	tests := []struct {
@@ -1231,26 +1222,38 @@ func TestAllocatePinnedRange(t *testing.T) {
 		},
 		{
 			name:        "outside pool - before",
-			pool:        PoolState{AllocatableStart: "10.40.0.64", AllocatableEnd: "10.40.0.127"},
+			pool:        PoolState{AllocatableRanges: []AllocatedRange{{Start: "10.40.0.64", End: "10.40.0.127"}}},
 			start:       "10.40.0.10",
 			end:         "10.40.0.17",
 			wantErr:     true,
-			errContains: "outside pool",
+			errContains: "outside allocatable ranges",
 		},
 		{
 			name:        "outside pool - after",
-			pool:        PoolState{AllocatableStart: "10.40.0.0", AllocatableEnd: "10.40.0.127"},
+			pool:        PoolState{AllocatableRanges: []AllocatedRange{{Start: "10.40.0.0", End: "10.40.0.127"}}},
 			start:       "10.40.0.200",
 			end:         "10.40.0.207",
 			wantErr:     true,
-			errContains: "outside pool",
+			errContains: "outside allocatable ranges",
+		},
+		{
+			name: "straddles two ranges",
+			pool: PoolState{
+				AllocatableRanges: []AllocatedRange{
+					{Start: "10.92.90.32", End: "10.92.90.63"},
+					{Start: "10.92.91.51", End: "10.92.91.191"},
+				},
+			},
+			start:       "10.92.90.62",
+			end:         "10.92.91.55",
+			wantErr:     true,
+			errContains: "straddles allocatable ranges",
 		},
 		{
 			name: "conflicts with reserved",
 			pool: PoolState{
-				AllocatableStart: "10.40.0.0",
-				AllocatableEnd:   "10.40.0.255",
-				ReservedCIDRs:    []string{"10.40.0.0/28"},
+				AllocatableRanges: []AllocatedRange{{Start: "10.40.0.0", End: "10.40.0.255"}},
+				ReservedCIDRs:     []string{"10.40.0.0/28"},
 			},
 			start:       "10.40.0.10",
 			end:         "10.40.0.17",
@@ -1260,9 +1263,8 @@ func TestAllocatePinnedRange(t *testing.T) {
 		{
 			name: "conflicts with existing allocation",
 			pool: PoolState{
-				AllocatableStart: "10.40.0.0",
-				AllocatableEnd:   "10.40.0.255",
-				ExistingAllocs:   []AllocatedRange{{Start: "10.40.0.10", End: "10.40.0.17"}},
+				AllocatableRanges: []AllocatedRange{{Start: "10.40.0.0", End: "10.40.0.255"}},
+				ExistingAllocs:    []AllocatedRange{{Start: "10.40.0.10", End: "10.40.0.17"}},
 			},
 			start:       "10.40.0.14",
 			end:         "10.40.0.21",
@@ -1272,9 +1274,8 @@ func TestAllocatePinnedRange(t *testing.T) {
 		{
 			name: "adjacent to existing - no conflict",
 			pool: PoolState{
-				AllocatableStart: "10.40.0.0",
-				AllocatableEnd:   "10.40.0.255",
-				ExistingAllocs:   []AllocatedRange{{Start: "10.40.0.10", End: "10.40.0.17"}},
+				AllocatableRanges: []AllocatedRange{{Start: "10.40.0.0", End: "10.40.0.255"}},
+				ExistingAllocs:    []AllocatedRange{{Start: "10.40.0.10", End: "10.40.0.17"}},
 			},
 			start:     "10.40.0.18",
 			end:       "10.40.0.25",
@@ -1316,8 +1317,7 @@ func TestAllocatePinnedRange(t *testing.T) {
 func TestAllocatePinnedRange_MigrationWorkflow(t *testing.T) {
 	// Simulate migrating 3 existing TCs with manual LB pools into IPAM
 	pool := PoolState{
-		AllocatableStart: "10.40.6.0",
-		AllocatableEnd:   "10.40.6.255",
+		AllocatableRanges: []AllocatedRange{{Start: "10.40.6.0", End: "10.40.6.255"}},
 	}
 
 	// Import existing assignments
@@ -1325,8 +1325,8 @@ func TestAllocatePinnedRange_MigrationWorkflow(t *testing.T) {
 		start string
 		end   string
 	}{
-		{"10.40.6.10", "10.40.6.30"},  // butlerlabs-site-dev
-		{"10.40.6.50", "10.40.6.55"},  // gateway-test
+		{"10.40.6.10", "10.40.6.30"},   // butlerlabs-site-dev
+		{"10.40.6.50", "10.40.6.55"},   // gateway-test
 		{"10.40.6.100", "10.40.6.115"}, // another cluster
 	}
 
@@ -1363,9 +1363,8 @@ func TestAllocateRange_RealisticDatacenter(t *testing.T) {
 	// Simulate a realistic datacenter scenario:
 	// /24 pool (256 IPs), reserved .0-.15 for management, 5 nodes + 8 LB per tenant
 	pool := PoolState{
-		AllocatableStart: "10.40.0.0",
-		AllocatableEnd:   "10.40.0.255",
-		ReservedCIDRs:    []string{"10.40.0.0/28"}, // .0-.15 reserved for management
+		AllocatableRanges: []AllocatedRange{{Start: "10.40.0.0", End: "10.40.0.255"}},
+		ReservedCIDRs:     []string{"10.40.0.0/28"}, // .0-.15 reserved for management
 	}
 
 	// Allocate for 10 tenants (5 node IPs + 8 LB IPs each = 13 per tenant)
@@ -1396,7 +1395,7 @@ func TestAllocateRange_RealisticDatacenter(t *testing.T) {
 	}
 
 	expectedAllocated := int32(10 * 13) // 130 IPs allocated
-	expectedTotal := int32(240)          // 256 - 16 reserved
+	expectedTotal := int32(240)         // 256 - 16 reserved
 	expectedAvailable := expectedTotal - expectedAllocated
 
 	if total != expectedTotal {
@@ -1408,4 +1407,300 @@ func TestAllocateRange_RealisticDatacenter(t *testing.T) {
 	if available != expectedAvailable {
 		t.Errorf("available = %d, want %d", available, expectedAvailable)
 	}
+}
+
+// --- Multi-Range Tests ---
+
+func TestBuildBitmap_MultiRange(t *testing.T) {
+	t.Run("two ranges with gap", func(t *testing.T) {
+		pool := PoolState{
+			AllocatableRanges: []AllocatedRange{
+				{Start: "10.0.0.0", End: "10.0.0.7"},
+				{Start: "10.0.0.16", End: "10.0.0.23"},
+			},
+		}
+		bitmap, startUint, err := BuildBitmap(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Bitmap spans .0 to .23 = 24 entries
+		if len(bitmap) != 24 {
+			t.Fatalf("bitmap length = %d, want 24", len(bitmap))
+		}
+		if startUint != IPToUint32(net.ParseIP("10.0.0.0")) {
+			t.Errorf("startUint mismatch")
+		}
+		// .0-.7 free (range 1), .8-.15 used (gap), .16-.23 free (range 2)
+		for i := 0; i < 8; i++ {
+			if bitmap[i] {
+				t.Errorf("bitmap[%d] should be free (range 1)", i)
+			}
+		}
+		for i := 8; i < 16; i++ {
+			if !bitmap[i] {
+				t.Errorf("bitmap[%d] should be used (gap)", i)
+			}
+		}
+		for i := 16; i < 24; i++ {
+			if bitmap[i] {
+				t.Errorf("bitmap[%d] should be free (range 2)", i)
+			}
+		}
+	})
+
+	t.Run("three ranges with reserved in gap", func(t *testing.T) {
+		pool := PoolState{
+			AllocatableRanges: []AllocatedRange{
+				{Start: "10.0.0.0", End: "10.0.0.7"},
+				{Start: "10.0.0.16", End: "10.0.0.23"},
+				{Start: "10.0.0.32", End: "10.0.0.39"},
+			},
+			ReservedCIDRs: []string{"10.0.0.4/30"}, // .4-.7 reserved within range 1
+		}
+		bitmap, _, err := BuildBitmap(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// .4-.7 reserved
+		for i := 4; i < 8; i++ {
+			if !bitmap[i] {
+				t.Errorf("bitmap[%d] should be reserved", i)
+			}
+		}
+		// .8-.15 gap
+		for i := 8; i < 16; i++ {
+			if !bitmap[i] {
+				t.Errorf("bitmap[%d] should be used (gap between range 1 and 2)", i)
+			}
+		}
+		// .16-.23 free (range 2)
+		for i := 16; i < 24; i++ {
+			if bitmap[i] {
+				t.Errorf("bitmap[%d] should be free (range 2)", i)
+			}
+		}
+	})
+}
+
+func TestAllocateRange_MultiRange(t *testing.T) {
+	t.Run("allocates across two ranges", func(t *testing.T) {
+		pool := PoolState{
+			AllocatableRanges: []AllocatedRange{
+				{Start: "10.0.0.0", End: "10.0.0.3"},   // 4 IPs
+				{Start: "10.0.0.16", End: "10.0.0.23"}, // 8 IPs
+			},
+		}
+		// Request 6 IPs — won't fit in range 1 (4 IPs), must use range 2 (8 IPs)
+		result, err := AllocateRange(pool, 6)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Best-fit selects range 2 (8 >= 6, and range 1 is too small)
+		if result.Start != "10.0.0.16" {
+			t.Errorf("start = %s, want 10.0.0.16", result.Start)
+		}
+		if result.End != "10.0.0.21" {
+			t.Errorf("end = %s, want 10.0.0.21", result.End)
+		}
+	})
+
+	t.Run("fills first range then second", func(t *testing.T) {
+		pool := PoolState{
+			AllocatableRanges: []AllocatedRange{
+				{Start: "10.0.0.0", End: "10.0.0.3"},   // 4 IPs
+				{Start: "10.0.0.16", End: "10.0.0.23"}, // 8 IPs
+			},
+		}
+		// Request 4 IPs — fits exactly in range 1 (best fit)
+		result1, err := AllocateRange(pool, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result1.Start != "10.0.0.0" {
+			t.Errorf("first allocation start = %s, want 10.0.0.0", result1.Start)
+		}
+
+		// Add to existing allocs, request 4 more — must use range 2
+		pool.ExistingAllocs = append(pool.ExistingAllocs, AllocatedRange{
+			Start: result1.Start, End: result1.End,
+		})
+		result2, err := AllocateRange(pool, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result2.Start != "10.0.0.16" {
+			t.Errorf("second allocation start = %s, want 10.0.0.16", result2.Start)
+		}
+	})
+}
+
+// TestAllocateRange_FullCIDRFallback verifies that a single range covering the
+// full CIDR (the shape produced by buildPoolState when TenantAllocation is nil)
+// behaves identically to the legacy single-range path.
+func TestAllocateRange_FullCIDRFallback(t *testing.T) {
+	// Simulates the controller's buildPoolState fallback: TenantAllocation is nil,
+	// so AllocatableRanges gets a single entry spanning the full CIDR.
+	pool := PoolState{
+		AllocatableRanges: []AllocatedRange{
+			{Start: "10.40.0.0", End: "10.40.0.255"},
+		},
+		ReservedCIDRs: []string{"10.40.0.0/28"}, // .0-.15 reserved
+	}
+
+	// Allocate 8 IPs — should skip reserved block and allocate .16-.23
+	result, err := AllocateRange(pool, 8)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Start != "10.40.0.16" {
+		t.Errorf("start = %s, want 10.40.0.16", result.Start)
+	}
+	if result.End != "10.40.0.23" {
+		t.Errorf("end = %s, want 10.40.0.23", result.End)
+	}
+
+	// Capacity should report 240 usable (256 - 16 reserved), 8 allocated, 232 available
+	pool.ExistingAllocs = []AllocatedRange{{Start: result.Start, End: result.End}}
+	total, allocated, available, err := PoolCapacityInfo(pool)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if total != 240 {
+		t.Errorf("total = %d, want 240", total)
+	}
+	if allocated != 8 {
+		t.Errorf("allocated = %d, want 8", allocated)
+	}
+	if available != 232 {
+		t.Errorf("available = %d, want 232", available)
+	}
+}
+
+func TestPoolCapacityInfo_MultiRange(t *testing.T) {
+	t.Run("total is sum of range sizes not span", func(t *testing.T) {
+		pool := PoolState{
+			AllocatableRanges: []AllocatedRange{
+				{Start: "10.0.0.0", End: "10.0.0.7"},   // 8 IPs
+				{Start: "10.0.0.32", End: "10.0.0.39"}, // 8 IPs
+			},
+		}
+		total, allocated, available, err := PoolCapacityInfo(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Total should be 16 (8+8), not 40 (span from .0 to .39)
+		if total != 16 {
+			t.Errorf("total = %d, want 16", total)
+		}
+		if allocated != 0 {
+			t.Errorf("allocated = %d, want 0", allocated)
+		}
+		if available != 16 {
+			t.Errorf("available = %d, want 16", available)
+		}
+	})
+
+	t.Run("reserved counted only within ranges", func(t *testing.T) {
+		pool := PoolState{
+			AllocatableRanges: []AllocatedRange{
+				{Start: "10.0.0.0", End: "10.0.0.15"},  // 16 IPs
+				{Start: "10.0.0.32", End: "10.0.0.47"}, // 16 IPs
+			},
+			ReservedCIDRs: []string{
+				"10.0.0.0/30",  // .0-.3 reserved within range 1
+				"10.0.0.20/30", // .20-.23 reserved in gap (not in any range)
+			},
+		}
+		total, _, available, err := PoolCapacityInfo(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Total = 32 - 4 (reserved in range 1) = 28. Gap reserved doesn't count.
+		if total != 28 {
+			t.Errorf("total = %d, want 28", total)
+		}
+		if available != 28 {
+			t.Errorf("available = %d, want 28", available)
+		}
+	})
+
+	t.Run("crop cluster scenario", func(t *testing.T) {
+		// Mirrors the actual crop cluster configuration:
+		// Range 1: .32-.63 (32 IPs), Range 2: .91.51-.91.191 (141 IPs)
+		pool := PoolState{
+			AllocatableRanges: []AllocatedRange{
+				{Start: "10.92.90.32", End: "10.92.90.63"},  // 32 IPs
+				{Start: "10.92.91.51", End: "10.92.91.191"}, // 141 IPs
+			},
+		}
+		total, allocated, available, err := PoolCapacityInfo(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if total != 173 {
+			t.Errorf("total = %d, want 173", total)
+		}
+		if allocated != 0 {
+			t.Errorf("allocated = %d, want 0", allocated)
+		}
+		if available != 173 {
+			t.Errorf("available = %d, want 173", available)
+		}
+	})
+}
+
+func TestComputeFragmentation_MultiRange(t *testing.T) {
+	t.Run("two ranges no allocations", func(t *testing.T) {
+		pool := PoolState{
+			AllocatableRanges: []AllocatedRange{
+				{Start: "10.0.0.0", End: "10.0.0.7"},
+				{Start: "10.0.0.16", End: "10.0.0.23"},
+			},
+		}
+		info, err := ComputeFragmentation(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Two separate free blocks (one per range), so fragmentation > 0
+		if info.FreeBlockCount != 2 {
+			t.Errorf("FreeBlockCount = %d, want 2", info.FreeBlockCount)
+		}
+		if info.TotalFreeIPs != 16 {
+			t.Errorf("TotalFreeIPs = %d, want 16", info.TotalFreeIPs)
+		}
+	})
+
+	t.Run("crop cluster scenario with partial allocation", func(t *testing.T) {
+		// Crop cluster: ranges[0] .32-.63 (32 IPs), ranges[1] .51-.191 (141 IPs)
+		// 28 IPs allocated in ranges[0] (.32-.59), 0 in ranges[1]
+		pool := PoolState{
+			AllocatableRanges: []AllocatedRange{
+				{Start: "10.92.90.32", End: "10.92.90.63"},
+				{Start: "10.92.91.51", End: "10.92.91.191"},
+			},
+			ExistingAllocs: []AllocatedRange{
+				{Start: "10.92.90.32", End: "10.92.90.59"},
+			},
+		}
+		info, err := ComputeFragmentation(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Free space: 4 IPs in ranges[0] (.60-.63) + 141 IPs in ranges[1] (.51-.191) = 145
+		if info.TotalFreeIPs != 145 {
+			t.Errorf("TotalFreeIPs = %d, want 145", info.TotalFreeIPs)
+		}
+		// Two free blocks: tail of ranges[0] and all of ranges[1]
+		if info.FreeBlockCount != 2 {
+			t.Errorf("FreeBlockCount = %d, want 2", info.FreeBlockCount)
+		}
+		// Largest free block is ranges[1] = 141 IPs
+		if info.LargestFreeBlock != 141 {
+			t.Errorf("LargestFreeBlock = %d, want 141", info.LargestFreeBlock)
+		}
+		// Fragmentation: 1 - (141/145) = ~2.7% — low, which is operationally correct
+		if info.FragmentationPercent > 5 {
+			t.Errorf("FragmentationPercent = %d, want <= 5 (healthy multi-range pool)", info.FragmentationPercent)
+		}
+	})
 }

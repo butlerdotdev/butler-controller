@@ -103,32 +103,47 @@ func (v *NetworkPoolValidator) ValidateUpdate(ctx context.Context, oldObj, newOb
 }
 
 // validateTenantAllocationNarrowing rejects narrowing of the tenant allocation
-// range when existing IPAllocations have addresses outside the proposed range.
+// ranges when existing IPAllocations have addresses outside the proposed ranges.
+// Handles all narrowing shapes: range removal, range shrink, range split,
+// and Start/End-to-Ranges migration.
 func (v *NetworkPoolValidator) validateTenantAllocationNarrowing(ctx context.Context, oldPool, newPool *butlerv1alpha1.NetworkPool) error {
-	if oldPool.Spec.TenantAllocation == nil || newPool.Spec.TenantAllocation == nil {
+	if newPool.Spec.TenantAllocation == nil {
 		return nil
 	}
 
-	oldStart := oldPool.Spec.TenantAllocation.Start
-	oldEnd := oldPool.Spec.TenantAllocation.End
-	newStart := newPool.Spec.TenantAllocation.Start
-	newEnd := newPool.Spec.TenantAllocation.End
-
-	// If the range didn't change, nothing to validate
-	if oldStart == newStart && oldEnd == newEnd {
-		return nil
+	newRanges := newPool.Spec.TenantAllocation.GetEffectiveRanges()
+	if len(newRanges) == 0 {
+		return nil // no ranges = entire CIDR, can't narrow
 	}
 
-	// Parse new range boundaries
-	newStartIP := net.ParseIP(newStart).To4()
-	newEndIP := net.ParseIP(newEnd).To4()
-	if newStartIP == nil || newEndIP == nil {
-		return nil // validation of IPs themselves is done by validatePoolSpec
+	// Parse new ranges into uint32 pairs for fast lookup.
+	type rangeBounds struct {
+		start, end uint32
 	}
-	newStartUint := ipam.IPToUint32(newStartIP)
-	newEndUint := ipam.IPToUint32(newEndIP)
+	newBounds := make([]rangeBounds, 0, len(newRanges))
+	for _, r := range newRanges {
+		sIP := net.ParseIP(r.Start).To4()
+		eIP := net.ParseIP(r.End).To4()
+		if sIP == nil || eIP == nil {
+			return nil // IP validation is done by validatePoolSpec
+		}
+		newBounds = append(newBounds, rangeBounds{
+			start: ipam.IPToUint32(sIP),
+			end:   ipam.IPToUint32(eIP),
+		})
+	}
 
-	// List all IPAllocations referencing this pool
+	// ipWithinRanges checks if an IP falls within any of the new ranges.
+	ipWithinRanges := func(ipUint uint32) bool {
+		for _, b := range newBounds {
+			if ipUint >= b.start && ipUint <= b.end {
+				return true
+			}
+		}
+		return false
+	}
+
+	// List all IPAllocations referencing this pool.
 	var allocList butlerv1alpha1.IPAllocationList
 	if err := v.Client.List(ctx, &allocList, client.MatchingLabels{
 		butlerv1alpha1.LabelNetworkPool: newPool.Name,
@@ -143,19 +158,18 @@ func (v *NetworkPoolValidator) validateTenantAllocationNarrowing(ctx context.Con
 			continue
 		}
 
-		// Check each address in the allocation
+		// Check each address in the allocation.
 		for _, addr := range alloc.Status.Addresses {
 			ip := net.ParseIP(addr).To4()
 			if ip == nil {
 				continue
 			}
-			ipUint := ipam.IPToUint32(ip)
-			if ipUint < newStartUint || ipUint > newEndUint {
+			if !ipWithinRanges(ipam.IPToUint32(ip)) {
 				allErrs = append(allErrs, field.Forbidden(
 					field.NewPath("spec", "tenantAllocation"),
 					fmt.Sprintf(
-						"cannot narrow tenant allocation range: IPAllocation %q has address %s outside the proposed range %s-%s. Migrate or delete affected allocations first",
-						alloc.Name, addr, newStart, newEnd,
+						"cannot narrow tenant allocation ranges: IPAllocation %q has address %s outside the proposed ranges. Migrate or delete affected allocations first",
+						alloc.Name, addr,
 					),
 				))
 				break // one violation per allocation is enough
@@ -170,12 +184,12 @@ func (v *NetworkPoolValidator) validateTenantAllocationNarrowing(ctx context.Con
 			if startIP != nil && endIP != nil {
 				sUint := ipam.IPToUint32(startIP)
 				eUint := ipam.IPToUint32(endIP)
-				if sUint < newStartUint || eUint > newEndUint {
+				if !ipWithinRanges(sUint) || !ipWithinRanges(eUint) {
 					allErrs = append(allErrs, field.Forbidden(
 						field.NewPath("spec", "tenantAllocation"),
 						fmt.Sprintf(
-							"cannot narrow tenant allocation range: IPAllocation %q has addresses %s-%s outside the proposed range %s-%s. Migrate or delete affected allocations first",
-							alloc.Name, alloc.Status.StartAddress, alloc.Status.EndAddress, newStart, newEnd,
+							"cannot narrow tenant allocation ranges: IPAllocation %q has addresses %s-%s outside the proposed ranges. Migrate or delete affected allocations first",
+							alloc.Name, alloc.Status.StartAddress, alloc.Status.EndAddress,
 						),
 					))
 				}
@@ -223,6 +237,7 @@ func (v *NetworkPoolValidator) ValidateDelete(ctx context.Context, obj runtime.O
 }
 
 // validatePoolSpec validates the internal consistency of a NetworkPool spec using the ipam package.
+// Returns deprecation warnings when Start/End are used instead of Ranges.
 func (v *NetworkPoolValidator) validatePoolSpec(pool *butlerv1alpha1.NetworkPool) (admission.Warnings, error) {
 	// Collect reserved CIDRs.
 	reservedCIDRs := make([]string, 0, len(pool.Spec.Reserved))
@@ -230,15 +245,32 @@ func (v *NetworkPoolValidator) validatePoolSpec(pool *butlerv1alpha1.NetworkPool
 		reservedCIDRs = append(reservedCIDRs, r.CIDR)
 	}
 
-	// Determine allocation range.
-	allocStart := ""
-	allocEnd := ""
+	// Resolve effective ranges and build deprecation warnings.
+	var warnings admission.Warnings
+	var ranges []ipam.AllocatedRange
 	if pool.Spec.TenantAllocation != nil {
-		allocStart = pool.Spec.TenantAllocation.Start
-		allocEnd = pool.Spec.TenantAllocation.End
+		ta := pool.Spec.TenantAllocation
+		hasStartEnd := ta.Start != "" && ta.End != ""
+		hasRanges := len(ta.Ranges) > 0
+
+		if hasStartEnd && hasRanges {
+			warnings = append(warnings,
+				"Start/End are ignored when Ranges is present; remove them")
+		} else if hasStartEnd && !hasRanges {
+			warnings = append(warnings, fmt.Sprintf(
+				"Start/End fields are deprecated; migrate to Ranges. Equivalent configuration:\n"+
+					"  tenantAllocation:\n"+
+					"    ranges:\n"+
+					"    - start: %s\n"+
+					"      end: %s", ta.Start, ta.End))
+		}
+
+		for _, r := range ta.GetEffectiveRanges() {
+			ranges = append(ranges, ipam.AllocatedRange{Start: r.Start, End: r.End})
+		}
 	}
 
-	errs := ipam.ValidatePoolSpec(pool.Spec.CIDR, reservedCIDRs, allocStart, allocEnd)
+	errs := ipam.ValidatePoolSpec(pool.Spec.CIDR, ranges, reservedCIDRs)
 	if len(errs) > 0 {
 		var allErrs field.ErrorList
 		for _, errMsg := range errs {
@@ -248,10 +280,10 @@ func (v *NetworkPoolValidator) validatePoolSpec(pool *butlerv1alpha1.NetworkPool
 				errMsg,
 			))
 		}
-		return nil, allErrs.ToAggregate()
+		return warnings, allErrs.ToAggregate()
 	}
 
-	return nil, nil
+	return warnings, nil
 }
 
 // SetupWebhookWithManager registers the NetworkPool validating webhook with the manager.
