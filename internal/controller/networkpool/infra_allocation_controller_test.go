@@ -395,7 +395,7 @@ func TestReconcile_NoOpWhenBothEmpty(t *testing.T) {
 	pool := newPool("pool", "default", "10.0.0.0/24",
 		[]butlerv1alpha1.ReservedRange{{CIDR: "10.0.0.0/28"}})
 
-	// ClusterIP service — produces no allocations
+	// ClusterIP service produces no allocations
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
 		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP},
@@ -503,7 +503,7 @@ func TestReconcile_IPOutsideReservedRange(t *testing.T) {
 	pool := newPool("pool", "default", "10.0.0.0/24",
 		[]butlerv1alpha1.ReservedRange{{CIDR: "10.0.0.0/28"}}) // .0-.15
 
-	// IP is 10.0.0.100 — outside the /28 range
+	// IP 10.0.0.100 is outside the /28 range
 	_, capture := reconcileWith(t, pool, newLBService("svc", "default", "10.0.0.100"))
 
 	if capture.called {
@@ -616,7 +616,7 @@ func TestReconcile_ClearsAllocationsWhenServiceRemoved(t *testing.T) {
 		},
 	}
 
-	// No services exist — the deleted service's allocation should be cleared
+	// No services exist. The deleted service's allocation should be cleared.
 	_, capture := reconcileWith(t, pool)
 
 	if !capture.called {

@@ -162,7 +162,7 @@ func (r *InfraAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 // patchInfraAllocations patches only the InfrastructureAllocations field
 // on NetworkPool status via SSA. Other status fields (TotalIPs, AllocatedIPs,
-// conditions, etc.) are untouched — they are managed by the existing
+// conditions, etc.) are untouched. They are managed by the existing
 // NetworkPool reconciler through plain Update.
 func (r *InfraAllocationReconciler) patchInfraAllocations(
 	ctx context.Context,
