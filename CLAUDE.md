@@ -7,3 +7,19 @@
 ## Conventions
 
 - Data-only API types without methods do not get unit test files in butler-api. Controller-side tests (envtest) cover the behavioral integration of those types.
+
+## SSA field manager conventions
+
+Three distinct field managers write to objects in this controller:
+
+| Field Manager | Location | Target | Mechanism |
+|---|---|---|---|
+| `butler-controller/infra-allocation` | `infra_allocation_controller.go` | `NetworkPool.status.infrastructureAllocations` | SSA status patch |
+| `butler-controller/ipam` | `installer.go` | MetalLB `IPAddressPool` / `L2Advertisement` on tenant clusters | SSA via dynamic client |
+| _(none / implicit)_ | `networkpool_controller.go` | `NetworkPool.status` capacity fields + conditions | Plain `r.Status().Update()` |
+
+If the existing NetworkPool reconciler is migrated to SSA, it must adopt a distinct manager name (suggested: `butler-controller/networkpool-allocation`) to avoid silent field ownership conflicts on the same status object.
+
+## Mapper enqueue-all-NetworkPools pattern
+
+The `InfraAllocationReconciler` Service mapper enqueues all NetworkPools on every qualifying Service event rather than filtering by IP-range membership. At current scale (under ~50 pools per management cluster) full enqueue is correct and simpler than IP-range-aware mapping. Each pool's Reconcile recomputes from scratch, so IP moves and deletions are handled by construction without needing access to `event.ObjectOld`. Revisit if pool count per cluster grows significantly.
