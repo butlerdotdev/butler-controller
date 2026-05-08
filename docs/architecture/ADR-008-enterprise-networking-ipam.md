@@ -75,22 +75,22 @@ First-fit is simpler but leads to fragmentation. After several allocate/free cyc
 
 ### Negative
 - NetworkPool controller is a single point of allocation (by design for safety, but if it crashes, new allocations stall until leader election recovers)
-- Pool capacity warnings emit every reconcile cycle (60s) when above threshold — should add rate limiting if noisy
+- Pool capacity warnings emit every reconcile cycle (60s) when above threshold. Rate limiting should be added if noisy.
 
 ### Metrics Emitted
-- `butler_network_pool_total_ips` — total IPs per pool
-- `butler_network_pool_allocated_ips` — allocated IPs per pool
-- `butler_network_pool_available_ips` — available IPs per pool
-- `butler_network_pool_fragmentation_percent` — free space fragmentation
-- `butler_ip_allocation_processed_total` — allocation counter by result
-- `butler_provider_config_ready` — provider readiness gauge
-- `butler_provider_config_available_ips` — available IPs per provider
+- `butler_network_pool_total_ips`: total IPs per pool
+- `butler_network_pool_allocated_ips`: allocated IPs per pool
+- `butler_network_pool_available_ips`: available IPs per pool
+- `butler_network_pool_fragmentation_percent`: free space fragmentation
+- `butler_ip_allocation_processed_total`: allocation counter by result
+- `butler_provider_config_ready`: provider readiness gauge
+- `butler_provider_config_available_ips`: available IPs per provider
 
 ### Events Emitted
-- `PoolCapacityWarning` — pool > 80% utilized
-- `PoolCapacityDanger` — pool > 90% utilized
-- `PoolExhausted` — pool 100% utilized
-- `IPsAllocated` — successful IP allocation
-- `AllocationFailed` — failed allocation attempt
-- `CredentialsInvalid` — provider credential validation failed
-- `PoolsExhausted` — all pools for a provider exhausted
+- `PoolCapacityWarning`: pool > 80% utilized
+- `PoolCapacityDanger`: pool > 90% utilized
+- `PoolExhausted`: pool 100% utilized
+- `IPsAllocated`: successful IP allocation
+- `AllocationFailed`: failed allocation attempt
+- `CredentialsInvalid`: provider credential validation failed
+- `PoolsExhausted`: all pools for a provider exhausted

@@ -92,6 +92,13 @@ var _ = BeforeSuite(func() {
 	}).SetupWithManager(mgr)
 	Expect(err).NotTo(HaveOccurred())
 
+	// Register the InfraAllocation controller (infrastructure IP discovery)
+	err = (&InfraAllocationReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr)
+	Expect(err).NotTo(HaveOccurred())
+
 	// Register the IPAllocation controller (finalizers, initial phase, deletion cleanup)
 	err = (&ipallocationctrl.Reconciler{
 		Client: mgr.GetClient(),

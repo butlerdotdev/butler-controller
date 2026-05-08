@@ -8,6 +8,7 @@ bin/*
 Dockerfile.cross
 secrets/
 .secrets/
+*.local.md
 
 .DS_Store
 
