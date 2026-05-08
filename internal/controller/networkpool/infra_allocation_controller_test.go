@@ -69,6 +69,13 @@ type patchCapture struct {
 	pool   *butlerv1alpha1.NetworkPool
 }
 
+// reconcileWith wraps a fake client with an interceptor that counts
+// SubResourcePatch calls via the patchCapture flag. Use this for any test
+// that needs to assert a reconciler's no-op patch guard works correctly.
+//
+// Asserting absence of state change in the fake client is not sufficient:
+// a reconciler can patch with the same desired value and still be looping.
+// Counting patch calls proves the comparison-before-patch path is correct.
 func reconcileWith(t *testing.T, pool *butlerv1alpha1.NetworkPool, services ...*corev1.Service) (ctrl.Result, patchCapture) {
 	t.Helper()
 	s := testScheme()
