@@ -621,6 +621,90 @@ func TestReconcile_ClearsAllocationsWhenServiceRemoved(t *testing.T) {
 	}
 }
 
+func TestReconcile_ServiceIPChanged(t *testing.T) {
+	// Pool with two distinct reserved CIDRs.
+	pool := newPool("pool", "default", "10.0.0.0/16",
+		[]butlerv1alpha1.ReservedRange{
+			{CIDR: "10.0.0.0/28"}, // range A: .0-.15
+			{CIDR: "10.0.1.0/28"}, // range B: .0-.15
+		})
+
+	svc := newLBService("moving-svc", "default", "10.0.0.5") // starts in range A
+
+	s := testScheme()
+	fc := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(pool, svc).
+		WithStatusSubresource(&butlerv1alpha1.NetworkPool{}).
+		Build()
+
+	var captures []patchCapture
+	cl := interceptor.NewClient(fc, interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, subResource string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			if p, ok := obj.(*butlerv1alpha1.NetworkPool); ok {
+				captures = append(captures, patchCapture{called: true, pool: p.DeepCopy()})
+			}
+			return nil
+		},
+	})
+
+	r := &InfraAllocationReconciler{Client: cl, Scheme: s}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pool", Namespace: "default"}}
+
+	// First reconcile: Service IP 10.0.0.5 is in range A.
+	_, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("first reconcile error: %v", err)
+	}
+	if len(captures) != 1 {
+		t.Fatalf("expected 1 patch after first reconcile, got %d", len(captures))
+	}
+	if captures[0].pool.Status.InfrastructureAllocations[0].IP != "10.0.0.5" {
+		t.Errorf("first reconcile: IP = %q, want 10.0.0.5",
+			captures[0].pool.Status.InfrastructureAllocations[0].IP)
+	}
+
+	// Simulate IP move: update the Service in the fake client to use an IP
+	// in range B. This models MetalLB reassigning the IP.
+	if err := fc.Get(context.Background(), types.NamespacedName{Name: "moving-svc", Namespace: "default"}, svc); err != nil {
+		t.Fatalf("failed to get service: %v", err)
+	}
+	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "10.0.1.3"}}
+	if err := fc.Status().Update(context.Background(), svc); err != nil {
+		t.Fatalf("failed to update service status: %v", err)
+	}
+
+	// Update the pool's current status to match what the first reconcile
+	// wrote, so the no-op guard sees the stale state.
+	if err := fc.Get(context.Background(), types.NamespacedName{Name: "pool", Namespace: "default"}, pool); err != nil {
+		t.Fatalf("failed to get pool: %v", err)
+	}
+	pool.Status.InfrastructureAllocations = captures[0].pool.Status.InfrastructureAllocations
+	if err := fc.Status().Update(context.Background(), pool); err != nil {
+		t.Fatalf("failed to update pool status: %v", err)
+	}
+
+	// Second reconcile: Service IP moved to 10.0.1.3 in range B.
+	captures = nil
+	_, err = r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("second reconcile error: %v", err)
+	}
+	if len(captures) != 1 {
+		t.Fatalf("expected 1 patch after second reconcile (IP changed), got %d", len(captures))
+	}
+	allocs := captures[0].pool.Status.InfrastructureAllocations
+	if len(allocs) != 1 {
+		t.Fatalf("expected 1 allocation after IP move, got %d", len(allocs))
+	}
+	if allocs[0].IP != "10.0.1.3" {
+		t.Errorf("after IP move: IP = %q, want 10.0.1.3", allocs[0].IP)
+	}
+	if allocs[0].ServiceRef.Name != "moving-svc" {
+		t.Errorf("after IP move: ServiceRef.Name = %q, want moving-svc", allocs[0].ServiceRef.Name)
+	}
+}
+
 func TestReconcile_SourceConstant(t *testing.T) {
 	if SourceMetalLB != "metallb" {
 		t.Errorf("SourceMetalLB = %q, want %q", SourceMetalLB, "metallb")
