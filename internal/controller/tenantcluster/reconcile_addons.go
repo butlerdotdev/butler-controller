@@ -523,6 +523,12 @@ func rawOrEmpty(v *butlerv1alpha1.ExtensionValues) []byte {
 // buildVectorAgentValues configures the vector-agent sink to forward to the
 // pipeline aggregator and injects cluster identification fields into the VRL
 // remap transform so log events carry source cluster metadata.
+//
+// Only transforms and sink URI are set here. The remaining sink fields (type,
+// inputs, encoding) come from the AddonDefinition default via recursive deep
+// merge in tenantaddon_controller.go. The default's sinks.aggregator.inputs
+// references ["enrich_metadata"], ensuring events flow through the transform
+// before reaching the sink.
 func buildVectorAgentValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig, tc *butlerv1alpha1.TenantCluster, providerType string) *butlerv1alpha1.ExtensionValues {
 	if pipeline == nil || pipeline.LogEndpoint == "" {
 		return nil
@@ -654,6 +660,9 @@ func buildOtelResourceAttributes(tc *butlerv1alpha1.TenantCluster, providerType 
 // "harvester") from the TenantCluster's ProviderConfigRef. Returns "" if the
 // ref is nil or empty. Uses the controller-runtime cached client, so cost is
 // bounded by informer cache, not API server round-trips.
+//
+// Accepts client.Reader (not client.Client) to signal read-only intent and
+// simplify test setup with fake.NewClientBuilder.
 func resolveProviderType(ctx context.Context, c client.Reader, tc *butlerv1alpha1.TenantCluster) (string, error) {
 	if tc.Spec.ProviderConfigRef == nil || tc.Spec.ProviderConfigRef.Name == "" {
 		return "", nil
