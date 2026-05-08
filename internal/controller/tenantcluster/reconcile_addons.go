@@ -407,8 +407,14 @@ func (r *Reconciler) reconcileAutoEnrollObservability(ctx context.Context, tc *b
 
 	enroll := obs.Collection.AutoEnroll
 
+	// Resolve provider type once for all builders that need cluster identification.
+	providerType, err := resolveProviderType(ctx, r.Client, tc)
+	if err != nil {
+		logger.Error(err, "failed to resolve provider type", "cluster", tc.Name)
+	}
+
 	if enroll.VectorAgent && obs.Pipeline.LogEndpoint != "" {
-		if err := r.ensureAutoEnrolledAddon(ctx, tc, "vector-agent", buildVectorAgentValues(obs.Pipeline)); err != nil {
+		if err := r.ensureAutoEnrolledAddon(ctx, tc, "vector-agent", buildVectorAgentValues(obs.Pipeline, tc, providerType)); err != nil {
 			logger.Error(err, "failed to auto-enroll vector-agent")
 		}
 	}
@@ -514,14 +520,23 @@ func rawOrEmpty(v *butlerv1alpha1.ExtensionValues) []byte {
 	return v.Raw
 }
 
-// buildVectorAgentValues configures the vector-agent sink to forward to the pipeline aggregator.
-func buildVectorAgentValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig) *butlerv1alpha1.ExtensionValues {
+// buildVectorAgentValues configures the vector-agent sink to forward to the
+// pipeline aggregator and injects cluster identification fields into the VRL
+// remap transform so log events carry source cluster metadata.
+func buildVectorAgentValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig, tc *butlerv1alpha1.TenantCluster, providerType string) *butlerv1alpha1.ExtensionValues {
 	if pipeline == nil || pipeline.LogEndpoint == "" {
 		return nil
 	}
 
 	values := map[string]interface{}{
 		"customConfig": map[string]interface{}{
+			"transforms": map[string]interface{}{
+				"enrich_metadata": map[string]interface{}{
+					"type":   "remap",
+					"inputs": []string{"kubernetes_logs"},
+					"source": buildVectorRemapSource(tc, providerType),
+				},
+			},
 			"sinks": map[string]interface{}{
 				"aggregator": map[string]interface{}{
 					"uri": pipeline.LogEndpoint,

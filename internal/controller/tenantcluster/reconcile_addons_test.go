@@ -1106,8 +1106,15 @@ func TestBuildVectorAgentValues_HTTPSinkURI(t *testing.T) {
 	pipeline := &butlerv1alpha1.ObservabilityPipelineConfig{
 		LogEndpoint: "http://10.0.0.1:8080",
 	}
+	tc := &butlerv1alpha1.TenantCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "team-a",
+			UID:       "uid-123",
+		},
+	}
 
-	ev := buildVectorAgentValues(pipeline)
+	ev := buildVectorAgentValues(pipeline, tc, "")
 	if ev == nil {
 		t.Fatal("expected non-nil ExtensionValues")
 	}
