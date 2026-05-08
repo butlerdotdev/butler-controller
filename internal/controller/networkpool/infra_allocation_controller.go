@@ -202,11 +202,19 @@ func (r *InfraAllocationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// mapServiceToNetworkPools enqueues all NetworkPools when a LB Service's
-// ingress IPs change. There are typically 1-5 pools per management cluster,
-// so a full list is cheaper than maintaining a CIDR-based index. Enqueuing
-// all pools also correctly handles IP moves: both the old pool (which loses
-// the IP) and the new pool (which gains it) get reconciled.
+// mapServiceToNetworkPools enqueues every NetworkPool when a LoadBalancer
+// Service event fires. The reconciler then recomputes desired infrastructure
+// allocations from current cluster state, so stale entries are dropped
+// naturally regardless of which IP changed or which pool previously
+// contained it.
+//
+// This is correct by construction: any IP move (Service IP changes from
+// CIDR-A to CIDR-B across pools) reconciles both pools without requiring
+// the mapper to inspect old vs new state on Update events.
+//
+// Cost: one Reconcile per NetworkPool per LB Service event. Acceptable at
+// typical management-cluster scale (1-50 pools, 10-50 LB Services).
+// Revisit if pool count approaches 100+.
 func (r *InfraAllocationReconciler) mapServiceToNetworkPools(ctx context.Context, _ client.Object) []reconcile.Request {
 	poolList := &butlerv1alpha1.NetworkPoolList{}
 	if err := r.List(ctx, poolList); err != nil {
