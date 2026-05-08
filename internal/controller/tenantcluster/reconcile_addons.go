@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -406,8 +407,14 @@ func (r *Reconciler) reconcileAutoEnrollObservability(ctx context.Context, tc *b
 
 	enroll := obs.Collection.AutoEnroll
 
+	// Resolve provider type once for all builders that need cluster identification.
+	providerType, err := resolveProviderType(ctx, r.Client, tc)
+	if err != nil {
+		logger.Error(err, "failed to resolve provider type", "cluster", tc.Name)
+	}
+
 	if enroll.VectorAgent && obs.Pipeline.LogEndpoint != "" {
-		if err := r.ensureAutoEnrolledAddon(ctx, tc, "vector-agent", buildVectorAgentValues(obs.Pipeline)); err != nil {
+		if err := r.ensureAutoEnrolledAddon(ctx, tc, "vector-agent", buildVectorAgentValues(obs.Pipeline, tc, providerType)); err != nil {
 			logger.Error(err, "failed to auto-enroll vector-agent")
 		}
 	}
@@ -419,7 +426,7 @@ func (r *Reconciler) reconcileAutoEnrollObservability(ctx context.Context, tc *b
 	}
 
 	if enroll.OtelCollector && obs.Pipeline.TraceEndpoint != "" {
-		if err := r.ensureAutoEnrolledAddon(ctx, tc, "otel-collector", buildOtelCollectorValues(obs.Pipeline)); err != nil {
+		if err := r.ensureAutoEnrolledAddon(ctx, tc, "otel-collector", buildOtelCollectorValues(obs.Pipeline, tc, providerType)); err != nil {
 			logger.Error(err, "failed to auto-enroll otel-collector")
 		}
 	}
@@ -513,14 +520,29 @@ func rawOrEmpty(v *butlerv1alpha1.ExtensionValues) []byte {
 	return v.Raw
 }
 
-// buildVectorAgentValues configures the vector-agent sink to forward to the pipeline aggregator.
-func buildVectorAgentValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig) *butlerv1alpha1.ExtensionValues {
+// buildVectorAgentValues configures the vector-agent sink to forward to the
+// pipeline aggregator and injects cluster identification fields into the VRL
+// remap transform so log events carry source cluster metadata.
+//
+// Only transforms and sink URI are set here. The remaining sink fields (type,
+// inputs, encoding) come from the AddonDefinition default via recursive deep
+// merge in tenantaddon_controller.go. The default's sinks.aggregator.inputs
+// references ["enrich_metadata"], ensuring events flow through the transform
+// before reaching the sink.
+func buildVectorAgentValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig, tc *butlerv1alpha1.TenantCluster, providerType string) *butlerv1alpha1.ExtensionValues {
 	if pipeline == nil || pipeline.LogEndpoint == "" {
 		return nil
 	}
 
 	values := map[string]interface{}{
 		"customConfig": map[string]interface{}{
+			"transforms": map[string]interface{}{
+				"enrich_metadata": map[string]interface{}{
+					"type":   "remap",
+					"inputs": []string{"kubernetes_logs"},
+					"source": buildVectorRemapSource(tc, providerType),
+				},
+			},
 			"sinks": map[string]interface{}{
 				"aggregator": map[string]interface{}{
 					"uri": pipeline.LogEndpoint,
@@ -564,11 +586,15 @@ func buildPrometheusValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig,
 	return &butlerv1alpha1.ExtensionValues{Raw: raw}
 }
 
-// buildOtelCollectorValues configures the OTLP exporter to the pipeline trace endpoint.
-func buildOtelCollectorValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig) *butlerv1alpha1.ExtensionValues {
+// buildOtelCollectorValues configures the OTLP exporter to the pipeline trace
+// endpoint and injects cluster identification as OTLP resource attributes via
+// a resource processor.
+func buildOtelCollectorValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig, tc *butlerv1alpha1.TenantCluster, providerType string) *butlerv1alpha1.ExtensionValues {
 	if pipeline == nil || pipeline.TraceEndpoint == "" {
 		return nil
 	}
+
+	attrs := buildOtelResourceAttributes(tc, providerType)
 
 	values := map[string]interface{}{
 		"config": map[string]interface{}{
@@ -580,6 +606,20 @@ func buildOtelCollectorValues(pipeline *butlerv1alpha1.ObservabilityPipelineConf
 					},
 				},
 			},
+			"processors": map[string]interface{}{
+				"resource": map[string]interface{}{
+					"attributes": attrs,
+				},
+			},
+			"service": map[string]interface{}{
+				"pipelines": map[string]interface{}{
+					"traces": map[string]interface{}{
+						"receivers":  []string{"otlp"},
+						"processors": []string{"resource", "memory_limiter", "batch"},
+						"exporters":  []string{"otlp"},
+					},
+				},
+			},
 		},
 	}
 
@@ -588,4 +628,80 @@ func buildOtelCollectorValues(pipeline *butlerv1alpha1.ObservabilityPipelineConf
 		return nil
 	}
 	return &butlerv1alpha1.ExtensionValues{Raw: raw}
+}
+
+// buildOtelResourceAttributes produces the OTLP resource attribute upsert list
+// for cluster identification. Uses semconv keys where applicable.
+func buildOtelResourceAttributes(tc *butlerv1alpha1.TenantCluster, providerType string) []map[string]interface{} {
+	attrs := []map[string]interface{}{
+		{"key": "k8s.cluster.name", "value": tc.Name, "action": "upsert"},
+		{"key": "k8s.namespace.name", "value": tc.Namespace, "action": "upsert"},
+		{"key": "k8s.cluster.uid", "value": string(tc.UID), "action": "upsert"},
+	}
+	if env := tc.Labels[butlerv1alpha1.LabelEnvironment]; env != "" {
+		attrs = append(attrs, map[string]interface{}{
+			"key": "butler.environment", "value": env, "action": "upsert",
+		})
+	}
+	if providerType != "" {
+		attrs = append(attrs, map[string]interface{}{
+			"key": "butler.provider_type", "value": providerType, "action": "upsert",
+		})
+	}
+	if pc := tc.Labels[butlerv1alpha1.LabelProviderConfig]; pc != "" {
+		attrs = append(attrs, map[string]interface{}{
+			"key": "butler.provider_config", "value": pc, "action": "upsert",
+		})
+	}
+	return attrs
+}
+
+// resolveProviderType looks up the canonical provider type (e.g., "nutanix",
+// "harvester") from the TenantCluster's ProviderConfigRef. Returns "" if the
+// ref is nil or empty. Uses the controller-runtime cached client, so cost is
+// bounded by informer cache, not API server round-trips.
+//
+// Accepts client.Reader (not client.Client) to signal read-only intent and
+// simplify test setup with fake.NewClientBuilder.
+func resolveProviderType(ctx context.Context, c client.Reader, tc *butlerv1alpha1.TenantCluster) (string, error) {
+	if tc.Spec.ProviderConfigRef == nil || tc.Spec.ProviderConfigRef.Name == "" {
+		return "", nil
+	}
+
+	ns := tc.Spec.ProviderConfigRef.Namespace
+	if ns == "" {
+		ns = "butler-system"
+	}
+
+	pc := &butlerv1alpha1.ProviderConfig{}
+	if err := c.Get(ctx, client.ObjectKey{Name: tc.Spec.ProviderConfigRef.Name, Namespace: ns}, pc); err != nil {
+		return "", fmt.Errorf("get ProviderConfig %s/%s: %w", ns, tc.Spec.ProviderConfigRef.Name, err)
+	}
+	return string(pc.Spec.Provider), nil
+}
+
+// buildVectorRemapSource produces the VRL source for the Vector agent's
+// enrich_metadata transform. Required fields (host, service, namespace, cluster,
+// tenant_namespace, cluster_uid) are always emitted. Optional fields
+// (environment, provider_type, provider_config) are omitted when their source
+// value is empty, avoiding empty-string Loki labels.
+func buildVectorRemapSource(tc *butlerv1alpha1.TenantCluster, providerType string) string {
+	var b strings.Builder
+	b.WriteString(".host = .kubernetes.pod_node_name\n")
+	b.WriteString(".service = .kubernetes.pod_name\n")
+	b.WriteString(".namespace = .kubernetes.pod_namespace\n")
+	fmt.Fprintf(&b, ".cluster = %s\n", strconv.Quote(tc.Name))
+	fmt.Fprintf(&b, ".tenant_namespace = %s\n", strconv.Quote(tc.Namespace))
+	fmt.Fprintf(&b, ".cluster_uid = %s\n", strconv.Quote(string(tc.UID)))
+
+	if env := tc.Labels[butlerv1alpha1.LabelEnvironment]; env != "" {
+		fmt.Fprintf(&b, ".environment = %s\n", strconv.Quote(env))
+	}
+	if providerType != "" {
+		fmt.Fprintf(&b, ".provider_type = %s\n", strconv.Quote(providerType))
+	}
+	if pc := tc.Labels[butlerv1alpha1.LabelProviderConfig]; pc != "" {
+		fmt.Fprintf(&b, ".provider_config = %s\n", strconv.Quote(pc))
+	}
+	return b.String()
 }
