@@ -43,10 +43,18 @@ const (
 	// SourceMetalLB identifies IPs consumed by MetalLB LoadBalancer Services.
 	SourceMetalLB = "metallb"
 
-	// infraAllocationFieldManager is the SSA field manager identity for the
-	// infrastructure allocation reconciler. Distinct from the existing
-	// NetworkPool reconciler (plain Update, no field manager) and from the
-	// MetalLB pool manager ("butler-controller/ipam" in installer.go).
+	// infraAllocationFieldManager is the SSA field manager identity for
+	// NetworkPool.status.infrastructureAllocations.
+	//
+	// Multiple writers patch NetworkPool.status. Each uses a distinct field
+	// manager to prevent SSA conflicts:
+	//   butler-controller/infra-allocation: this reconciler, owns infrastructureAllocations
+	//   butler-controller/ipam (installer.go): MetalLB IPAddressPool on tenant clusters
+	//   (existing NetworkPool reconciler): plain Update for capacity fields and conditions
+	//
+	// If the existing NetworkPool reconciler is migrated to SSA, it must adopt
+	// a distinct field manager (e.g., butler-controller/networkpool-allocation).
+	// Sharing a field manager across writers causes silent conflict resolution.
 	infraAllocationFieldManager = "butler-controller/infra-allocation"
 )
 
