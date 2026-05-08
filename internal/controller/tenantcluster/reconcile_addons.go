@@ -426,7 +426,7 @@ func (r *Reconciler) reconcileAutoEnrollObservability(ctx context.Context, tc *b
 	}
 
 	if enroll.OtelCollector && obs.Pipeline.TraceEndpoint != "" {
-		if err := r.ensureAutoEnrolledAddon(ctx, tc, "otel-collector", buildOtelCollectorValues(obs.Pipeline)); err != nil {
+		if err := r.ensureAutoEnrolledAddon(ctx, tc, "otel-collector", buildOtelCollectorValues(obs.Pipeline, tc, providerType)); err != nil {
 			logger.Error(err, "failed to auto-enroll otel-collector")
 		}
 	}
@@ -580,11 +580,15 @@ func buildPrometheusValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig,
 	return &butlerv1alpha1.ExtensionValues{Raw: raw}
 }
 
-// buildOtelCollectorValues configures the OTLP exporter to the pipeline trace endpoint.
-func buildOtelCollectorValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig) *butlerv1alpha1.ExtensionValues {
+// buildOtelCollectorValues configures the OTLP exporter to the pipeline trace
+// endpoint and injects cluster identification as OTLP resource attributes via
+// a resource processor.
+func buildOtelCollectorValues(pipeline *butlerv1alpha1.ObservabilityPipelineConfig, tc *butlerv1alpha1.TenantCluster, providerType string) *butlerv1alpha1.ExtensionValues {
 	if pipeline == nil || pipeline.TraceEndpoint == "" {
 		return nil
 	}
+
+	attrs := buildOtelResourceAttributes(tc, providerType)
 
 	values := map[string]interface{}{
 		"config": map[string]interface{}{
@@ -596,6 +600,20 @@ func buildOtelCollectorValues(pipeline *butlerv1alpha1.ObservabilityPipelineConf
 					},
 				},
 			},
+			"processors": map[string]interface{}{
+				"resource": map[string]interface{}{
+					"attributes": attrs,
+				},
+			},
+			"service": map[string]interface{}{
+				"pipelines": map[string]interface{}{
+					"traces": map[string]interface{}{
+						"receivers":  []string{"otlp"},
+						"processors": []string{"resource", "memory_limiter", "batch"},
+						"exporters":  []string{"otlp"},
+					},
+				},
+			},
 		},
 	}
 
@@ -604,6 +622,32 @@ func buildOtelCollectorValues(pipeline *butlerv1alpha1.ObservabilityPipelineConf
 		return nil
 	}
 	return &butlerv1alpha1.ExtensionValues{Raw: raw}
+}
+
+// buildOtelResourceAttributes produces the OTLP resource attribute upsert list
+// for cluster identification. Uses semconv keys where applicable.
+func buildOtelResourceAttributes(tc *butlerv1alpha1.TenantCluster, providerType string) []map[string]interface{} {
+	attrs := []map[string]interface{}{
+		{"key": "k8s.cluster.name", "value": tc.Name, "action": "upsert"},
+		{"key": "k8s.namespace.name", "value": tc.Namespace, "action": "upsert"},
+		{"key": "k8s.cluster.uid", "value": string(tc.UID), "action": "upsert"},
+	}
+	if env := tc.Labels[butlerv1alpha1.LabelEnvironment]; env != "" {
+		attrs = append(attrs, map[string]interface{}{
+			"key": "butler.environment", "value": env, "action": "upsert",
+		})
+	}
+	if providerType != "" {
+		attrs = append(attrs, map[string]interface{}{
+			"key": "butler.provider_type", "value": providerType, "action": "upsert",
+		})
+	}
+	if pc := tc.Labels[butlerv1alpha1.LabelProviderConfig]; pc != "" {
+		attrs = append(attrs, map[string]interface{}{
+			"key": "butler.provider_config", "value": pc, "action": "upsert",
+		})
+	}
+	return attrs
 }
 
 // resolveProviderType looks up the canonical provider type (e.g., "nutanix",
