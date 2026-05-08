@@ -628,6 +628,17 @@ func TestReconcile_ClearsAllocationsWhenServiceRemoved(t *testing.T) {
 	}
 }
 
+// TestReconcile_ServiceIPChanged exercises the IP-move scenario: a
+// LoadBalancer Service changes its assigned IP from one reserved CIDR to a
+// different one. The mapper enqueues all NetworkPools (see
+// mapServiceToNetworkPools), and each pool's Reconcile recomputes desired
+// allocations from current Service state. The old IP entry drops and the
+// new IP entry appears.
+//
+// Reconcilers that watch secondary K8s resources with mutable identity
+// (Service IPs, claim refs, owner references, etc.) should test this
+// scenario explicitly. Create and Delete events alone are not sufficient
+// to exercise the comparison path on Update.
 func TestReconcile_ServiceIPChanged(t *testing.T) {
 	// Pool with two distinct reserved CIDRs.
 	pool := newPool("pool", "default", "10.0.0.0/16",
