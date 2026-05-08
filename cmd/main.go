@@ -210,6 +210,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Infrastructure allocation controller. Discovers reserved IP usage
+	// by management-cluster LB Services and writes to NetworkPool status.
+	if err = (&networkpool.InfraAllocationReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "InfraAllocation")
+		os.Exit(1)
+	}
+
 	// IPAllocation controller. Thin controller for lifecycle management
 	if err = (&ipallocation.Reconciler{
 		Client: mgr.GetClient(),
@@ -304,7 +314,7 @@ func main() {
 	}
 
 	setupLog.Info("starting manager",
-		"controllers", []string{"ButlerConfig", "Team", "TenantCluster", "TenantAddon", "ManagementAddon", "NetworkPool", "IPAllocation", "ImageSync", "ProviderConfig", "Workspace", "StewardSecret", "StewardStatus"})
+		"controllers", []string{"ButlerConfig", "Team", "TenantCluster", "TenantAddon", "ManagementAddon", "NetworkPool", "InfraAllocation", "IPAllocation", "ImageSync", "ProviderConfig", "Workspace", "StewardSecret", "StewardStatus"})
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
