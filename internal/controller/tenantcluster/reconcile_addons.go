@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -588,4 +589,51 @@ func buildOtelCollectorValues(pipeline *butlerv1alpha1.ObservabilityPipelineConf
 		return nil
 	}
 	return &butlerv1alpha1.ExtensionValues{Raw: raw}
+}
+
+// resolveProviderType looks up the canonical provider type (e.g., "nutanix",
+// "harvester") from the TenantCluster's ProviderConfigRef. Returns "" if the
+// ref is nil or empty. Uses the controller-runtime cached client, so cost is
+// bounded by informer cache, not API server round-trips.
+func resolveProviderType(ctx context.Context, c client.Reader, tc *butlerv1alpha1.TenantCluster) (string, error) {
+	if tc.Spec.ProviderConfigRef == nil || tc.Spec.ProviderConfigRef.Name == "" {
+		return "", nil
+	}
+
+	ns := tc.Spec.ProviderConfigRef.Namespace
+	if ns == "" {
+		ns = "butler-system"
+	}
+
+	pc := &butlerv1alpha1.ProviderConfig{}
+	if err := c.Get(ctx, client.ObjectKey{Name: tc.Spec.ProviderConfigRef.Name, Namespace: ns}, pc); err != nil {
+		return "", fmt.Errorf("get ProviderConfig %s/%s: %w", ns, tc.Spec.ProviderConfigRef.Name, err)
+	}
+	return string(pc.Spec.Provider), nil
+}
+
+// buildVectorRemapSource produces the VRL source for the Vector agent's
+// enrich_metadata transform. Required fields (host, service, namespace, cluster,
+// tenant_namespace, cluster_uid) are always emitted. Optional fields
+// (environment, provider_type, provider_config) are omitted when their source
+// value is empty, avoiding empty-string Loki labels.
+func buildVectorRemapSource(tc *butlerv1alpha1.TenantCluster, providerType string) string {
+	var b strings.Builder
+	b.WriteString(".host = .kubernetes.pod_node_name\n")
+	b.WriteString(".service = .kubernetes.pod_name\n")
+	b.WriteString(".namespace = .kubernetes.pod_namespace\n")
+	fmt.Fprintf(&b, ".cluster = %s\n", strconv.Quote(tc.Name))
+	fmt.Fprintf(&b, ".tenant_namespace = %s\n", strconv.Quote(tc.Namespace))
+	fmt.Fprintf(&b, ".cluster_uid = %s\n", strconv.Quote(string(tc.UID)))
+
+	if env := tc.Labels[butlerv1alpha1.LabelEnvironment]; env != "" {
+		fmt.Fprintf(&b, ".environment = %s\n", strconv.Quote(env))
+	}
+	if providerType != "" {
+		fmt.Fprintf(&b, ".provider_type = %s\n", strconv.Quote(providerType))
+	}
+	if pc := tc.Labels[butlerv1alpha1.LabelProviderConfig]; pc != "" {
+		fmt.Fprintf(&b, ".provider_config = %s\n", strconv.Quote(pc))
+	}
+	return b.String()
 }
