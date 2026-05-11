@@ -118,7 +118,7 @@ func (r *InfraAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	type infraEntry struct {
 		source     string
 		serviceRef *butlerv1alpha1.NamespacedObjectReference
-		nodeRef    *butlerv1alpha1.NamespacedObjectReference
+		nodeRef    *butlerv1alpha1.ClusterObjectReference
 	}
 	entries := make(map[string]*infraEntry)
 
@@ -177,9 +177,8 @@ func (r *InfraAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			if ipInTenantRanges(addr.Address, tenantRanges) {
 				continue
 			}
-			nodeRef := &butlerv1alpha1.NamespacedObjectReference{
-				Name:      node.Name,
-				Namespace: "", // Nodes are cluster-scoped
+			nodeRef := &butlerv1alpha1.ClusterObjectReference{
+				Name: node.Name,
 			}
 			if existing, ok := entries[addr.Address]; ok {
 				// IP already claimed by a Service: enrich with NodeRef.
