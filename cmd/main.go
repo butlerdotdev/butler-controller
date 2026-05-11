@@ -43,6 +43,7 @@ import (
 	"github.com/butlerdotdev/butler-controller/internal/controller/stewardsecret"
 	"github.com/butlerdotdev/butler-controller/internal/controller/stewardstatus"
 	"github.com/butlerdotdev/butler-controller/internal/controller/team"
+	usercontroller "github.com/butlerdotdev/butler-controller/internal/controller/user"
 	"github.com/butlerdotdev/butler-controller/internal/controller/tenantaddon"
 	"github.com/butlerdotdev/butler-controller/internal/controller/tenantcluster"
 	"github.com/butlerdotdev/butler-controller/internal/controller/workspace"
@@ -158,6 +159,17 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Team")
+		os.Exit(1)
+	}
+
+	// User-Teams controller. Resolves team membership from User and Team CRDs
+	if err = (&usercontroller.Reconciler{
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Recorder:                mgr.GetEventRecorderFor("user-teams-controller"),
+		MaxConcurrentReconciles: 5,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "UserTeams")
 		os.Exit(1)
 	}
 
@@ -314,7 +326,7 @@ func main() {
 	}
 
 	setupLog.Info("starting manager",
-		"controllers", []string{"ButlerConfig", "Team", "TenantCluster", "TenantAddon", "ManagementAddon", "NetworkPool", "InfraAllocation", "IPAllocation", "ImageSync", "ProviderConfig", "Workspace", "StewardSecret", "StewardStatus"})
+		"controllers", []string{"ButlerConfig", "Team", "UserTeams", "TenantCluster", "TenantAddon", "ManagementAddon", "NetworkPool", "InfraAllocation", "IPAllocation", "ImageSync", "ProviderConfig", "Workspace", "StewardSecret", "StewardStatus"})
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
