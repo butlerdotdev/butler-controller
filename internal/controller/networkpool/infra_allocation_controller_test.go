@@ -514,14 +514,14 @@ func TestReconcile_IPOutsideReservedRange(t *testing.T) {
 func TestReconcile_MultipleRangesAndServices(t *testing.T) {
 	pool := newPool("pool", "default", "10.0.0.0/16",
 		[]butlerv1alpha1.ReservedRange{
-			{CIDR: "10.0.0.0/28"},   // .0-.15
-			{CIDR: "10.0.1.0/28"},   // .0-.15 in second octet
+			{CIDR: "10.0.0.0/28"}, // .0-.15
+			{CIDR: "10.0.1.0/28"}, // .0-.15 in second octet
 		})
 
 	svcs := []*corev1.Service{
-		newLBService("svc-a", "ns1", "10.0.0.5"),   // in first range
-		newLBService("svc-b", "ns2", "10.0.1.10"),  // in second range
-		newLBService("svc-c", "ns3", "10.0.2.1"),   // outside both ranges
+		newLBService("svc-a", "ns1", "10.0.0.5"),  // in first range
+		newLBService("svc-b", "ns2", "10.0.1.10"), // in second range
+		newLBService("svc-c", "ns3", "10.0.2.1"),  // outside both ranges
 	}
 
 	_, capture := reconcileWith(t, pool, svcs...)

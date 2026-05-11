@@ -43,7 +43,7 @@ type talosconfigContext struct {
 // talosconfigFile represents the top-level talosconfig structure.
 type talosconfigFile struct {
 	Context  string                        `yaml:"context"`
-	Contexts map[string]talosconfigContext  `yaml:"contexts"`
+	Contexts map[string]talosconfigContext `yaml:"contexts"`
 }
 
 // GenerateTalosconfig generates a talosconfig YAML for CLI access to worker nodes.

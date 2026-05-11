@@ -1771,9 +1771,9 @@ func TestComputeUnmanagedRanges(t *testing.T) {
 		// Reproduces the real crop mgmt pool layout: 10.92.90.0/23
 		cidr := "10.92.90.0/23"
 		reserved := []string{
-			"10.92.90.7/32",  // .7
-			"10.92.90.8/29",  // .8-.15
-			"10.92.90.16/28", // .16-.31
+			"10.92.90.7/32",   // .7
+			"10.92.90.8/29",   // .8-.15
+			"10.92.90.16/28",  // .16-.31
 			"10.92.91.192/26", // .192-.255
 		}
 		tenantRanges := []AllocatedRange{

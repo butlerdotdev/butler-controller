@@ -25,8 +25,8 @@ import (
 	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
-	authzv1 "k8s.io/api/authorization/v1"
 	authnv1 "k8s.io/api/authentication/v1"
+	authzv1 "k8s.io/api/authorization/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"

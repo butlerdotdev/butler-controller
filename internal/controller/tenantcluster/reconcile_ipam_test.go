@@ -22,10 +22,10 @@ import (
 
 func TestCountLBIPs(t *testing.T) {
 	tests := []struct {
-		name             string
-		services         []corev1.Service
-		wantPlatform     int32
-		wantTenant       int32
+		name         string
+		services     []corev1.Service
+		wantPlatform int32
+		wantTenant   int32
 	}{
 		{
 			name:         "no services",
@@ -704,8 +704,8 @@ func TestDemandDrivenGrowthTrigger(t *testing.T) {
 		wantGrowthAlloc bool
 	}{
 		{
-			name:            "no pending services: no growth even with zero available IPs",
-			services:        []corev1.Service{
+			name: "no pending services: no growth even with zero available IPs",
+			services: []corev1.Service{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "traefik", Namespace: "traefik",
@@ -1168,11 +1168,11 @@ func TestDemandDrivenShrink(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "team-a-test-lb-1", Namespace: "butler-system",
 					CreationTimestamp: oldTime,
-					Labels:           map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+					Labels:            map[string]string{LabelAllocationRole: AllocationRoleGrowth},
 				},
 				Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
 				Status: butlerv1alpha1.IPAllocationStatus{
-					Phase: butlerv1alpha1.IPAllocationPhaseAllocated,
+					Phase:        butlerv1alpha1.IPAllocationPhaseAllocated,
 					StartAddress: "10.0.0.5", EndAddress: "10.0.0.5",
 				},
 			},
@@ -1185,11 +1185,11 @@ func TestDemandDrivenShrink(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "team-a-test-lb-1", Namespace: "butler-system",
 					CreationTimestamp: youngTime,
-					Labels:           map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+					Labels:            map[string]string{LabelAllocationRole: AllocationRoleGrowth},
 				},
 				Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
 				Status: butlerv1alpha1.IPAllocationStatus{
-					Phase: butlerv1alpha1.IPAllocationPhaseAllocated,
+					Phase:        butlerv1alpha1.IPAllocationPhaseAllocated,
 					StartAddress: "10.0.0.5", EndAddress: "10.0.0.5",
 				},
 			},
@@ -1202,11 +1202,11 @@ func TestDemandDrivenShrink(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "team-a-test-lb-1", Namespace: "butler-system",
 					CreationTimestamp: oldTime,
-					Labels:           map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+					Labels:            map[string]string{LabelAllocationRole: AllocationRoleGrowth},
 				},
 				Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
 				Status: butlerv1alpha1.IPAllocationStatus{
-					Phase: butlerv1alpha1.IPAllocationPhaseAllocated,
+					Phase:        butlerv1alpha1.IPAllocationPhaseAllocated,
 					StartAddress: "10.0.0.5", EndAddress: "10.0.0.5",
 				},
 			},
@@ -1219,11 +1219,11 @@ func TestDemandDrivenShrink(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "team-a-test-lb", Namespace: "butler-system",
 					CreationTimestamp: oldTime,
-					Labels:           map[string]string{LabelAllocationRole: AllocationRoleInitial},
+					Labels:            map[string]string{LabelAllocationRole: AllocationRoleInitial},
 				},
 				Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
 				Status: butlerv1alpha1.IPAllocationStatus{
-					Phase: butlerv1alpha1.IPAllocationPhaseAllocated,
+					Phase:        butlerv1alpha1.IPAllocationPhaseAllocated,
 					StartAddress: "10.0.0.1", EndAddress: "10.0.0.1",
 				},
 			},
@@ -1236,7 +1236,7 @@ func TestDemandDrivenShrink(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "team-a-test-lb-1", Namespace: "butler-system",
 					CreationTimestamp: oldTime,
-					Labels:           map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+					Labels:            map[string]string{LabelAllocationRole: AllocationRoleGrowth},
 				},
 				Spec:   butlerv1alpha1.IPAllocationSpec{Count: &count},
 				Status: butlerv1alpha1.IPAllocationStatus{Phase: butlerv1alpha1.IPAllocationPhasePending},
@@ -1250,7 +1250,7 @@ func TestDemandDrivenShrink(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "team-a-test-lb-1", Namespace: "butler-system",
 					CreationTimestamp: oldTime,
-					Labels:           map[string]string{LabelAllocationRole: AllocationRoleGrowth},
+					Labels:            map[string]string{LabelAllocationRole: AllocationRoleGrowth},
 				},
 				Spec: butlerv1alpha1.IPAllocationSpec{
 					Count: &count,
@@ -1260,7 +1260,7 @@ func TestDemandDrivenShrink(t *testing.T) {
 					},
 				},
 				Status: butlerv1alpha1.IPAllocationStatus{
-					Phase: butlerv1alpha1.IPAllocationPhaseAllocated,
+					Phase:        butlerv1alpha1.IPAllocationPhaseAllocated,
 					StartAddress: "10.0.0.5", EndAddress: "10.0.0.5",
 				},
 			},
@@ -1782,7 +1782,7 @@ func TestShrinkFiltersMixedAllocations(t *testing.T) {
 		},
 		Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
 		Status: butlerv1alpha1.IPAllocationStatus{
-			Phase: butlerv1alpha1.IPAllocationPhaseAllocated,
+			Phase:        butlerv1alpha1.IPAllocationPhaseAllocated,
 			StartAddress: "10.0.0.1", EndAddress: "10.0.0.1",
 		},
 	}
@@ -1794,7 +1794,7 @@ func TestShrinkFiltersMixedAllocations(t *testing.T) {
 		},
 		Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
 		Status: butlerv1alpha1.IPAllocationStatus{
-			Phase: butlerv1alpha1.IPAllocationPhaseAllocated,
+			Phase:        butlerv1alpha1.IPAllocationPhaseAllocated,
 			StartAddress: "10.0.0.3", EndAddress: "10.0.0.3",
 		},
 	}
@@ -1815,7 +1815,7 @@ func TestShrinkFiltersMixedAllocations(t *testing.T) {
 		},
 		Spec: butlerv1alpha1.IPAllocationSpec{Count: &count},
 		Status: butlerv1alpha1.IPAllocationStatus{
-			Phase: butlerv1alpha1.IPAllocationPhaseAllocated,
+			Phase:        butlerv1alpha1.IPAllocationPhaseAllocated,
 			StartAddress: "10.0.0.5", EndAddress: "10.0.0.5",
 		},
 	}
@@ -2216,11 +2216,11 @@ func TestInFlightGrowthDeduction(t *testing.T) {
 	int32Ptr := func(v int32) *int32 { return &v }
 
 	tests := []struct {
-		name           string
+		name            string
 		pendingServices []LBServiceSummary
-		allocs         []butlerv1alpha1.IPAllocation
-		serviceIPs     map[string]bool
-		wantNetPending int32
+		allocs          []butlerv1alpha1.IPAllocation
+		serviceIPs      map[string]bool
+		wantNetPending  int32
 	}{
 		{
 			name: "no in-flight allocations: growth fires normally",
