@@ -26,7 +26,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -46,6 +48,9 @@ const (
 
 	// SourceNode identifies IPs used as Node InternalIPs within the pool CIDR.
 	SourceNode = "node"
+
+	// SourceMachine identifies IPs used by CAPI Machine VMs within the pool CIDR.
+	SourceMachine = "machine"
 
 	// infraAllocationFieldManager is the SSA field manager identity for
 	// NetworkPool.status.infrastructureAllocations.
@@ -71,6 +76,7 @@ type InfraAllocationReconciler struct {
 
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines,verbs=get;list;watch
 
 func (r *InfraAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -114,11 +120,12 @@ func (r *InfraAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	// Build a map keyed by IP for merging Service and Node facts.
+	// Build a map keyed by IP for merging Service, Node, and Machine facts.
 	type infraEntry struct {
 		source     string
 		serviceRef *butlerv1alpha1.NamespacedObjectReference
 		nodeRef    *butlerv1alpha1.ClusterObjectReference
+		machineRef *butlerv1alpha1.NamespacedObjectReference
 	}
 	entries := make(map[string]*infraEntry)
 
@@ -192,6 +199,48 @@ func (r *InfraAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
+	// Discover CAPI Machine IPs within the pool CIDR (outside tenant ranges).
+	// Machines represent tenant cluster VMs whose IPs are assigned by the
+	// infrastructure provider (e.g., Nutanix DHCP) rather than by Butler.
+	machineList := &unstructured.UnstructuredList{}
+	machineList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "cluster.x-k8s.io",
+		Version: "v1beta1",
+		Kind:    "MachineList",
+	})
+	if err := r.List(ctx, machineList); err != nil {
+		logger.V(1).Info("unable to list CAPI Machines, skipping machine tracking", "error", err)
+	} else {
+		for i := range machineList.Items {
+			m := &machineList.Items[i]
+			for _, ipStr := range extractMachineIPs(m) {
+				ip := net.ParseIP(ipStr)
+				if ip == nil {
+					continue
+				}
+				if !poolNet.Contains(ip) {
+					continue
+				}
+				if ipInTenantRanges(ipStr, tenantRanges) {
+					continue
+				}
+				machineRef := &butlerv1alpha1.NamespacedObjectReference{
+					Name:      m.GetName(),
+					Namespace: m.GetNamespace(),
+				}
+				if existing, ok := entries[ipStr]; ok {
+					// IP already claimed by a Node or Service: enrich with MachineRef.
+					existing.machineRef = machineRef
+				} else {
+					entries[ipStr] = &infraEntry{
+						source:     SourceMachine,
+						machineRef: machineRef,
+					}
+				}
+			}
+		}
+	}
+
 	// Convert map to sorted slice.
 	var desired []butlerv1alpha1.InfrastructureAllocation
 	for ip, entry := range entries {
@@ -200,6 +249,7 @@ func (r *InfraAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			Source:     entry.source,
 			ServiceRef: entry.serviceRef,
 			NodeRef:    entry.nodeRef,
+			MachineRef: entry.machineRef,
 		})
 	}
 	sort.Slice(desired, func(i, j int) bool {
@@ -275,8 +325,18 @@ func (r *InfraAllocationReconciler) patchInfraAllocations(
 	return ctrl.Result{}, nil
 }
 
+// machineGVK is the GroupVersionKind for CAPI Machine resources.
+var machineGVK = schema.GroupVersionKind{
+	Group:   "cluster.x-k8s.io",
+	Version: "v1beta1",
+	Kind:    "Machine",
+}
+
 // SetupWithManager registers the controller with the manager.
 func (r *InfraAllocationReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	machine := &unstructured.Unstructured{}
+	machine.SetGroupVersionKind(machineGVK)
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&butlerv1alpha1.NetworkPool{}).
 		Watches(&corev1.Service{},
@@ -286,6 +346,10 @@ func (r *InfraAllocationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Node{},
 			handler.EnqueueRequestsFromMapFunc(r.mapNodeToNetworkPools),
 			builder.WithPredicates(nodeIPChangedPredicate{}),
+		).
+		Watches(machine,
+			handler.EnqueueRequestsFromMapFunc(r.mapMachineToNetworkPools),
+			builder.WithPredicates(machineIPChangedPredicate{}),
 		).
 		Named("infra-allocation").
 		Complete(r)
@@ -465,6 +529,86 @@ func extractNodeIPs(node *corev1.Node) []string {
 	for _, addr := range node.Status.Addresses {
 		if addr.Type == corev1.NodeInternalIP && addr.Address != "" {
 			ips = append(ips, addr.Address)
+		}
+	}
+	sort.Strings(ips)
+	return ips
+}
+
+// mapMachineToNetworkPools enqueues every NetworkPool when a CAPI Machine's
+// IP changes. Same fan-out strategy as mapServiceToNetworkPools.
+func (r *InfraAllocationReconciler) mapMachineToNetworkPools(ctx context.Context, _ client.Object) []reconcile.Request {
+	poolList := &butlerv1alpha1.NetworkPoolList{}
+	if err := r.List(ctx, poolList); err != nil {
+		log.FromContext(ctx).Error(err, "failed to list NetworkPools for Machine mapper")
+		return nil
+	}
+
+	requests := make([]reconcile.Request, len(poolList.Items))
+	for i, pool := range poolList.Items {
+		requests[i] = reconcile.Request{
+			NamespacedName: client.ObjectKey{
+				Name:      pool.Name,
+				Namespace: pool.Namespace,
+			},
+		}
+	}
+	return requests
+}
+
+// machineIPChangedPredicate filters CAPI Machine events to only those where
+// the InternalIP address set changed. Works with unstructured objects.
+type machineIPChangedPredicate struct {
+	predicate.Funcs
+}
+
+func (machineIPChangedPredicate) Create(e event.CreateEvent) bool {
+	return len(extractMachineIPs(e.Object)) > 0
+}
+
+func (machineIPChangedPredicate) Update(e event.UpdateEvent) bool {
+	return !stringSlicesEqual(extractMachineIPs(e.ObjectOld), extractMachineIPs(e.ObjectNew))
+}
+
+func (machineIPChangedPredicate) Delete(e event.DeleteEvent) bool {
+	return len(extractMachineIPs(e.Object)) > 0
+}
+
+// stringSlicesEqual returns true if both slices have the same elements.
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// extractMachineIPs returns the sorted list of InternalIP addresses from a
+// CAPI Machine resource. The Machine's status.addresses follows the same
+// schema as Node status.addresses: [{type, address}, ...].
+func extractMachineIPs(obj client.Object) []string {
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return nil
+	}
+	addrs, found, err := unstructured.NestedSlice(u.Object, "status", "addresses")
+	if err != nil || !found {
+		return nil
+	}
+	var ips []string
+	for _, a := range addrs {
+		addrMap, ok := a.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		addrType, _ := addrMap["type"].(string)
+		address, _ := addrMap["address"].(string)
+		if addrType == "InternalIP" && address != "" {
+			ips = append(ips, address)
 		}
 	}
 	sort.Strings(ips)
