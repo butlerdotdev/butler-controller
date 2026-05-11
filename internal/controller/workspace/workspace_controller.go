@@ -915,9 +915,9 @@ func (r *Reconciler) ensurePVC(ctx context.Context, tenantClient kubernetes.Inte
 			Name:      pvcName,
 			Namespace: workspacesNamespace,
 			Labels: map[string]string{
-				butlerv1alpha1.LabelManagedBy:          "butler",
-				butlerv1alpha1.LabelWorkspaceOwner:     sanitizeLabel(ws.Spec.Owner),
-				"butler.butlerlabs.dev/workspace":      ws.Name,
+				butlerv1alpha1.LabelManagedBy:      "butler",
+				butlerv1alpha1.LabelWorkspaceOwner: sanitizeLabel(ws.Spec.Owner),
+				"butler.butlerlabs.dev/workspace":  ws.Name,
 			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
@@ -954,7 +954,7 @@ func (r *Reconciler) ensureWorkspaceStorageClass(ctx context.Context, tenantClie
 		Provisioner:   "driver.longhorn.io",
 		ReclaimPolicy: &reclaimPolicy,
 		Parameters: map[string]string{
-			"numberOfReplicas": "1",
+			"numberOfReplicas":    "1",
 			"staleReplicaTimeout": "30",
 		},
 		AllowVolumeExpansion: boolPtr(true),
@@ -1140,17 +1140,17 @@ func (r *Reconciler) ensurePod(ctx context.Context, tenantClient kubernetes.Inte
 			Name:      podName,
 			Namespace: workspacesNamespace,
 			Labels: map[string]string{
-				butlerv1alpha1.LabelManagedBy:          "butler",
-				butlerv1alpha1.LabelWorkspaceOwner:     sanitizeLabel(ws.Spec.Owner),
-				"butler.butlerlabs.dev/workspace":      ws.Name,
+				butlerv1alpha1.LabelManagedBy:      "butler",
+				butlerv1alpha1.LabelWorkspaceOwner: sanitizeLabel(ws.Spec.Owner),
+				"butler.butlerlabs.dev/workspace":  ws.Name,
 			},
 		},
 		Spec: corev1.PodSpec{
 			InitContainers: initContainers,
 			Containers: []corev1.Container{
 				{
-					Name:  "workspace",
-					Image: ws.Spec.Image,
+					Name:    "workspace",
+					Image:   ws.Spec.Image,
 					Command: []string{"/bin/sh", "-c"},
 					Args:    []string{buildEntrypointScript(ws)},
 					Ports: []corev1.ContainerPort{

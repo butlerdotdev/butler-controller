@@ -514,14 +514,14 @@ func TestReconcile_IPOutsideReservedRange(t *testing.T) {
 func TestReconcile_MultipleRangesAndServices(t *testing.T) {
 	pool := newPool("pool", "default", "10.0.0.0/16",
 		[]butlerv1alpha1.ReservedRange{
-			{CIDR: "10.0.0.0/28"},   // .0-.15
-			{CIDR: "10.0.1.0/28"},   // .0-.15 in second octet
+			{CIDR: "10.0.0.0/28"}, // .0-.15
+			{CIDR: "10.0.1.0/28"}, // .0-.15 in second octet
 		})
 
 	svcs := []*corev1.Service{
-		newLBService("svc-a", "ns1", "10.0.0.5"),   // in first range
-		newLBService("svc-b", "ns2", "10.0.1.10"),  // in second range
-		newLBService("svc-c", "ns3", "10.0.2.1"),   // outside both ranges
+		newLBService("svc-a", "ns1", "10.0.0.5"),  // in first range
+		newLBService("svc-b", "ns2", "10.0.1.10"), // in second range
+		newLBService("svc-c", "ns3", "10.0.2.1"),  // outside both ranges
 	}
 
 	_, capture := reconcileWith(t, pool, svcs...)
@@ -726,5 +726,325 @@ func TestReconcile_ServiceIPChanged(t *testing.T) {
 func TestReconcile_SourceConstant(t *testing.T) {
 	if SourceMetalLB != "metallb" {
 		t.Errorf("SourceMetalLB = %q, want %q", SourceMetalLB, "metallb")
+	}
+	if SourceNode != "node" {
+		t.Errorf("SourceNode = %q, want %q", SourceNode, "node")
+	}
+}
+
+// ── Node helpers ──
+
+func newNode(name, ip string) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Status: corev1.NodeStatus{
+			Addresses: []corev1.NodeAddress{
+				{Type: corev1.NodeInternalIP, Address: ip},
+			},
+		},
+	}
+}
+
+func newPoolWithTenant(name, ns, cidr string, reserved []butlerv1alpha1.ReservedRange, tenantRanges []butlerv1alpha1.AllocationRange) *butlerv1alpha1.NetworkPool {
+	pool := newPool(name, ns, cidr, reserved)
+	if len(tenantRanges) > 0 {
+		pool.Spec.TenantAllocation = &butlerv1alpha1.TenantAllocationConfig{
+			Ranges: tenantRanges,
+		}
+	}
+	return pool
+}
+
+// reconcileWithNodes is like reconcileWith but also accepts Nodes.
+func reconcileWithNodes(t *testing.T, pool *butlerv1alpha1.NetworkPool, services []*corev1.Service, nodes []*corev1.Node) (ctrl.Result, patchCapture) {
+	t.Helper()
+	s := testScheme()
+	objs := []client.Object{pool}
+	for _, svc := range services {
+		objs = append(objs, svc)
+	}
+	for _, node := range nodes {
+		objs = append(objs, node)
+	}
+	fc := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(objs...).
+		WithStatusSubresource(&butlerv1alpha1.NetworkPool{}).
+		Build()
+
+	var capture patchCapture
+	cl := interceptor.NewClient(fc, interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, subResource string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			capture.called = true
+			if p, ok := obj.(*butlerv1alpha1.NetworkPool); ok {
+				capture.pool = p.DeepCopy()
+			}
+			return nil
+		},
+	})
+
+	r := &InfraAllocationReconciler{Client: cl, Scheme: s}
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace},
+	})
+	if err != nil {
+		t.Fatalf("reconcile error: %v", err)
+	}
+	return result, capture
+}
+
+// ── Node tracking tests ──
+
+func TestReconcile_NodeInPoolCIDR(t *testing.T) {
+	pool := newPoolWithTenant("test-pool", "butler-system", "10.0.0.0/24",
+		[]butlerv1alpha1.ReservedRange{
+			{CIDR: "10.0.0.1/32"},
+		},
+		[]butlerv1alpha1.AllocationRange{
+			{Start: "10.0.0.32", End: "10.0.0.63"},
+		},
+	)
+	nodes := []*corev1.Node{
+		newNode("worker-01", "10.0.0.80"),
+		newNode("worker-02", "10.0.0.81"),
+	}
+
+	_, capture := reconcileWithNodes(t, pool, nil, nodes)
+	if !capture.called {
+		t.Fatal("expected patch to be called")
+	}
+	allocs := capture.pool.Status.InfrastructureAllocations
+	if len(allocs) != 2 {
+		t.Fatalf("expected 2 allocations, got %d", len(allocs))
+	}
+	for _, a := range allocs {
+		if a.Source != SourceNode {
+			t.Errorf("expected source %q, got %q", SourceNode, a.Source)
+		}
+		if a.NodeRef == nil {
+			t.Errorf("expected nodeRef for IP %s", a.IP)
+		}
+	}
+	if capture.pool.Status.InfrastructureConsumedIPs != 2 {
+		t.Errorf("InfrastructureConsumedIPs = %d, want 2", capture.pool.Status.InfrastructureConsumedIPs)
+	}
+}
+
+func TestReconcile_NodeInTenantRange_Excluded(t *testing.T) {
+	pool := newPoolWithTenant("test-pool", "butler-system", "10.0.0.0/24",
+		[]butlerv1alpha1.ReservedRange{
+			{CIDR: "10.0.0.1/32"},
+		},
+		[]butlerv1alpha1.AllocationRange{
+			{Start: "10.0.0.32", End: "10.0.0.63"},
+		},
+	)
+	// Node IP falls within tenant range -- should be excluded
+	nodes := []*corev1.Node{
+		newNode("tenant-node", "10.0.0.40"),
+	}
+
+	_, capture := reconcileWithNodes(t, pool, nil, nodes)
+	if capture.called {
+		t.Fatal("expected no patch (node IP in tenant range should be excluded)")
+	}
+}
+
+func TestReconcile_NodeAndServiceOverlap(t *testing.T) {
+	pool := newPoolWithTenant("test-pool", "butler-system", "10.0.0.0/24",
+		[]butlerv1alpha1.ReservedRange{
+			{CIDR: "10.0.0.1/32"},
+		},
+		[]butlerv1alpha1.AllocationRange{
+			{Start: "10.0.0.32", End: "10.0.0.63"},
+		},
+	)
+	// Both a Service and a Node claim 10.0.0.1
+	services := []*corev1.Service{
+		newLBService("traefik", "traefik", "10.0.0.1"),
+	}
+	nodes := []*corev1.Node{
+		newNode("cp-01", "10.0.0.1"),
+	}
+
+	_, capture := reconcileWithNodes(t, pool, services, nodes)
+	if !capture.called {
+		t.Fatal("expected patch to be called")
+	}
+	allocs := capture.pool.Status.InfrastructureAllocations
+	if len(allocs) != 1 {
+		t.Fatalf("expected 1 allocation (merged), got %d", len(allocs))
+	}
+	a := allocs[0]
+	if a.IP != "10.0.0.1" {
+		t.Errorf("IP = %q, want 10.0.0.1", a.IP)
+	}
+	if a.Source != SourceMetalLB {
+		t.Errorf("Source = %q, want %q (Service takes precedence)", a.Source, SourceMetalLB)
+	}
+	if a.ServiceRef == nil || a.ServiceRef.Name != "traefik" {
+		t.Errorf("expected ServiceRef to reference traefik")
+	}
+	if a.NodeRef == nil || a.NodeRef.Name != "cp-01" {
+		t.Errorf("expected NodeRef to reference cp-01")
+	}
+}
+
+func TestReconcile_NodeOutsidePoolCIDR_Excluded(t *testing.T) {
+	pool := newPoolWithTenant("test-pool", "butler-system", "10.0.0.0/24",
+		[]butlerv1alpha1.ReservedRange{
+			{CIDR: "10.0.0.1/32"},
+		},
+		nil,
+	)
+	// Node IP not in pool CIDR at all
+	nodes := []*corev1.Node{
+		newNode("other-node", "192.168.1.100"),
+	}
+
+	_, capture := reconcileWithNodes(t, pool, nil, nodes)
+	if capture.called {
+		t.Fatal("expected no patch (node IP outside pool CIDR)")
+	}
+}
+
+// ── Node predicate tests ──
+
+func TestNodeIPChangedPredicate_Create(t *testing.T) {
+	pred := nodeIPChangedPredicate{}
+	tests := []struct {
+		name string
+		node *corev1.Node
+		want bool
+	}{
+		{
+			name: "node with IP",
+			node: newNode("n", "10.0.0.1"),
+			want: true,
+		},
+		{
+			name: "node without addresses",
+			node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n"}},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := pred.Create(event.CreateEvent{Object: tt.node})
+			if got != tt.want {
+				t.Errorf("Create() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNodeIPChangedPredicate_Update(t *testing.T) {
+	pred := nodeIPChangedPredicate{}
+	tests := []struct {
+		name string
+		old  *corev1.Node
+		new  *corev1.Node
+		want bool
+	}{
+		{
+			name: "IP unchanged",
+			old:  newNode("n", "10.0.0.1"),
+			new:  newNode("n", "10.0.0.1"),
+			want: false,
+		},
+		{
+			name: "IP changed",
+			old:  newNode("n", "10.0.0.1"),
+			new:  newNode("n", "10.0.0.2"),
+			want: true,
+		},
+		{
+			name: "IP added",
+			old:  &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n"}},
+			new:  newNode("n", "10.0.0.1"),
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := pred.Update(event.UpdateEvent{ObjectOld: tt.old, ObjectNew: tt.new})
+			if got != tt.want {
+				t.Errorf("Update() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNodeIPChangedPredicate_Delete(t *testing.T) {
+	pred := nodeIPChangedPredicate{}
+	tests := []struct {
+		name string
+		node *corev1.Node
+		want bool
+	}{
+		{
+			name: "node with IP",
+			node: newNode("n", "10.0.0.1"),
+			want: true,
+		},
+		{
+			name: "node without IP",
+			node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n"}},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := pred.Delete(event.DeleteEvent{Object: tt.node})
+			if got != tt.want {
+				t.Errorf("Delete() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractNodeIPs(t *testing.T) {
+	tests := []struct {
+		name string
+		node *corev1.Node
+		want []string
+	}{
+		{
+			name: "single IP",
+			node: newNode("n", "10.0.0.1"),
+			want: []string{"10.0.0.1"},
+		},
+		{
+			name: "no addresses",
+			node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n"}},
+			want: nil,
+		},
+		{
+			name: "multiple address types",
+			node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "n"},
+				Status: corev1.NodeStatus{
+					Addresses: []corev1.NodeAddress{
+						{Type: corev1.NodeInternalIP, Address: "10.0.0.1"},
+						{Type: corev1.NodeExternalIP, Address: "1.2.3.4"},
+						{Type: corev1.NodeHostName, Address: "node-1"},
+					},
+				},
+			},
+			want: []string{"10.0.0.1"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractNodeIPs(tt.node)
+			if len(got) != len(tt.want) {
+				t.Fatalf("len = %d, want %d", len(got), len(tt.want))
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("IP[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
 	}
 }

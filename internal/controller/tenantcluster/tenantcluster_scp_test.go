@@ -50,7 +50,7 @@ func quantityPtr(s string) *resource.Quantity {
 }
 
 func TestCpComponentDrifted(t *testing.T) {
-		tests := []struct {
+	tests := []struct {
 		name      string
 		scpCPU    string
 		scpMemory string
@@ -132,18 +132,18 @@ func TestCpComponentDrifted(t *testing.T) {
 
 func TestReconcileStewardControlPlane_PatchContent(t *testing.T) {
 	tests := []struct {
-		name           string
-		tcVersion      string
-		tcReplicas     int32
-		tcResources    *butlerv1alpha1.ControlPlaneResourcesSpec
-		scpVersion     string
-		scpReplicas    int64
-		scpCPU         string
-		scpMem         string
-		wantNoPatch    bool
-		wantVersion    string
-		wantReplicas   *int64
-		wantAPIServer  bool
+		name          string
+		tcVersion     string
+		tcReplicas    int32
+		tcResources   *butlerv1alpha1.ControlPlaneResourcesSpec
+		scpVersion    string
+		scpReplicas   int64
+		scpCPU        string
+		scpMem        string
+		wantNoPatch   bool
+		wantVersion   string
+		wantReplicas  *int64
+		wantAPIServer bool
 	}{
 		{
 			name:        "no drift produces no patch",

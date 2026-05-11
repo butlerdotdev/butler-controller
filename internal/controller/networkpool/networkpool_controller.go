@@ -439,6 +439,41 @@ func (r *Reconciler) updatePoolStatus(ctx context.Context, pool *butlerv1alpha1.
 	pool.Status.LargestFreeBlock = fragInfo.LargestFreeBlock
 	pool.Status.ObservedGeneration = pool.Generation
 
+	// Compute pool-wide capacity fields.
+	poolSizeIPs, err := ipam.ComputePoolSizeIPs(pool.Spec.CIDR)
+	if err == nil {
+		pool.Status.PoolSizeIPs = poolSizeIPs
+	}
+
+	var reservedCIDRs []string
+	for _, r := range pool.Spec.Reserved {
+		reservedCIDRs = append(reservedCIDRs, r.CIDR)
+	}
+	reservedIPs, err := ipam.ComputeReservedIPs(reservedCIDRs)
+	if err == nil {
+		pool.Status.ReservedIPs = reservedIPs
+	}
+
+	var tenantRanges []ipam.AllocatedRange
+	if pool.Spec.TenantAllocation != nil {
+		for _, r := range pool.Spec.TenantAllocation.GetEffectiveRanges() {
+			tenantRanges = append(tenantRanges, ipam.AllocatedRange{Start: r.Start, End: r.End})
+		}
+	}
+	unmanagedRanges, unmanagedScopeIPs, err := ipam.ComputeUnmanagedRanges(pool.Spec.CIDR, reservedCIDRs, tenantRanges)
+	if err == nil {
+		pool.Status.UnmanagedScopeIPs = unmanagedScopeIPs
+		pool.Status.UnmanagedRanges = make([]butlerv1alpha1.AllocationRange, 0, len(unmanagedRanges))
+		for _, ur := range unmanagedRanges {
+			pool.Status.UnmanagedRanges = append(pool.Status.UnmanagedRanges, butlerv1alpha1.AllocationRange{
+				Start: ur.Start,
+				End:   ur.End,
+			})
+		}
+	}
+
+	pool.Status.InfrastructureConsumedIPs = int32(len(pool.Status.InfrastructureAllocations))
+
 	meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
 		Type:               butlerv1alpha1.ConditionTypeReady,
 		Status:             metav1.ConditionTrue,

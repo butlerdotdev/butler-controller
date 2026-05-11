@@ -626,12 +626,12 @@ func (r *Reconciler) reconcileImageSync(ctx context.Context, tc *butlerv1alpha1.
 			Name:      imageSyncName,
 			Namespace: tc.Namespace,
 			Labels: map[string]string{
-				butlerv1alpha1.LabelManagedBy:       "butler",
-				butlerv1alpha1.LabelTenant:          tc.Name,
-				butlerv1alpha1.LabelSchematicID:     labelSchematicID,
-				butlerv1alpha1.LabelImageVersion:    version,
-				butlerv1alpha1.LabelProviderConfig:  pc.Name,
-				butlerv1alpha1.LabelImageArch:       arch,
+				butlerv1alpha1.LabelManagedBy:      "butler",
+				butlerv1alpha1.LabelTenant:         tc.Name,
+				butlerv1alpha1.LabelSchematicID:    labelSchematicID,
+				butlerv1alpha1.LabelImageVersion:   version,
+				butlerv1alpha1.LabelProviderConfig: pc.Name,
+				butlerv1alpha1.LabelImageArch:      arch,
 			},
 		},
 		Spec: butlerv1alpha1.ImageSyncSpec{
