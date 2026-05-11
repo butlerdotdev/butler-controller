@@ -201,7 +201,7 @@ func (r *InfraAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	// Discover CAPI Machine IPs within the pool CIDR (outside tenant ranges).
 	// Machines represent tenant cluster VMs whose IPs are assigned by the
-	// infrastructure provider (e.g., Nutanix DHCP) rather than by Butler.
+	// infrastructure provider rather than by Butler.
 	machineList := &unstructured.UnstructuredList{}
 	machineList.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "cluster.x-k8s.io",
