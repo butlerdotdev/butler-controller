@@ -756,3 +756,121 @@ func ParseIPRange(rangeStr string) (start, end string, err error) {
 	}
 	return ip.String(), ip.String(), nil
 }
+
+// ComputePoolSizeIPs returns the total number of IPs in a CIDR block.
+func ComputePoolSizeIPs(cidr string) (int32, error) {
+	_, _, count, err := ParseCIDR(cidr)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// ComputeReservedIPs returns the total number of IPs across all reserved CIDRs.
+// Overlapping reserved ranges are counted once (union).
+func ComputeReservedIPs(reservedCIDRs []string) (int32, error) {
+	if len(reservedCIDRs) == 0 {
+		return 0, nil
+	}
+
+	// Build a set of all reserved IP addresses (handles overlaps).
+	seen := make(map[uint32]struct{})
+	for _, cidr := range reservedCIDRs {
+		start, end, _, err := ParseCIDR(cidr)
+		if err != nil {
+			return 0, fmt.Errorf("parsing reserved CIDR %q: %w", cidr, err)
+		}
+		s := IPToUint32(start.To4())
+		e := IPToUint32(end.To4())
+		for ip := s; ip <= e; ip++ {
+			seen[ip] = struct{}{}
+		}
+	}
+
+	return capInt32(uint32(len(seen))), nil
+}
+
+// UnmanagedRange represents a contiguous block of IPs that Butler does not manage.
+type UnmanagedRange struct {
+	Start string
+	End   string
+}
+
+// ComputeUnmanagedRanges finds contiguous IP ranges within the pool CIDR
+// that are not covered by the gateway address (first IP), reserved CIDRs,
+// or tenant allocation ranges. The result is sorted by start IP ascending.
+func ComputeUnmanagedRanges(cidr string, reservedCIDRs []string, tenantRanges []AllocatedRange) ([]UnmanagedRange, int32, error) {
+	poolStart, poolEnd, _, err := ParseCIDR(cidr)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	pStart := IPToUint32(poolStart.To4())
+	pEnd := IPToUint32(poolEnd.To4())
+
+	// Build a bitmap of all "claimed" IPs within the pool.
+	size := pEnd - pStart + 1
+	claimed := make([]bool, size)
+
+	// Mark gateway (first IP in CIDR) as claimed.
+	claimed[0] = true
+
+	// Mark broadcast (last IP in CIDR) as claimed for /24 and smaller.
+	// For larger pools the broadcast concept still applies.
+	claimed[size-1] = true
+
+	// Mark reserved CIDRs.
+	for _, rc := range reservedCIDRs {
+		rStart, rEnd, _, parseErr := ParseCIDR(rc)
+		if parseErr != nil {
+			continue
+		}
+		rs := IPToUint32(rStart.To4())
+		re := IPToUint32(rEnd.To4())
+		for ip := rs; ip <= re; ip++ {
+			if ip >= pStart && ip <= pEnd {
+				claimed[ip-pStart] = true
+			}
+		}
+	}
+
+	// Mark tenant allocation ranges.
+	for _, tr := range tenantRanges {
+		tStartIP := net.ParseIP(tr.Start).To4()
+		tEndIP := net.ParseIP(tr.End).To4()
+		if tStartIP == nil || tEndIP == nil {
+			continue
+		}
+		ts := IPToUint32(tStartIP)
+		te := IPToUint32(tEndIP)
+		for ip := ts; ip <= te; ip++ {
+			if ip >= pStart && ip <= pEnd {
+				claimed[ip-pStart] = true
+			}
+		}
+	}
+
+	// Find contiguous unclaimed ranges.
+	var ranges []UnmanagedRange
+	totalUnmanaged := int32(0)
+	i := uint32(0)
+	for i < size {
+		if !claimed[i] {
+			start := i
+			for i < size && !claimed[i] {
+				i++
+			}
+			end := i - 1
+			count := end - start + 1
+			totalUnmanaged += capInt32(count)
+			ranges = append(ranges, UnmanagedRange{
+				Start: Uint32ToIP(pStart + start).String(),
+				End:   Uint32ToIP(pStart + end).String(),
+			})
+		} else {
+			i++
+		}
+	}
+
+	return ranges, totalUnmanaged, nil
+}

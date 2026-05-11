@@ -37,11 +37,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
+	"github.com/butlerdotdev/butler-controller/internal/ipam"
 )
 
 const (
 	// SourceMetalLB identifies IPs consumed by MetalLB LoadBalancer Services.
 	SourceMetalLB = "metallb"
+
+	// SourceNode identifies IPs used as Node InternalIPs within the pool CIDR.
+	SourceNode = "node"
 
 	// infraAllocationFieldManager is the SSA field manager identity for
 	// NetworkPool.status.infrastructureAllocations.
@@ -66,6 +70,7 @@ type InfraAllocationReconciler struct {
 }
 
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 
 func (r *InfraAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -82,7 +87,14 @@ func (r *InfraAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 	}
 
-	// Parse reserved ranges into net.IPNet for containment checks.
+	// Parse pool CIDR for containment checks on Nodes.
+	_, poolNet, err := net.ParseCIDR(pool.Spec.CIDR)
+	if err != nil {
+		logger.V(1).Info("skipping pool with invalid CIDR", "cidr", pool.Spec.CIDR, "error", err)
+		return ctrl.Result{}, nil
+	}
+
+	// Parse reserved ranges into net.IPNet for Service containment checks.
 	var reservedNets []*net.IPNet
 	for _, reserved := range pool.Spec.Reserved {
 		_, network, err := net.ParseCIDR(reserved.CIDR)
@@ -93,22 +105,28 @@ func (r *InfraAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		reservedNets = append(reservedNets, network)
 	}
 
-	if len(reservedNets) == 0 {
-		if len(pool.Status.InfrastructureAllocations) > 0 {
-			return r.patchInfraAllocations(ctx, pool, nil)
+	// Parse tenant allocation ranges (Nodes in these ranges are tracked by
+	// the IPAM allocator, not the infra reconciler).
+	var tenantRanges []ipam.AllocatedRange
+	if pool.Spec.TenantAllocation != nil {
+		for _, r := range pool.Spec.TenantAllocation.GetEffectiveRanges() {
+			tenantRanges = append(tenantRanges, ipam.AllocatedRange{Start: r.Start, End: r.End})
 		}
-		return ctrl.Result{}, nil
 	}
 
-	// List all Services cluster-wide.
+	// Build a map keyed by IP for merging Service and Node facts.
+	type infraEntry struct {
+		source     string
+		serviceRef *butlerv1alpha1.NamespacedObjectReference
+		nodeRef    *butlerv1alpha1.NamespacedObjectReference
+	}
+	entries := make(map[string]*infraEntry)
+
+	// Discover LB Service IPs in reserved ranges.
 	svcList := &corev1.ServiceList{}
 	if err := r.List(ctx, svcList); err != nil {
 		return ctrl.Result{}, err
 	}
-
-	// Build desired InfrastructureAllocations from LB Services whose IPs
-	// fall within reserved ranges.
-	var desired []butlerv1alpha1.InfrastructureAllocation
 	for i := range svcList.Items {
 		svc := &svcList.Items[i]
 		if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
@@ -124,21 +142,67 @@ func (r *InfraAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 			for _, network := range reservedNets {
 				if network.Contains(ip) {
-					desired = append(desired, butlerv1alpha1.InfrastructureAllocation{
-						IP:     ingress.IP,
-						Source: SourceMetalLB,
-						ServiceRef: &butlerv1alpha1.NamespacedObjectReference{
+					entries[ingress.IP] = &infraEntry{
+						source: SourceMetalLB,
+						serviceRef: &butlerv1alpha1.NamespacedObjectReference{
 							Name:      svc.Name,
 							Namespace: svc.Namespace,
 						},
-					})
+					}
 					break
 				}
 			}
 		}
 	}
 
-	// Sort by numeric IP for deterministic output.
+	// Discover Node InternalIPs within the pool CIDR (outside tenant ranges).
+	nodeList := &corev1.NodeList{}
+	if err := r.List(ctx, nodeList); err != nil {
+		return ctrl.Result{}, err
+	}
+	for i := range nodeList.Items {
+		node := &nodeList.Items[i]
+		for _, addr := range node.Status.Addresses {
+			if addr.Type != corev1.NodeInternalIP {
+				continue
+			}
+			ip := net.ParseIP(addr.Address)
+			if ip == nil {
+				continue
+			}
+			if !poolNet.Contains(ip) {
+				continue
+			}
+			// Skip IPs within tenant allocation ranges.
+			if ipInTenantRanges(addr.Address, tenantRanges) {
+				continue
+			}
+			nodeRef := &butlerv1alpha1.NamespacedObjectReference{
+				Name:      node.Name,
+				Namespace: "", // Nodes are cluster-scoped
+			}
+			if existing, ok := entries[addr.Address]; ok {
+				// IP already claimed by a Service: enrich with NodeRef.
+				existing.nodeRef = nodeRef
+			} else {
+				entries[addr.Address] = &infraEntry{
+					source:  SourceNode,
+					nodeRef: nodeRef,
+				}
+			}
+		}
+	}
+
+	// Convert map to sorted slice.
+	var desired []butlerv1alpha1.InfrastructureAllocation
+	for ip, entry := range entries {
+		desired = append(desired, butlerv1alpha1.InfrastructureAllocation{
+			IP:         ip,
+			Source:     entry.source,
+			ServiceRef: entry.serviceRef,
+			NodeRef:    entry.nodeRef,
+		})
+	}
 	sort.Slice(desired, func(i, j int) bool {
 		a := net.ParseIP(desired[i].IP).To4()
 		b := net.ParseIP(desired[j].IP).To4()
@@ -158,6 +222,27 @@ func (r *InfraAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	logger.Info("updating infrastructure allocations", "count", len(desired))
 	return r.patchInfraAllocations(ctx, pool, desired)
+}
+
+// ipInTenantRanges returns true if the given IP falls within any tenant
+// allocation range.
+func ipInTenantRanges(ipStr string, ranges []ipam.AllocatedRange) bool {
+	ip := net.ParseIP(ipStr).To4()
+	if ip == nil {
+		return false
+	}
+	ipN := ipam.IPToUint32(ip)
+	for _, r := range ranges {
+		startIP := net.ParseIP(r.Start).To4()
+		endIP := net.ParseIP(r.End).To4()
+		if startIP == nil || endIP == nil {
+			continue
+		}
+		if ipN >= ipam.IPToUint32(startIP) && ipN <= ipam.IPToUint32(endIP) {
+			return true
+		}
+	}
+	return false
 }
 
 // patchInfraAllocations patches only the InfrastructureAllocations field
@@ -180,6 +265,7 @@ func (r *InfraAllocationReconciler) patchInfraAllocations(
 		},
 	}
 	patch.Status.InfrastructureAllocations = desired
+	patch.Status.InfrastructureConsumedIPs = int32(len(desired))
 
 	if err := r.Status().Patch(ctx, patch, client.Apply,
 		client.FieldOwner(infraAllocationFieldManager),
@@ -197,6 +283,10 @@ func (r *InfraAllocationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Service{},
 			handler.EnqueueRequestsFromMapFunc(r.mapServiceToNetworkPools),
 			builder.WithPredicates(lbIngressChangedPredicate{}),
+		).
+		Watches(&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(r.mapNodeToNetworkPools),
+			builder.WithPredicates(nodeIPChangedPredicate{}),
 		).
 		Named("infra-allocation").
 		Complete(r)
@@ -294,6 +384,88 @@ func extractLBIPs(svc *corev1.Service) []string {
 	for _, ingress := range svc.Status.LoadBalancer.Ingress {
 		if ingress.IP != "" {
 			ips = append(ips, ingress.IP)
+		}
+	}
+	sort.Strings(ips)
+	return ips
+}
+
+// mapNodeToNetworkPools enqueues every NetworkPool when a Node's InternalIP
+// changes. Same fan-out strategy as mapServiceToNetworkPools.
+func (r *InfraAllocationReconciler) mapNodeToNetworkPools(ctx context.Context, _ client.Object) []reconcile.Request {
+	poolList := &butlerv1alpha1.NetworkPoolList{}
+	if err := r.List(ctx, poolList); err != nil {
+		log.FromContext(ctx).Error(err, "failed to list NetworkPools for Node mapper")
+		return nil
+	}
+
+	requests := make([]reconcile.Request, len(poolList.Items))
+	for i, pool := range poolList.Items {
+		requests[i] = reconcile.Request{
+			NamespacedName: client.ObjectKey{
+				Name:      pool.Name,
+				Namespace: pool.Namespace,
+			},
+		}
+	}
+	return requests
+}
+
+// nodeIPChangedPredicate filters Node events to only those where the
+// InternalIP address set changed.
+type nodeIPChangedPredicate struct {
+	predicate.Funcs
+}
+
+func (nodeIPChangedPredicate) Create(e event.CreateEvent) bool {
+	node, ok := e.Object.(*corev1.Node)
+	if !ok {
+		return false
+	}
+	return len(extractNodeIPs(node)) > 0
+}
+
+func (nodeIPChangedPredicate) Update(e event.UpdateEvent) bool {
+	oldNode, ok := e.ObjectOld.(*corev1.Node)
+	if !ok {
+		return false
+	}
+	newNode, ok := e.ObjectNew.(*corev1.Node)
+	if !ok {
+		return false
+	}
+	return !nodeIPsEqual(oldNode, newNode)
+}
+
+func (nodeIPChangedPredicate) Delete(e event.DeleteEvent) bool {
+	node, ok := e.Object.(*corev1.Node)
+	if !ok {
+		return false
+	}
+	return len(extractNodeIPs(node)) > 0
+}
+
+// nodeIPsEqual returns true if both Nodes have the same set of InternalIPs.
+func nodeIPsEqual(old, new *corev1.Node) bool {
+	oldIPs := extractNodeIPs(old)
+	newIPs := extractNodeIPs(new)
+	if len(oldIPs) != len(newIPs) {
+		return false
+	}
+	for i := range oldIPs {
+		if oldIPs[i] != newIPs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// extractNodeIPs returns the sorted list of InternalIP addresses from a Node.
+func extractNodeIPs(node *corev1.Node) []string {
+	var ips []string
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == corev1.NodeInternalIP && addr.Address != "" {
+			ips = append(ips, addr.Address)
 		}
 	}
 	sort.Strings(ips)

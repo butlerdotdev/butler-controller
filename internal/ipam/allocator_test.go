@@ -1704,3 +1704,142 @@ func TestComputeFragmentation_MultiRange(t *testing.T) {
 		}
 	})
 }
+
+// --- ComputePoolSizeIPs ---
+
+func TestComputePoolSizeIPs(t *testing.T) {
+	tests := []struct {
+		cidr string
+		want int32
+	}{
+		{"10.0.0.0/24", 256},
+		{"10.0.0.0/23", 512},
+		{"10.0.0.0/32", 1},
+		{"10.0.0.0/16", 65536},
+	}
+	for _, tt := range tests {
+		t.Run(tt.cidr, func(t *testing.T) {
+			got, err := ComputePoolSizeIPs(tt.cidr)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("ComputePoolSizeIPs(%s) = %d, want %d", tt.cidr, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestComputePoolSizeIPs_InvalidCIDR(t *testing.T) {
+	_, err := ComputePoolSizeIPs("not-a-cidr")
+	if err == nil {
+		t.Fatal("expected error for invalid CIDR")
+	}
+}
+
+// --- ComputeReservedIPs ---
+
+func TestComputeReservedIPs(t *testing.T) {
+	tests := []struct {
+		name     string
+		reserved []string
+		want     int32
+	}{
+		{"empty", nil, 0},
+		{"single /32", []string{"10.0.0.1/32"}, 1},
+		{"single /29", []string{"10.0.0.8/29"}, 8},
+		{"multiple non-overlapping", []string{"10.0.0.7/32", "10.0.0.8/29", "10.0.0.16/28"}, 25},
+		{"overlapping ranges", []string{"10.0.0.0/28", "10.0.0.8/29"}, 16}, // .8-.15 is within .0-.15
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ComputeReservedIPs(tt.reserved)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("ComputeReservedIPs = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// --- ComputeUnmanagedRanges ---
+
+func TestComputeUnmanagedRanges(t *testing.T) {
+	t.Run("crop mgmt pool", func(t *testing.T) {
+		// Reproduces the real crop mgmt pool layout: 10.92.90.0/23
+		cidr := "10.92.90.0/23"
+		reserved := []string{
+			"10.92.90.7/32",  // .7
+			"10.92.90.8/29",  // .8-.15
+			"10.92.90.16/28", // .16-.31
+			"10.92.91.192/26", // .192-.255
+		}
+		tenantRanges := []AllocatedRange{
+			{Start: "10.92.90.32", End: "10.92.90.63"},
+			{Start: "10.92.91.51", End: "10.92.91.191"},
+		}
+
+		ranges, total, err := ComputeUnmanagedRanges(cidr, reserved, tenantRanges)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Expected unmanaged ranges:
+		// .1-.6 (6 IPs) -- .0 is gateway/network, .7 is reserved
+		// .64-10.92.91.50 (243 IPs) -- between first tenant range end and second tenant range start
+		if len(ranges) != 2 {
+			t.Fatalf("expected 2 unmanaged ranges, got %d: %+v", len(ranges), ranges)
+		}
+
+		if ranges[0].Start != "10.92.90.1" || ranges[0].End != "10.92.90.6" {
+			t.Errorf("range[0] = %s-%s, want 10.92.90.1-10.92.90.6", ranges[0].Start, ranges[0].End)
+		}
+		if ranges[1].Start != "10.92.90.64" || ranges[1].End != "10.92.91.50" {
+			t.Errorf("range[1] = %s-%s, want 10.92.90.64-10.92.91.50", ranges[1].Start, ranges[1].End)
+		}
+
+		// Total: 6 + 243 = 249
+		if total != 249 {
+			t.Errorf("total unmanaged = %d, want 249", total)
+		}
+	})
+
+	t.Run("no gaps", func(t *testing.T) {
+		// Pool where reserved + tenant covers everything except gateway/broadcast
+		cidr := "10.0.0.0/30" // 4 IPs: .0 (gateway), .1, .2, .3 (broadcast)
+		reserved := []string{"10.0.0.1/32"}
+		tenantRanges := []AllocatedRange{{Start: "10.0.0.2", End: "10.0.0.2"}}
+
+		ranges, total, err := ComputeUnmanagedRanges(cidr, reserved, tenantRanges)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(ranges) != 0 {
+			t.Errorf("expected 0 unmanaged ranges, got %d: %+v", len(ranges), ranges)
+		}
+		if total != 0 {
+			t.Errorf("total = %d, want 0", total)
+		}
+	})
+
+	t.Run("no reserved no tenant", func(t *testing.T) {
+		// Everything except gateway and broadcast is unmanaged.
+		cidr := "10.0.0.0/29" // 8 IPs: .0-.7
+		ranges, total, err := ComputeUnmanagedRanges(cidr, nil, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// .0 is gateway, .7 is broadcast, .1-.6 is unmanaged
+		if len(ranges) != 1 {
+			t.Fatalf("expected 1 unmanaged range, got %d: %+v", len(ranges), ranges)
+		}
+		if ranges[0].Start != "10.0.0.1" || ranges[0].End != "10.0.0.6" {
+			t.Errorf("range = %s-%s, want 10.0.0.1-10.0.0.6", ranges[0].Start, ranges[0].End)
+		}
+		if total != 6 {
+			t.Errorf("total = %d, want 6", total)
+		}
+	})
+}
