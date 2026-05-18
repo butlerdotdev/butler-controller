@@ -204,6 +204,7 @@ A cluster-wide pin and a team allow-list for the same option type resolve in fav
 Five surfaces, mirroring ADR-009's "Enforcement locations" structure.
 
 - **butler-server option-list handlers** (`butler-server/internal/api/handlers/providers.go`). New shared package `butler-server/internal/api/policy/` provides `ApplyOptionRule(ctx, optionType, items, resCtx)`. Each of the four list handlers calls `policy.Apply...` after the existing `switch providerType` block populates the result, before `writeJSON`. Resolution context comes from `UserSession.SelectedTeam` and `UserSession.SelectedEnvironment` already populated by `butler-server/internal/auth/middleware.go:84` (X-Butler-Environment header). No new request header is required.
+- **butler-server admin endpoints for policy CRUD** (`butler-server/internal/api/handlers/admin_policies.go`). Five thin dynamic-client wrappers following the Team admin endpoint pattern: `GET /admin/policies`, `GET /admin/policies/:name`, `POST /admin/policies`, `PUT /admin/policies/:name`, `DELETE /admin/policies/:name`. Platform admin role required. Admission-webhook rejection messages on Create and Update are unwrapped into a structured 400 response so the console can render the validation error inline against the offending field. The webhook validates structure regardless of whether the input came from UI, GitOps, or kubectl. All three paths converge at the same validation surface.
 - **Policy CRD admission webhook** (new file `butler-controller/internal/webhook/clustercreationpolicy_webhook.go`). Validates the CRD itself on create and update:
   - Exactly-one-of on `spec.scope` (CEL `XValidation` rule).
   - Referenced team exists (`APIReader.Get` against `butler-api/api/v1alpha1.Team`).
@@ -213,6 +214,7 @@ Five surfaces, mirroring ADR-009's "Enforcement locations" structure.
   - Provider-entry existence is a soft warning, not a hard reject. Provider lookups at admission time would couple admission to provider availability; a provider outage would block legitimate policy authoring. Stale references are surfaced by a status reconciler (deferred).
 - **TenantCluster admission webhook** (`butler-controller/internal/webhook/tenantcluster_webhook.go`). Add `validatePolicy` called from `validateCreateUpdate` (line 155) after the env validation block at line 181. Shared resolution code lives in new `butler-controller/internal/policy/` package (`resolve.go`). Provider-field dispatch (how to read the image ID from `tc.Spec.InfrastructureOverride.Nutanix` vs `.Harvester`) lives in `butler-controller/internal/policy/fieldmap.go`. For example, the image option type maps to `tc.Spec.InfrastructureOverride.Nutanix.ImageUUID` for Nutanix providers and `tc.Spec.InfrastructureOverride.Harvester.ImageName` for Harvester providers. The fieldmap is the only per-provider code path the resolver touches. The webhook rejects with the policy name and the violating field path.
 - **butler-console create-cluster modal** (`butler-console/src/pages/CreateClusterPage.tsx`). The console does not re-resolve policy. It consumes the server-applied response. Three touches: render the `recommended` badge and re-sort when the response carries policy metadata; pre-select the `default` ID; show "curated by policy: <name>" under the affected dropdown so the operator understands why the list is shorter. New typings in `butler-console/src/api/`.
+- **butler-console admin authoring pages** (`butler-console/src/pages/admin/policies/`). Three pages compose the admin authoring workflow: a list view (`/admin/policies`) with status indicators, a create form (`/admin/policies/new`) with scope picker, provider multi-select, and per-option-type mode and value editors, and a view/edit/delete page (`/admin/policies/:name`). UI authoring posts to the butler-server admin endpoints described above; validation messages from the policy admission webhook surface directly in the UI against the offending field.
 - **butler-charts CRD sync** (`butler-charts/charts/butler-crds/`). The CRD generated from `butler-api` lands as a YAML manifest. Standard CRD chart version bump. No values templating; the CRD is data, not configuration.
 
 Response envelope change: each of the four list endpoints returns `{<items>: [...], policy?: {name, mode, default?, recommendedReason?}}`. Existing API consumers that ignore unknown fields keep working.
@@ -383,6 +385,7 @@ Rejected for v1: requires cross-repo work across every provider package, and the
 - Provider-agnostic resolution. New providers inherit policy support as long as they return `{id, name}` shaped option entries.
 - Coexists cleanly with `Team.spec.clusterDefaults` (ADR-009). No deprecation, no schema churn on the existing field.
 - Closed option-type set in v1 keeps the CRD shape small and matches butler-server's current handler surface.
+- UI, GitOps, and kubectl all author policies against the same validation surface. Operators choose the workflow that fits their team; policies remain auditable and reviewable in any path.
 
 ### Negative
 
@@ -394,7 +397,6 @@ Rejected for v1: requires cross-repo work across every provider package, and the
 ### Deferred
 
 - `ListOptionTypes` provider method. Lets the CRD enum become provider-declared instead of butler-server-declared. Promotion path documented in Alternatives.
-- Admin UI in butler-console for authoring policies. v1 ships with kubectl and butlerctl only.
 - Cross-team policy inheritance (a policy on team A also applies to teams B and C). Not requested; would be a `parentTeamRef` or label-selector mechanic in a future iteration.
 - Provider-entry-existence reconciler that sets `status.staleReferences` on the policy when pinned or allow-listed IDs no longer exist in the provider response.
 - Audit log of policy-applied filtering decisions at the create-cluster path. Implementation detail for the audit PR.
