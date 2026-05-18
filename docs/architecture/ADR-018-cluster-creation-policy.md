@@ -59,6 +59,9 @@ type ClusterCreationPolicySpec struct {
     Options map[OptionType]OptionRule `json:"options,omitempty"`
 }
 
+// PolicyScope discriminator: exactly one of clusterWide, team, or
+// teamAndEnvironment must be set. Enforced via CEL XValidation in the
+// policy admission webhook (see Decision section 7).
 type PolicyScope struct {
     ClusterWide        *ClusterWideScope     `json:"clusterWide,omitempty"`
     Team               *TeamScope            `json:"team,omitempty"`
@@ -104,6 +107,8 @@ const (
 )
 ```
 
+Each ClusterCreationPolicy contains zero or more OptionRule entries within its `Options` map, one rule per option type. A policy is the unit of authorship and RBAC; a rule is the unit of resolution.
+
 Resource attributes: `+kubebuilder:resource:scope=Cluster`, shortname `ccp`. The `spec.scope` discriminator carves team boundaries; the resource itself is not namespaced.
 
 ### 2. Coexistence with `Team.spec.clusterDefaults`
@@ -116,7 +121,7 @@ Resource attributes: `+kubebuilder:resource:scope=Cluster`, shortname `ccp`. The
 
 ADR-009 embedded environments in `Team.spec.environments` and noted promotion to a standalone CRD stays viable if independent lifecycle emerges. This ADR chooses standalone for one reason: cluster-wide policies cannot be expressed embedded. A rule like "no team can use image X" needs a global statement. Duplicating that rule across every team's spec produces drift; inventing a separate cluster-wide carve-out reproduces a standalone CRD by another name.
 
-Lifecycle also differs from Team. Platform admins author policies; team admins do not. Putting policy fields under Team would mean either gating those fields by an additional role check inside the Team admission webhook or risking team admins accidentally clearing policy. A separate CRD with its own webhook gives policy its own RBAC surface.
+Lifecycle also differs from Team. Platform admins author policies; team admins do not. Cluster-wide rules require platform-level authority by definition. A team admin authoring a cluster-wide policy would be exercising scope beyond their team. Team admins can author policies scoped to their own team via `spec.scope.team`, but the lifecycle and RBAC surface for those policies stays distinct from team self-service operations on `Team.spec` itself. Putting policy fields under Team would mean either gating those fields by an additional role check inside the Team admission webhook or risking team admins accidentally clearing policy. A separate CRD with its own webhook gives policy its own RBAC surface.
 
 ### 4. Closed option-type set in v1
 
@@ -136,6 +141,15 @@ Adding a new option type beyond this four requires butler-server handler changes
 - **default**: presentation only. The modal renders the full provider response. `Default` is pre-selected. Admission does not enforce.
 - **recommended**: presentation only. The modal renders the full provider response. Entries in `Values` are badged and sorted first. `RecommendedReason` (when set) appears in the badge tooltip. Admission does not enforce.
 
+Summary of mode behaviors:
+
+| Mode | Filters dropdown | Pre-selects default | Badges entries | Admission enforces |
+|---|---|---|---|---|
+| pin | Yes | When single entry, renders read-only | No | Yes |
+| allowList | Yes | When default set | No | Yes |
+| default | No | Yes | No | No |
+| recommended | No | No | Yes | No |
+
 ### 6. Resolution order
 
 The resolution context is the tuple `(team, environment, providerConfig.provider)` derived from the operator session for list-time resolution, and from the TenantCluster spec for admission-time resolution.
@@ -145,7 +159,7 @@ Steps:
 1. **Gather candidates.** List every ClusterCreationPolicy where `spec.targetProviders` is empty or contains the current provider AND `spec.scope` matches the context. `clusterWide` always matches. `team` matches when `teamRef.name == team.name`. `teamAndEnvironment` matches when both `teamRef.name` and `environmentName` match.
 2. **Bin by specificity tier.** Tier 1 is `teamAndEnvironment`. Tier 2 is `team`. Tier 3 is `clusterWide`.
 3. **Resolve per option type.** Walk tiers most-specific first. The first tier that contains at least one rule for a given option type provides the effective rule for that option type. Modes do not stack across tiers; specificity wins.
-4. **Intra-tier conflict.** If two policies in the same tier define rules for the same option type for the same matching context, the policy admission webhook rejects the second at write time. Conflict detection is scoped to overlapping `targetProviders` AND shared option-type keys: two policies in the same tier targeting different providers do not conflict, and two policies in the same tier targeting the same providers but defining rules for disjoint option-type keys do not conflict. The resolution layer is therefore single-policy-per-tier-per-option-type at read time.
+4. **Intra-tier conflict.** If two policies in the same tier define rules for the same option type for the same matching context, the policy admission webhook rejects the second at write time. Conflict detection is scoped to overlapping `targetProviders` AND shared option-type keys: two policies in the same tier targeting different providers do not conflict, and two policies in the same tier targeting the same providers but defining rules for disjoint option-type keys do not conflict. The resolution layer is therefore single-policy-per-tier-per-option-type at read time. Read-time conflict resolution would force a choice between union (the broadest combined rule), intersection (the strictest combined rule), or strictest-wins (always pin if any conflicting rule pins). Each option is surprising to operators who authored their policy expecting a specific behavior. Write-time rejection makes the conflict explicit at the author's terminal, with the conflicting policy named.
 5. **Apply the resolved rule.** butler-server applies the rule when serving option-list responses. The admission webhook applies the rule when validating TenantCluster spec.
 6. **No effective rule.** When no tier contains a rule for an option type, the provider response passes through unchanged. This matches today's behavior.
 
@@ -197,7 +211,7 @@ Five surfaces, mirroring ADR-009's "Enforcement locations" structure.
   - No same-tier same-option-type conflict with an existing policy in the same context (scan + reject with the conflicting policy name).
   - `pin` and `allowList` require non-empty `values`; `default` requires non-empty `default`; `recommended` requires non-empty `values`.
   - Provider-entry existence is a soft warning, not a hard reject. Provider lookups at admission time would couple admission to provider availability; a provider outage would block legitimate policy authoring. Stale references are surfaced by a status reconciler (deferred).
-- **TenantCluster admission webhook** (`butler-controller/internal/webhook/tenantcluster_webhook.go`). Add `validatePolicy` called from `validateCreateUpdate` (line 155) after the env validation block at line 181. Shared resolution code lives in new `butler-controller/internal/policy/` package (`resolve.go`). Provider-field dispatch (how to read the image ID from `tc.Spec.InfrastructureOverride.Nutanix` vs `.Harvester`) lives in `butler-controller/internal/policy/fieldmap.go`. For example, the image option type maps to `tc.Spec.InfrastructureOverride.Nutanix.ImageUUID` for Nutanix providers and `tc.Spec.InfrastructureOverride.Harvester.ImageTemplate` for Harvester providers. The fieldmap is the only per-provider code path the resolver touches. The webhook rejects with the policy name and the violating field path.
+- **TenantCluster admission webhook** (`butler-controller/internal/webhook/tenantcluster_webhook.go`). Add `validatePolicy` called from `validateCreateUpdate` (line 155) after the env validation block at line 181. Shared resolution code lives in new `butler-controller/internal/policy/` package (`resolve.go`). Provider-field dispatch (how to read the image ID from `tc.Spec.InfrastructureOverride.Nutanix` vs `.Harvester`) lives in `butler-controller/internal/policy/fieldmap.go`. For example, the image option type maps to `tc.Spec.InfrastructureOverride.Nutanix.ImageUUID` for Nutanix providers and `tc.Spec.InfrastructureOverride.Harvester.ImageName` for Harvester providers. The fieldmap is the only per-provider code path the resolver touches. The webhook rejects with the policy name and the violating field path.
 - **butler-console create-cluster modal** (`butler-console/src/pages/CreateClusterPage.tsx`). The console does not re-resolve policy. It consumes the server-applied response. Three touches: render the `recommended` badge and re-sort when the response carries policy metadata; pre-select the `default` ID; show "curated by policy: <name>" under the affected dropdown so the operator understands why the list is shorter. New typings in `butler-console/src/api/`.
 - **butler-charts CRD sync** (`butler-charts/charts/butler-crds/`). The CRD generated from `butler-api` lands as a YAML manifest. Standard CRD chart version bump. No values templating; the CRD is data, not configuration.
 
@@ -280,6 +294,25 @@ spec:
 
 Outcome: every Nutanix storage-container dropdown shows the full list, with `sc-ssd-prod-001` badged and sorted to the top. No admission rejection; operators can still pick a different container.
 
+### Default storage container
+
+```yaml
+apiVersion: butler.butlerlabs.dev/v1alpha1
+kind: ClusterCreationPolicy
+metadata:
+  name: global-default-storage
+spec:
+  scope:
+    clusterWide: {}
+  targetProviders: [nutanix]
+  options:
+    storageContainer:
+      mode: default
+      default: sc-ssd-prod-001
+```
+
+Outcome: every Nutanix storage-container dropdown shows the full provider response with `sc-ssd-prod-001` pre-selected. Operators can pick any other container; admission does not enforce. The pattern fits soft defaults that aim for operator convenience without restricting choice.
+
 ### Deprecated-image block plus team carve-out
 
 ```yaml
@@ -354,7 +387,7 @@ Rejected for v1: requires cross-repo work across every provider package, and the
 ### Negative
 
 - New CRD to document, version, and chart. Adds a v1alpha1 type to butler-api and a CRD chart row to `butler-charts/charts/butler-crds/`.
-- Resolution latency at list time: butler-server uses controller-runtime's cached client to List policies, so resolution adds a memory lookup plus an in-process loop per modal open rather than an etcd hit. Worst case is bounded by the total number of policies in the cluster.
+- Resolution latency at list time: butler-server uses controller-runtime's cached client to List policies, so resolution adds a memory lookup plus an in-process loop per modal open rather than an etcd hit. For N policies and K option types, the resolver runs at most N times K rule evaluations per modal open. K is bounded at four in v1 and N at the cluster's policy count, so the operation budget stays small in practice.
 - Misconfigured policies can block legitimate operators. Mitigation: the policy admission webhook validates structure at write time (exactly-one-of on scope, non-empty values on pin and allowList, no same-tier conflicts). It does not validate provider-entry existence; a policy that pins to an image UUID the provider no longer exposes produces an empty list. A follow-on status reconciler surfaces stale references as a condition on the policy.
 - Modal response envelope changes shape: a new optional `policy` block on each list endpoint. Console types update; existing API consumers ignore unknown fields.
 
@@ -371,7 +404,7 @@ Rejected for v1: requires cross-repo work across every provider package, and the
 No open questions block this ADR. The five items below are follow-ons.
 
 - **Multi-team operator conflict resolution**. When one operator is in teams A and B and opens the modal, the modal already requires team selection before any provider-list endpoint fires. v1 disposition: resolution uses `UserSession.SelectedTeam` only. No multi-team union semantics in v1.
-- **Provider-specific metadata filtering**. The v1 CRD filters on `{id, name}` only because that is what every provider response shares (`butler-server/internal/api/handlers/providers.go:1424-1427` `ImageInfo`; analogous shapes for the other three). Filtering on VLAN (Nutanix network), OS (image), or replication factor (storage container) would require either per-provider schema extensions in the policy CRD or a uniform metadata-map shape on provider responses. v1 disposition: deferred; no metadata filtering.
+- **Provider-specific metadata filtering**. The v1 CRD filters on `{id, name}` only because that is what every provider response shares (`butler-server/internal/api/handlers/providers.go:1424-1429` `ImageInfo`; analogous shapes for the other three). Filtering on VLAN (Nutanix network), OS (image), or replication factor (storage container) would require either per-provider schema extensions in the policy CRD or a uniform metadata-map shape on provider responses. v1 disposition: deferred; no metadata filtering.
 - **Stale-reference handling**. A policy that pins to an image UUID the provider has since removed produces an empty modal list. v1 disposition: soft-warn via status; the follow-on reconciler writes the condition.
 - **Audit verbosity**. Every option-list response that runs through policy filtering is a decision point. Logging every one is noisy. Logging only admission rejections is too narrow. v1 disposition: logs admission rejections only; verbose mode deferred to the audit PR.
 - **Orphan policy scope**. When a Team CRD is renamed or deleted, a `scope.team.teamRef` pointing at the removed name falls through (policy effectively unscoped, never matches anything). v1 disposition: the status reconciler surfaces the orphan via a stale-reference condition. No cascade delete in v1.
