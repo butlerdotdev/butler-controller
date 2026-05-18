@@ -74,3 +74,8 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.0 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
+
+// Replace directive for ADR-018 implementation chain. Points at the
+// local butler-api checkout on branch feat/clustercreationpolicy-types.
+// Removed at merge phase when butler-api PR tags are cut.
+replace github.com/butlerdotdev/butler-api => ../butler-api

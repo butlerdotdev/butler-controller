@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
+	policypkg "github.com/butlerdotdev/butler-api/pkg/policy"
 )
 
 const defaultProviderConfigNamespace = "butler-system"
@@ -228,6 +229,14 @@ func (v *TenantClusterValidator) validateCreateUpdate(ctx context.Context, tc, o
 			}
 		}
 	}
+
+	// ADR-018: enforce ClusterCreationPolicy at admission time. Runs
+	// after PC fetch because provider type drives field-map resolution.
+	policyErrs, err := v.validatePolicy(ctx, tc, pc.Spec.Provider)
+	if err != nil {
+		return nil, err
+	}
+	allErrs = append(allErrs, policyErrs...)
 
 	// Enforce per-team cluster limit. Create-only: on update the TC is
 	// already counted and re-simulation would deadlock operations when
@@ -648,6 +657,44 @@ func (v *TenantClusterValidator) validateEnvironment(ctx context.Context, tc, ol
 	}
 
 	return allErrs, nil
+}
+
+// validatePolicy resolves applicable ClusterCreationPolicy resources for
+// the TC's (team, environment, provider) tuple and rejects when the TC
+// spec violates a pin or allowList rule. default and recommended modes
+// are presentation-only and do not enforce here. See ADR-018 Decision
+// section 7.
+func (v *TenantClusterValidator) validatePolicy(ctx context.Context, tc *butlerv1alpha1.TenantCluster, providerType butlerv1alpha1.ProviderType) (field.ErrorList, error) {
+	var errs field.ErrorList
+
+	teamName := ""
+	if tc.Spec.TeamRef != nil {
+		teamName = tc.Spec.TeamRef.Name
+	}
+	envName := tc.Labels[butlerv1alpha1.LabelEnvironment]
+
+	policies := &butlerv1alpha1.ClusterCreationPolicyList{}
+	if err := v.Client.List(ctx, policies); err != nil {
+		return nil, fmt.Errorf("list ClusterCreationPolicy: %w", err)
+	}
+	if len(policies.Items) == 0 {
+		return errs, nil
+	}
+
+	resCtx := policypkg.ResolutionContext{
+		TeamName:        teamName,
+		EnvironmentName: envName,
+		ProviderType:    providerType,
+	}
+	rules, sources := policypkg.ResolveWithSources(resCtx, policies.Items)
+	for optType, rule := range rules {
+		ok, fieldPath, msg := policypkg.ValidateAgainstRule(tc, providerType, optType, rule, sources[optType])
+		if !ok {
+			path := field.NewPath(fieldPath)
+			errs = append(errs, field.Forbidden(path, msg))
+		}
+	}
+	return errs, nil
 }
 
 // SetupWebhookWithManager registers the TenantCluster validating webhook
