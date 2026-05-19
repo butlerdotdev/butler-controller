@@ -287,6 +287,10 @@ func main() {
 			setupLog.Error(err, "unable to create webhook", "webhook", "ProviderConfig")
 			os.Exit(1)
 		}
+		if err = (&webhook.ClusterCreationPolicyValidator{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "ClusterCreationPolicy")
+			os.Exit(1)
+		}
 		setupLog.Info("admission webhooks enabled")
 	} else {
 		setupLog.Info("admission webhooks disabled")
