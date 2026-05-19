@@ -162,11 +162,19 @@ func validateOptionRules(policy *butlerv1alpha1.ClusterCreationPolicy) field.Err
 	for optType, rule := range policy.Spec.Options {
 		path := field.NewPath("spec", "options").Key(string(optType))
 		switch rule.Mode {
-		case butlerv1alpha1.OptionModePin, butlerv1alpha1.OptionModeAllowList:
+		case butlerv1alpha1.OptionModePin:
+			if len(rule.Values) != 1 {
+				errs = append(errs, field.Invalid(
+					path.Child("values"),
+					rule.Values,
+					fmt.Sprintf("mode \"pin\" requires exactly one value, got %d", len(rule.Values)),
+				))
+			}
+		case butlerv1alpha1.OptionModeAllowList:
 			if len(rule.Values) == 0 {
 				errs = append(errs, field.Required(
 					path.Child("values"),
-					fmt.Sprintf("at least one value is required when mode is %q", rule.Mode),
+					"at least one value is required when mode is \"allowList\"",
 				))
 			}
 		case butlerv1alpha1.OptionModeDefault:
