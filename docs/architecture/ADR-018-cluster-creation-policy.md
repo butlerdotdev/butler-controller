@@ -136,7 +136,7 @@ Adding a new option type beyond this four requires butler-server handler changes
 
 ### 5. Mode semantics
 
-- **pin**: the only acceptable values for this option. The modal renders the pinned list (when length is greater than one) or renders the single pinned entry as read-only (when length is one). Admission rejects any TenantCluster create or update whose corresponding spec field references a value outside `Values`.
+- **pin**: exactly one acceptable value for this option. `Values` must have length 1. The modal renders the pinned entry as a single read-only selection. Admission rejects any TenantCluster create or update whose corresponding spec field references a different value. Use `allowList` with one entry when you want a single-value enforcing rule that the admin may later widen; use `pin` when the single-value semantics are deliberate.
 - **allowList**: the acceptable values for this option. The modal renders the allow-listed subset. `Default` (when set) is pre-selected. Admission rejects values outside `Values`.
 - **default**: presentation only. The modal renders the full provider response. `Default` is pre-selected. Admission does not enforce.
 - **recommended**: presentation only. The modal renders the full provider response. Entries in `Values` are badged and sorted first. `RecommendedReason` (when set) appears in the badge tooltip. Admission does not enforce.
@@ -145,7 +145,7 @@ Summary of mode behaviors:
 
 | Mode | Filters dropdown | Pre-selects default | Badges entries | Admission enforces |
 |---|---|---|---|---|
-| pin | Yes | When single entry, renders read-only | No | Yes |
+| pin | Yes (single value) | Renders read-only | No | Yes |
 | allowList | Yes | When default set | No | Yes |
 | default | No | Yes | No | No |
 | recommended | No | No | Yes | No |
