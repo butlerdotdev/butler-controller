@@ -33,7 +33,7 @@ Binding constraints:
 
 ## Decision
 
-Add a new cluster-scoped CRD `ClusterCreationPolicy` in the `butler.butlerlabs.dev` group. The policy CRD declares scope (cluster-wide, team, or team-and-environment), the providers it applies to, and a map of option-type modes (`pin`, `allowList`, `default`, `recommended`) over the four canonical option types. butler-server applies the resolved policy to option-list responses. The TenantCluster admission webhook validates create and update requests against the same resolved policy for defense in depth.
+Add a new cluster-scoped CRD `ClusterCreationPolicy` in the `butler.butlerlabs.dev` group. The policy CRD declares scope (platform-wide, team, or team-and-environment), the providers it applies to, and a map of option-type modes (`pin`, `allowList`, `default`, `recommended`) over the four canonical option types. butler-server applies the resolved policy to option-list responses. The TenantCluster admission webhook validates create and update requests against the same resolved policy for defense in depth.
 
 ### 1. CRD shape
 
@@ -46,7 +46,7 @@ Add a new cluster-scoped CRD `ClusterCreationPolicy` in the `butler.butlerlabs.d
 // curation only.
 type ClusterCreationPolicySpec struct {
     // Scope selects which TenantCluster create requests this policy
-    // applies to. Exactly one of clusterWide, team, teamAndEnvironment
+    // applies to. Exactly one of platformWide, team, teamAndEnvironment
     // must be set. Validated by the policy admission webhook.
     Scope PolicyScope `json:"scope"`
 
@@ -59,16 +59,16 @@ type ClusterCreationPolicySpec struct {
     Options map[OptionType]OptionRule `json:"options,omitempty"`
 }
 
-// PolicyScope discriminator: exactly one of clusterWide, team, or
+// PolicyScope discriminator: exactly one of platformWide, team, or
 // teamAndEnvironment must be set. Enforced via CEL XValidation in the
 // policy admission webhook (see Decision section 7).
 type PolicyScope struct {
-    ClusterWide        *ClusterWideScope     `json:"clusterWide,omitempty"`
+    PlatformWide       *PlatformWideScope     `json:"platformWide,omitempty"`
     Team               *TeamScope            `json:"team,omitempty"`
     TeamAndEnvironment *TeamEnvironmentScope `json:"teamAndEnvironment,omitempty"`
 }
 
-type ClusterWideScope struct{}
+type PlatformWideScope struct{}
 
 type TeamScope struct {
     TeamRef LocalObjectReference `json:"teamRef"`
@@ -119,9 +119,9 @@ Resource attributes: `+kubebuilder:resource:scope=Cluster`, shortname `ccp`. The
 
 ### 3. Standalone CRD, not embedded
 
-ADR-009 embedded environments in `Team.spec.environments` and noted promotion to a standalone CRD stays viable if independent lifecycle emerges. This ADR chooses standalone for one reason: cluster-wide policies cannot be expressed embedded. A rule like "no team can use image X" needs a global statement. Duplicating that rule across every team's spec produces drift; inventing a separate cluster-wide carve-out reproduces a standalone CRD by another name.
+ADR-009 embedded environments in `Team.spec.environments` and noted promotion to a standalone CRD stays viable if independent lifecycle emerges. This ADR chooses standalone for one reason: platform-wide policies cannot be expressed embedded. A rule like "no team can use image X" needs a global statement. Duplicating that rule across every team's spec produces drift; inventing a separate platform-wide carve-out reproduces a standalone CRD by another name.
 
-Lifecycle also differs from Team. Platform admins author policies; team admins do not. Cluster-wide rules require platform-level authority by definition. A team admin authoring a cluster-wide policy would be exercising scope beyond their team. Team admins can author policies scoped to their own team via `spec.scope.team`, but the lifecycle and RBAC surface for those policies stays distinct from team self-service operations on `Team.spec` itself. Putting policy fields under Team would mean either gating those fields by an additional role check inside the Team admission webhook or risking team admins accidentally clearing policy. A separate CRD with its own webhook gives policy its own RBAC surface.
+Lifecycle also differs from Team. Platform admins author policies; team admins do not. Platform-wide rules require platform-level authority by definition. A team admin authoring a platform-wide policy would be exercising scope beyond their team. Team admins can author policies scoped to their own team via `spec.scope.team`, but the lifecycle and RBAC surface for those policies stays distinct from team self-service operations on `Team.spec` itself. Putting policy fields under Team would mean either gating those fields by an additional role check inside the Team admission webhook or risking team admins accidentally clearing policy. A separate CRD with its own webhook gives policy its own RBAC surface.
 
 ### 4. Closed option-type set in v1
 
@@ -156,8 +156,8 @@ The resolution context is the tuple `(team, environment, providerConfig.provider
 
 Steps:
 
-1. **Gather candidates.** List every ClusterCreationPolicy where `spec.targetProviders` is empty or contains the current provider AND `spec.scope` matches the context. `clusterWide` always matches. `team` matches when `teamRef.name == team.name`. `teamAndEnvironment` matches when both `teamRef.name` and `environmentName` match.
-2. **Bin by specificity tier.** Tier 1 is `teamAndEnvironment`. Tier 2 is `team`. Tier 3 is `clusterWide`.
+1. **Gather candidates.** List every ClusterCreationPolicy where `spec.targetProviders` is empty or contains the current provider AND `spec.scope` matches the context. `platformWide` always matches. `team` matches when `teamRef.name == team.name`. `teamAndEnvironment` matches when both `teamRef.name` and `environmentName` match.
+2. **Bin by specificity tier.** Tier 1 is `teamAndEnvironment`. Tier 2 is `team`. Tier 3 is `platformWide`.
 3. **Resolve per option type.** Walk tiers most-specific first. The first tier that contains at least one rule for a given option type provides the effective rule for that option type. Modes do not stack across tiers; specificity wins.
 4. **Intra-tier conflict.** If two policies in the same tier define rules for the same option type for the same matching context, the policy admission webhook rejects the second at write time. Conflict detection is scoped to overlapping `targetProviders` AND shared option-type keys: two policies in the same tier targeting different providers do not conflict, and two policies in the same tier targeting the same providers but defining rules for disjoint option-type keys do not conflict. The resolution layer is therefore single-policy-per-tier-per-option-type at read time. Read-time conflict resolution would force a choice between union (the broadest combined rule), intersection (the strictest combined rule), or strictest-wins (always pin if any conflicting rule pins). Each option is surprising to operators who authored their policy expecting a specific behavior. Write-time rejection makes the conflict explicit at the author's terminal, with the conflicting policy named.
 5. **Apply the resolved rule.** butler-server applies the rule when serving option-list responses. The admission webhook applies the rule when validating TenantCluster spec.
@@ -170,7 +170,7 @@ Context: team=acme, env=prod, provider=nutanix
 
 Policies in cluster:
   - ccp/global-no-deprecated-images
-      scope.clusterWide: {}
+      scope.platformWide: {}
       targetProviders: [nutanix]
       options:
         image:
@@ -185,7 +185,7 @@ Policies in cluster:
           values: [net-prod-vlan-200]
 
 Resolved rules for (acme, prod, nutanix):
-  image:            clusterWide -> allowList [img-rocky-9, img-talos-1.7, img-talos-1.8]
+  image:            platformWide -> allowList [img-rocky-9, img-talos-1.7, img-talos-1.8]
   network:          teamAndEnv  -> pin       [net-prod-vlan-200]
   cluster:          no rule, pass through
   storageContainer: no rule, pass through
@@ -197,7 +197,7 @@ Modal renders:
   storageContainer dropdown: full provider response
 ```
 
-A cluster-wide pin and a team allow-list for the same option type resolve in favor of the team. The cluster-wide rule is the umbrella; the team carve-out is the intentional override. Operators who need to widen for one team author a team-scoped policy; operators who need to narrow for one team do the same.
+A platform-wide pin and a team allow-list for the same option type resolve in favor of the team. The platform-wide rule is the umbrella; the team carve-out is the intentional override. Operators who need to widen for one team author a team-scoped policy; operators who need to narrow for one team do the same.
 
 ### 7. Enforcement locations
 
@@ -274,9 +274,9 @@ spec:
       default: img-talos-1.8
 ```
 
-Outcome: every environment under `acme` sees only the three vetted images, with Talos 1.8 pre-selected. Cluster-wide image policies apply only to teams that have no team-scoped image rule (specificity wins).
+Outcome: every environment under `acme` sees only the three vetted images, with Talos 1.8 pre-selected. Platform-wide image policies apply only to teams that have no team-scoped image rule (specificity wins).
 
-### Recommended storage container (cluster-wide soft default)
+### Recommended storage container (platform-wide soft default)
 
 ```yaml
 apiVersion: butler.butlerlabs.dev/v1alpha1
@@ -285,7 +285,7 @@ metadata:
   name: global-recommended-storage
 spec:
   scope:
-    clusterWide: {}
+    platformWide: {}
   targetProviders: [nutanix]
   options:
     storageContainer:
@@ -305,7 +305,7 @@ metadata:
   name: global-default-storage
 spec:
   scope:
-    clusterWide: {}
+    platformWide: {}
   targetProviders: [nutanix]
   options:
     storageContainer:
@@ -324,7 +324,7 @@ metadata:
   name: global-image-deny-rocky-8
 spec:
   scope:
-    clusterWide: {}
+    platformWide: {}
   targetProviders: [nutanix]
   options:
     image:
@@ -347,7 +347,7 @@ spec:
       values: [img-rocky-8, img-rocky-9, img-talos-1.8]
 ```
 
-Outcome: team-legacy operators see the four-item team list (including the deprecated Rocky 8). Every other team sees the cluster-wide four-item list (which excludes Rocky 8). The team policy wins for team-legacy because team is more specific than cluster-wide.
+Outcome: team-legacy operators see the four-item team list (including the deprecated Rocky 8). Every other team sees the platform-wide four-item list (which excludes Rocky 8). The team policy wins for team-legacy because team is more specific than platform-wide.
 
 ## Alternatives Considered
 
@@ -355,7 +355,7 @@ Outcome: team-legacy operators see the four-item team list (including the deprec
 
 Push the policy fields into `EnvironmentSpec.options` on each environment, mirroring how `EnvironmentSpec.ClusterDefaults` lives there today (`butler-api/api/v1alpha1/team_types.go:118-122`).
 
-Rejected: cluster-wide policies cannot be expressed. "No team can use deprecated image X" needs a global statement; embedding requires either duplicating the rule across every team (drift) or inventing a separate cluster-wide carve-out (which is the standalone CRD by another name). ADR-009 chose embedded for environments because environments have no cross-team form; this case is the opposite. Lifecycle also differs: platform admins write policies, team admins do not.
+Rejected: platform-wide policies cannot be expressed. "No team can use deprecated image X" needs a global statement; embedding requires either duplicating the rule across every team (drift) or inventing a separate platform-wide carve-out (which is the standalone CRD by another name). ADR-009 chose embedded for environments because environments have no cross-team form; this case is the opposite. Lifecycle also differs: platform admins write policies, team admins do not.
 
 ### Apply at the provider layer
 
@@ -379,7 +379,7 @@ Rejected for v1: requires cross-repo work across every provider package, and the
 
 ### Positive
 
-- Admins curate option lists per scope (cluster-wide, team, team-and-env) without per-team YAML duplication.
+- Admins curate option lists per scope (platform-wide, team, team-and-env) without per-team YAML duplication.
 - Operators see shorter, vetted dropdowns and a clear "curated by policy" indicator when the list is filtered.
 - kubectl-direct creates are validated against the same policy at admission. No console-only enforcement gap.
 - Provider-agnostic resolution. New providers inherit policy support as long as they return `{id, name}` shaped option entries.
