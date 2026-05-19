@@ -154,6 +154,17 @@ func (v *ClusterCreationPolicyValidator) validateScopeReferences(ctx context.Con
 	return errs
 }
 
+// validOptionTypes is the closed v1 set per ADR-018 Decision section 4.
+// CRD OpenAPI v3 schema enforces enum validation on map values but not
+// on map keys, so kubebuilder Enum on OptionType does not stop unknown
+// keys from passing CRD admission. The webhook closes that gap.
+var validOptionTypes = map[butlerv1alpha1.OptionType]bool{
+	butlerv1alpha1.OptionTypeImage:            true,
+	butlerv1alpha1.OptionTypeNetwork:          true,
+	butlerv1alpha1.OptionTypeCluster:          true,
+	butlerv1alpha1.OptionTypeStorageContainer: true,
+}
+
 // validateOptionRules enforces the mode-specific value requirements that
 // produce better operator-facing error messages than CRD schema CEL.
 // Per ADR-018 Decision section 7.
@@ -161,6 +172,19 @@ func validateOptionRules(policy *butlerv1alpha1.ClusterCreationPolicy) field.Err
 	var errs field.ErrorList
 	for optType, rule := range policy.Spec.Options {
 		path := field.NewPath("spec", "options").Key(string(optType))
+		if !validOptionTypes[optType] {
+			errs = append(errs, field.NotSupported(
+				path,
+				string(optType),
+				[]string{
+					string(butlerv1alpha1.OptionTypeImage),
+					string(butlerv1alpha1.OptionTypeNetwork),
+					string(butlerv1alpha1.OptionTypeCluster),
+					string(butlerv1alpha1.OptionTypeStorageContainer),
+				},
+			))
+			continue
+		}
 		switch rule.Mode {
 		case butlerv1alpha1.OptionModePin:
 			if len(rule.Values) != 1 {
