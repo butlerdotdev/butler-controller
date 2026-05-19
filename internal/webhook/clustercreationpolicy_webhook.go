@@ -198,7 +198,7 @@ func validateOptionRules(policy *butlerv1alpha1.ClusterCreationPolicy) field.Err
 
 // detectIntraTierConflict scans existing policies for a conflict with
 // the policy being admitted. Conflict scope per ADR-018 Decision section
-// 6 step 4: same tier (clusterWide vs team vs teamAndEnvironment),
+// 6 step 4: same tier (platformWide vs team vs teamAndEnvironment),
 // overlapping targetProviders, AND shared option-type keys.
 func (v *ClusterCreationPolicyValidator) detectIntraTierConflict(ctx context.Context, policy *butlerv1alpha1.ClusterCreationPolicy) (field.ErrorList, error) {
 	var errs field.ErrorList
@@ -236,7 +236,7 @@ func (v *ClusterCreationPolicyValidator) detectIntraTierConflict(ctx context.Con
 type scopeTier int
 
 const (
-	stClusterWide scopeTier = iota + 1
+	stPlatformWide scopeTier = iota + 1
 	stTeam
 	stTeamAndEnv
 )
@@ -247,15 +247,15 @@ func tierOfScope(s butlerv1alpha1.PolicyScope) scopeTier {
 		return stTeamAndEnv
 	case s.Team != nil:
 		return stTeam
-	case s.ClusterWide != nil:
-		return stClusterWide
+	case s.PlatformWide != nil:
+		return stPlatformWide
 	}
 	return 0
 }
 
 func sameScopeTarget(a, b butlerv1alpha1.PolicyScope) bool {
 	switch {
-	case a.ClusterWide != nil && b.ClusterWide != nil:
+	case a.PlatformWide != nil && b.PlatformWide != nil:
 		return true
 	case a.Team != nil && b.Team != nil:
 		return a.Team.TeamRef.Name == b.Team.TeamRef.Name
