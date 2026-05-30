@@ -26,6 +26,7 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	authnv1 "k8s.io/api/authentication/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -675,6 +676,19 @@ func (v *TenantClusterValidator) validatePolicy(ctx context.Context, tc *butlerv
 
 	policies := &butlerv1alpha1.ClusterCreationPolicyList{}
 	if err := v.Client.List(ctx, policies); err != nil {
+		// The ClusterCreationPolicy CRD shipped in butler-api v0.21.0
+		// and is distributed via the butler-crds Helm chart. A cluster
+		// that picks up a new butler-controller before the matching
+		// chart upgrade will not have the CRD installed; the list
+		// returns "no matches for kind" instead of an empty list.
+		// Treat that case identically to "no policies installed"
+		// (the len == 0 path below): no policies means no enforcement.
+		// Without this guard, an admission webhook wedge blocks every
+		// TenantCluster apply on the cluster, including the GitOps
+		// reconciles that would deliver the matching CRD.
+		if meta.IsNoMatchError(err) {
+			return errs, nil
+		}
 		return nil, fmt.Errorf("list ClusterCreationPolicy: %w", err)
 	}
 	if len(policies.Items) == 0 {

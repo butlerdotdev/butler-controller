@@ -24,10 +24,13 @@ import (
 
 	admissionv1 "k8s.io/api/admission/v1"
 	authnv1 "k8s.io/api/authentication/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
@@ -611,4 +614,50 @@ func TestTCWebhook_Handle_Create_EnvMaxClustersZero_Allowed(t *testing.T) {
 	tc := buildTC("p2", "team-acme", "prod", "", 1)
 	req := newTCAdmissionRequest(t, admissionv1.Create, "any@example.com", tc, nil)
 	assertAllowed(t, v.Handle(context.Background(), req))
+}
+
+// validatePolicy must treat "no matches for kind" on the
+// ClusterCreationPolicyList listing identically to "no policies installed".
+// The CRD ships in butler-api v0.21.0 via the butler-crds chart; a cluster
+// that takes a new butler-controller before the matching chart upgrade
+// has the type referenced in compiled code but not the resource registered
+// in the API server. Without this defensive path, every TenantCluster apply
+// is denied at admission, which wedges any GitOps reconcile that would
+// deliver the CRD. See 2026-05-29 butler-beta investigation in
+// .secrets/butler-beta-vtenantcluster-2026-05-29.md.
+func TestTCWebhook_ValidatePolicy_CRDMissing_TreatedAsNoPolicies(t *testing.T) {
+	s := teamScheme(t)
+
+	// Interceptor returns the same error shape the apiserver produces when
+	// the CRD is not registered: apimeta.NoKindMatchError. Other List calls
+	// fall through to the fake client's normal behavior.
+	noMatchErr := &apimeta.NoKindMatchError{
+		GroupKind: schema.GroupKind{
+			Group: "butler.butlerlabs.dev",
+			Kind:  "ClusterCreationPolicy",
+		},
+		SearchedVersions: []string{"v1alpha1"},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, inner client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*butlerv1alpha1.ClusterCreationPolicyList); ok {
+					return noMatchErr
+				}
+				return inner.List(ctx, list, opts...)
+			},
+		}).
+		Build()
+
+	v := &TenantClusterValidator{Client: c, APIReader: c}
+	tc := buildTC("tc-1", "team-acme", "prod", "", 3)
+
+	errs, err := v.validatePolicy(context.Background(), tc, butlerv1alpha1.ProviderType(""))
+	if err != nil {
+		t.Fatalf("validatePolicy returned error for missing CRD; want nil, got %v", err)
+	}
+	if len(errs) != 0 {
+		t.Fatalf("validatePolicy returned field errors for missing CRD; want none, got %d: %v", len(errs), errs)
+	}
 }
