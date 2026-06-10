@@ -3,7 +3,7 @@ module github.com/butlerdotdev/butler-controller
 go 1.24.6
 
 require (
-	github.com/butlerdotdev/butler-api v0.21.0
+	github.com/butlerdotdev/butler-api v0.21.1-0.20260610210252-e96a3324e2ce
 	github.com/onsi/ginkgo/v2 v2.22.0
 	github.com/onsi/gomega v1.36.1
 	github.com/prometheus/client_golang v1.22.0
