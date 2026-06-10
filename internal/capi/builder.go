@@ -122,6 +122,8 @@ func (b *Builder) Build() (*ResourceSet, error) {
 		return b.buildHarvesterResources()
 	case butlerv1alpha1.ProviderTypeNutanix:
 		return b.buildNutanixResources()
+	case butlerv1alpha1.ProviderTypeLocal:
+		return b.buildLocalResources()
 	default:
 		return nil, fmt.Errorf("unsupported provider type: %s", b.providerConfig.Spec.Provider)
 	}
@@ -161,6 +163,141 @@ func (b *Builder) buildHarvesterResources() (*ResourceSet, error) {
 		MachineTemplate:         machineTemplate,
 		BootstrapConfigTemplate: bootstrapTemplate,
 	}, nil
+}
+
+// buildLocalResources constructs CAPI resources for the local provider.
+// Worker nodes run as containers via the Cluster API Docker provider (CAPD) on a
+// kind-based management cluster. The control plane is a Steward TenantControlPlane
+// (pods), identical to every other provider. The local provider is always kubeadm
+// (never Talos), so the bootstrap template is always created and the MachineDeployment
+// is created in one pass (the non-Talos 1-phase path in reconcile_infrastructure).
+func (b *Builder) buildLocalResources() (*ResourceSet, error) {
+	clusterName := b.tc.Name
+
+	// Infrastructure cluster (DockerCluster).
+	infraCluster := b.buildDockerCluster(clusterName)
+
+	// Control plane (StewardControlPlane - shared across providers).
+	controlPlane := b.buildStewardControlPlane(clusterName)
+
+	// Top-level Cluster.
+	cluster := b.buildCluster(clusterName, infraCluster, controlPlane)
+
+	// Machine template (DockerMachineTemplate).
+	machineTemplate := b.buildDockerMachineTemplate(clusterName)
+
+	// Bootstrap config template (CAPD-specific minimal kubeadm join).
+	bootstrapTemplate := b.buildCAPDKubeadmConfigTemplate(clusterName)
+
+	// Machine deployment (shared).
+	machineDeployment := b.buildMachineDeployment(clusterName, machineTemplate, bootstrapTemplate)
+
+	return &ResourceSet{
+		Cluster:                 cluster,
+		InfrastructureCluster:   infraCluster,
+		ControlPlane:            controlPlane,
+		MachineDeployment:       machineDeployment,
+		MachineTemplate:         machineTemplate,
+		BootstrapConfigTemplate: bootstrapTemplate,
+	}, nil
+}
+
+// buildDockerCluster constructs the DockerCluster infrastructure resource (CAPD).
+// CAPD uses the v1beta1 infrastructure contract, like CAPX.
+func (b *Builder) buildDockerCluster(name string) *unstructured.Unstructured {
+	dc := &unstructured.Unstructured{}
+	dc.SetAPIVersion(fmt.Sprintf("%s/v1beta1", InfrastructureAPIGroup))
+	dc.SetKind("DockerCluster")
+	dc.SetName(name)
+	dc.SetNamespace(b.namespace)
+	b.applyCommonMetadata(dc)
+
+	// Control plane endpoint is owned by Steward, not CAPD: the StewardControlPlane
+	// reports the endpoint once its Service has an address, mirroring the CAPX pattern
+	// (empty host, patched later). CAPD would otherwise provision an HAProxy load
+	// balancer container for the control plane, which is unnecessary here because the
+	// control plane is the external Steward TenantControlPlane.
+	// NOTE: whether CAPD honors a pre-set endpoint or insists on its own LB must be
+	// validated live when CAPD is installed on the management cluster (PR 2.3).
+	spec := map[string]interface{}{
+		"controlPlaneEndpoint": map[string]interface{}{
+			"host": "",
+			"port": int64(6443),
+		},
+	}
+
+	dc.Object["spec"] = spec
+	return dc
+}
+
+// buildDockerMachineTemplate constructs the DockerMachineTemplate for worker nodes (CAPD).
+// CAPD runs each node as a container from a kindest/node image whose tag must match the
+// tenant Kubernetes version.
+func (b *Builder) buildDockerMachineTemplate(name string) *unstructured.Unstructured {
+	dmt := &unstructured.Unstructured{}
+	dmt.SetAPIVersion(fmt.Sprintf("%s/v1beta1", InfrastructureAPIGroup))
+	dmt.SetKind("DockerMachineTemplate")
+	dmt.SetName(fmt.Sprintf("%s-worker", name))
+	dmt.SetNamespace(b.namespace)
+	b.applyCommonMetadata(dmt)
+
+	spec := map[string]interface{}{
+		"template": map[string]interface{}{
+			"spec": map[string]interface{}{
+				"customImage": b.localNodeImage(),
+			},
+		},
+	}
+
+	dmt.Object["spec"] = spec
+	return dmt
+}
+
+// buildCAPDKubeadmConfigTemplate constructs a minimal kubeadm join template for CAPD nodes.
+// Unlike buildKubeadmConfigTemplate (Rocky Linux), CAPD nodes boot from a pre-baked
+// kindest/node image where containerd, kubelet, and kubeadm already exist, so there are no
+// package-install preKubeadmCommands. The eviction-hard override is required because kind
+// nodes share the host filesystem and the default eviction thresholds would otherwise fire
+// immediately and keep the node NotReady.
+func (b *Builder) buildCAPDKubeadmConfigTemplate(name string) *unstructured.Unstructured {
+	kct := &unstructured.Unstructured{}
+	kct.SetAPIVersion(fmt.Sprintf("%s/%s", BootstrapAPIGroup, BootstrapAPIVersion))
+	kct.SetKind("KubeadmConfigTemplate")
+	kct.SetName(fmt.Sprintf("%s-worker", name))
+	kct.SetNamespace(b.namespace)
+	b.applyCommonMetadata(kct)
+
+	spec := map[string]interface{}{
+		"template": map[string]interface{}{
+			"spec": map[string]interface{}{
+				"joinConfiguration": map[string]interface{}{
+					"nodeRegistration": map[string]interface{}{
+						"criSocket": "unix:///var/run/containerd/containerd.sock",
+						"kubeletExtraArgs": map[string]interface{}{
+							"eviction-hard": "nodefs.available<0%,nodefs.inodesFree<0%,imagefs.available<0%",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	kct.Object["spec"] = spec
+	return kct
+}
+
+// localNodeImage returns the kindest/node image for tenant worker containers. It honors an
+// explicit override on the local ProviderConfig and otherwise derives the tag from the
+// tenant Kubernetes version.
+func (b *Builder) localNodeImage() string {
+	if b.providerConfig.Spec.Local != nil && b.providerConfig.Spec.Local.KindNodeImage != "" {
+		return b.providerConfig.Spec.Local.KindNodeImage
+	}
+	version := b.tc.Spec.KubernetesVersion
+	if !strings.HasPrefix(version, "v") {
+		version = "v" + version
+	}
+	return "kindest/node:" + version
 }
 
 // buildCluster constructs the top-level CAPI Cluster resource.

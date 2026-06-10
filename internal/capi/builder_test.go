@@ -76,6 +76,77 @@ func TestBuildHarvesterResources(t *testing.T) {
 	}
 }
 
+func TestBuildLocalResources(t *testing.T) {
+	tc := newTestTenantCluster("toy", "team-demo")
+	pc := newTestProviderConfig("local")
+
+	rs, err := NewBuilder(tc, pc, "toy-abc12345").Build()
+	if err != nil {
+		t.Fatalf("failed to build local resources: %v", err)
+	}
+
+	// Every resource except the credential secret is created (CAPD needs no creds).
+	if rs.Cluster == nil || rs.InfrastructureCluster == nil || rs.ControlPlane == nil ||
+		rs.MachineDeployment == nil || rs.MachineTemplate == nil || rs.BootstrapConfigTemplate == nil {
+		t.Fatal("expected all CAPD resources to be created")
+	}
+	if rs.CredentialSecret != nil {
+		t.Error("local provider must not create a credential secret")
+	}
+
+	// Infrastructure cluster is a DockerCluster on the v1beta1 infra contract.
+	if got := rs.InfrastructureCluster.GetKind(); got != "DockerCluster" {
+		t.Errorf("InfrastructureCluster kind = %q, want DockerCluster", got)
+	}
+	if got := rs.InfrastructureCluster.GetAPIVersion(); got != "infrastructure.cluster.x-k8s.io/v1beta1" {
+		t.Errorf("DockerCluster apiVersion = %q, want infrastructure.cluster.x-k8s.io/v1beta1", got)
+	}
+
+	// Machine template is a DockerMachineTemplate; customImage derives from the k8s version.
+	if got := rs.MachineTemplate.GetKind(); got != "DockerMachineTemplate" {
+		t.Errorf("MachineTemplate kind = %q, want DockerMachineTemplate", got)
+	}
+	img, _, _ := unstructured.NestedString(rs.MachineTemplate.Object, "spec", "template", "spec", "customImage")
+	if img != "kindest/node:v1.30.2" {
+		t.Errorf("customImage = %q, want kindest/node:v1.30.2", img)
+	}
+
+	// Bootstrap is a kubeadm join template (CAPD-specific): containerd criSocket + eviction-hard,
+	// and NONE of the Rocky Linux package-install preKubeadmCommands.
+	criSocket, _, _ := unstructured.NestedString(rs.BootstrapConfigTemplate.Object,
+		"spec", "template", "spec", "joinConfiguration", "nodeRegistration", "criSocket")
+	if criSocket != "unix:///var/run/containerd/containerd.sock" {
+		t.Errorf("criSocket = %q, want containerd socket", criSocket)
+	}
+	if _, found, _ := unstructured.NestedSlice(rs.BootstrapConfigTemplate.Object, "spec", "template", "spec", "preKubeadmCommands"); found {
+		t.Error("CAPD bootstrap must not carry Rocky Linux preKubeadmCommands")
+	}
+
+	// MachineDeployment uses configRef (kubeadm), not a Talos dataSecretName.
+	bootstrap, _, _ := unstructured.NestedMap(rs.MachineDeployment.Object, "spec", "template", "spec", "bootstrap")
+	if _, hasConfigRef := bootstrap["configRef"]; !hasConfigRef {
+		t.Error("MachineDeployment bootstrap must use configRef for the local (kubeadm) path")
+	}
+	if _, hasDataSecret := bootstrap["dataSecretName"]; hasDataSecret {
+		t.Error("local MachineDeployment must not use dataSecretName (that is the Talos path)")
+	}
+}
+
+func TestLocalNodeImageOverride(t *testing.T) {
+	tc := newTestTenantCluster("toy", "team-demo")
+	pc := newTestProviderConfig("local")
+	pc.Spec.Local = &butlerv1alpha1.LocalProviderConfig{KindNodeImage: "kindest/node:v1.29.4"}
+
+	rs, err := NewBuilder(tc, pc, "toy-abc12345").Build()
+	if err != nil {
+		t.Fatalf("failed to build: %v", err)
+	}
+	img, _, _ := unstructured.NestedString(rs.MachineTemplate.Object, "spec", "template", "spec", "customImage")
+	if img != "kindest/node:v1.29.4" {
+		t.Errorf("customImage = %q, want override kindest/node:v1.29.4", img)
+	}
+}
+
 func TestBuildCluster(t *testing.T) {
 	tc := newTestTenantCluster("prod-cluster", "team-alpha")
 	pc := newTestProviderConfig("harvester")
