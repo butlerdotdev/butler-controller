@@ -48,6 +48,12 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 	var addonStatuses []butlerv1alpha1.AddonStatus
 	var failedAddons []string
 
+	// The local provider runs a single-node toy tenant on CAPD. Cilium (CNI) and
+	// MetalLB (the control plane LoadBalancer IP) are load-bearing and stay; Longhorn
+	// and Traefik are unnecessary and only add load to a constrained node.
+	providerType, _ := resolveProviderType(ctx, r.Client, tc)
+	isLocal := providerType == string(butlerv1alpha1.ProviderTypeLocal)
+
 	// 1. CNI - REQUIRED, nodes won't be Ready without it
 	ciliumVersion := addons.DefaultCiliumVersion
 	if tc.Spec.Addons.CNI != nil && tc.Spec.Addons.CNI.Version != "" {
@@ -124,13 +130,14 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 		})
 	}
 
-	// 3. Longhorn - storage
+	// 3. Longhorn - storage (skipped for local; kind's default StorageClass suffices)
 	longhornVersion := addons.DefaultLonghornVersion
 	if tc.Spec.Addons.Storage != nil && tc.Spec.Addons.Storage.Version != "" {
 		longhornVersion = tc.Spec.Addons.Storage.Version
 	}
-	logger.Info("installing Longhorn", "version", longhornVersion)
-	if err := r.Installer.InstallLonghorn(ctx, kubeconfigData, longhornVersion); err != nil {
+	if isLocal {
+		logger.Info("skipping Longhorn installation (local provider)")
+	} else if err := r.Installer.InstallLonghorn(ctx, kubeconfigData, longhornVersion); err != nil {
 		logger.Error(err, "failed to install Longhorn")
 		failedAddons = append(failedAddons, "longhorn")
 		r.Recorder.Eventf(tc, corev1.EventTypeWarning, "AddonInstallFailed",
@@ -165,8 +172,8 @@ func (r *Reconciler) reconcileAddons(ctx context.Context, tc *butlerv1alpha1.Ten
 		})
 	}
 
-	// 5. Traefik - Ingress (optional)
-	if tc.Spec.Addons.Ingress.IsIngressEnabled() {
+	// 5. Traefik - Ingress (optional; skipped for local)
+	if tc.Spec.Addons.Ingress.IsIngressEnabled() && !isLocal {
 		traefikVersion := addons.DefaultTraefikVersion
 		if tc.Spec.Addons.Ingress != nil && tc.Spec.Addons.Ingress.Version != "" {
 			traefikVersion = tc.Spec.Addons.Ingress.Version
@@ -276,12 +283,19 @@ func (r *Reconciler) reconcileAddonHealth(ctx context.Context, tc *butlerv1alpha
 		metallbVersion = tc.Spec.Addons.LoadBalancer.Version
 	}
 
+	// Local toy tenants skip Longhorn and Traefik (see reconcileAddons); only
+	// cert-manager and MetalLB are expected alongside the required Cilium.
+	providerType, _ := resolveProviderType(ctx, r.Client, tc)
+	isLocal := providerType == string(butlerv1alpha1.ProviderTypeLocal)
+
 	expected := []expectedAddon{
 		{"cert-manager", certManagerVersion},
-		{"longhorn", longhornVersion},
 		{"metallb", metallbVersion},
 	}
-	if tc.Spec.Addons.Ingress.IsIngressEnabled() {
+	if !isLocal {
+		expected = append(expected, expectedAddon{"longhorn", longhornVersion})
+	}
+	if tc.Spec.Addons.Ingress.IsIngressEnabled() && !isLocal {
 		traefikVersion := addons.DefaultTraefikVersion
 		if tc.Spec.Addons.Ingress != nil && tc.Spec.Addons.Ingress.Version != "" {
 			traefikVersion = tc.Spec.Addons.Ingress.Version
