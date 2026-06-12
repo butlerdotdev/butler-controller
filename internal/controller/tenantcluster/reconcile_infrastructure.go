@@ -130,8 +130,13 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 	//
 	// For non-Talos clusters, create all resources in one pass — kubeadm bootstrap
 	// uses a configRef to a KubeadmConfigTemplate, which CAPI handles natively.
+	// The local provider is always kubeadm/CAPD, never Talos, so it uses the one-pass
+	// path even if a TenantCluster mistakenly sets os.type=talos. Only VM providers
+	// (CAPX) need the Talos two-phase MachineDeployment deferral.
+	talosTwoPhase := isTalosCluster(tc) && providerConfig.Spec.Provider != butlerv1alpha1.ProviderTypeLocal
+
 	var initialResources []*unstructured.Unstructured
-	if isTalosCluster(tc) {
+	if talosTwoPhase {
 		initialResources = resourceSet.ResourcesWithoutMachineDeployment()
 	} else {
 		initialResources = resourceSet.AllResources()
@@ -183,7 +188,7 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, tc *butlerv1al
 		// Config must be applied BEFORE addon installation — workers need to leave
 		// maintenance mode and join the cluster before Cilium and other addons can
 		// schedule pods on them.
-		if isTalosCluster(tc) {
+		if talosTwoPhase {
 			if err := r.reconcileTalosBootstrap(ctx, tc, butlerConfig, providerConfig); err != nil {
 				logger.Error(err, "failed to reconcile Talos bootstrap")
 				return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
