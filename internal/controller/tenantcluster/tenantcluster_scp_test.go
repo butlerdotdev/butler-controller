@@ -134,7 +134,7 @@ func TestReconcileStewardControlPlane_PatchContent(t *testing.T) {
 	tests := []struct {
 		name          string
 		tcVersion     string
-		tcReplicas    int32
+		tcReplicas    *int32
 		tcResources   *butlerv1alpha1.ControlPlaneResourcesSpec
 		scpVersion    string
 		scpReplicas   int64
@@ -148,15 +148,23 @@ func TestReconcileStewardControlPlane_PatchContent(t *testing.T) {
 		{
 			name:        "no drift produces no patch",
 			tcVersion:   "v1.31.0",
-			tcReplicas:  1,
+			tcReplicas:  int32Ptr(1),
 			scpVersion:  "v1.31.0",
 			scpReplicas: 1,
 			wantNoPatch: true,
 		},
 		{
+			name:        "omitted replicas never patched (provider owns default)",
+			tcVersion:   "v1.31.0",
+			tcReplicas:  nil,
+			scpVersion:  "v1.31.0",
+			scpReplicas: 2,
+			wantNoPatch: true,
+		},
+		{
 			name:        "version drift",
 			tcVersion:   "v1.32.0",
-			tcReplicas:  1,
+			tcReplicas:  int32Ptr(1),
 			scpVersion:  "v1.31.0",
 			scpReplicas: 1,
 			wantVersion: "v1.32.0",
@@ -164,7 +172,7 @@ func TestReconcileStewardControlPlane_PatchContent(t *testing.T) {
 		{
 			name:         "replicas drift",
 			tcVersion:    "v1.31.0",
-			tcReplicas:   3,
+			tcReplicas:   int32Ptr(3),
 			scpVersion:   "v1.31.0",
 			scpReplicas:  1,
 			wantReplicas: int64Ptr(3),
@@ -172,7 +180,7 @@ func TestReconcileStewardControlPlane_PatchContent(t *testing.T) {
 		{
 			name:       "resource drift",
 			tcVersion:  "v1.31.0",
-			tcReplicas: 1,
+			tcReplicas: int32Ptr(1),
 			tcResources: &butlerv1alpha1.ControlPlaneResourcesSpec{
 				APIServer: &butlerv1alpha1.ComponentResources{
 					Requests: &butlerv1alpha1.ResourceQuantities{
@@ -190,7 +198,7 @@ func TestReconcileStewardControlPlane_PatchContent(t *testing.T) {
 		{
 			name:       "equivalent resources no drift",
 			tcVersion:  "v1.31.0",
-			tcReplicas: 1,
+			tcReplicas: int32Ptr(1),
 			tcResources: &butlerv1alpha1.ControlPlaneResourcesSpec{
 				APIServer: &butlerv1alpha1.ComponentResources{
 					Requests: &butlerv1alpha1.ResourceQuantities{
@@ -291,11 +299,13 @@ func buildSCPPatch(tc *butlerv1alpha1.TenantCluster, scp *unstructured.Unstructu
 		changes = append(changes, "version")
 	}
 
-	currentReplicas, _, _ := unstructured.NestedInt64(scp.Object, "spec", "replicas")
-	desiredReplicas := int64(tc.Spec.ControlPlane.Replicas)
-	if desiredReplicas > 0 && desiredReplicas != currentReplicas {
-		specPatch["replicas"] = desiredReplicas
-		changes = append(changes, "replicas")
+	if tc.Spec.ControlPlane.Replicas != nil {
+		currentReplicas, _, _ := unstructured.NestedInt64(scp.Object, "spec", "replicas")
+		desiredReplicas := int64(*tc.Spec.ControlPlane.Replicas)
+		if desiredReplicas != currentReplicas {
+			specPatch["replicas"] = desiredReplicas
+			changes = append(changes, "replicas")
+		}
 	}
 
 	desired := capi.ResolveControlPlaneResources(tc, butlerConfig)
