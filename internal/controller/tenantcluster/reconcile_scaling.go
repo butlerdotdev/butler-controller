@@ -343,13 +343,16 @@ func (r *Reconciler) reconcileStewardControlPlane(ctx context.Context, tc *butle
 		changes = append(changes, fmt.Sprintf("version %s->%s", currentVersion, tc.Spec.KubernetesVersion))
 	}
 
-	// Replicas drift. Only patch if TC explicitly sets replicas (> 0).
-	// SCP defaults to 2 via kubebuilder; patching 0 -> 1 would fight the default.
-	currentReplicas, _, _ := unstructured.NestedInt64(scp.Object, "spec", "replicas")
-	desiredReplicas := int64(tc.Spec.ControlPlane.Replicas)
-	if desiredReplicas > 0 && desiredReplicas != currentReplicas {
-		specPatch["replicas"] = desiredReplicas
-		changes = append(changes, fmt.Sprintf("replicas %d->%d", currentReplicas, desiredReplicas))
+	// Replicas drift. Only patch if the TenantCluster explicitly sets replicas.
+	// When it is omitted (nil), leave the SCP replicas alone so the provider
+	// default is preserved; patching it would fight that default.
+	if tc.Spec.ControlPlane.Replicas != nil {
+		currentReplicas, _, _ := unstructured.NestedInt64(scp.Object, "spec", "replicas")
+		desiredReplicas := int64(*tc.Spec.ControlPlane.Replicas)
+		if desiredReplicas != currentReplicas {
+			specPatch["replicas"] = desiredReplicas
+			changes = append(changes, fmt.Sprintf("replicas %d->%d", currentReplicas, desiredReplicas))
+		}
 	}
 
 	// CP resource drift

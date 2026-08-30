@@ -398,12 +398,6 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 	kcp.SetNamespace(b.namespace)
 	b.applyCommonMetadata(kcp)
 
-	// Get control plane replicas from spec
-	replicas := int64(1)
-	if b.tc.Spec.ControlPlane.Replicas > 0 {
-		replicas = int64(b.tc.Spec.ControlPlane.Replicas)
-	}
-
 	// Get datastore name
 	dataStoreName := "default"
 	if b.tc.Spec.ControlPlane.DataStoreRef != nil && b.tc.Spec.ControlPlane.DataStoreRef.Name != "" {
@@ -515,7 +509,6 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 	// See: https://steward.butlerlabs.dev/cluster-api/kamaji-control-plane-provider/
 	spec := map[string]interface{}{
 		"version":       b.tc.Spec.KubernetesVersion,
-		"replicas":      replicas,
 		"dataStoreName": dataStoreName,
 		"addons":        addons,
 
@@ -531,6 +524,13 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 
 		// Network configuration
 		"network": network,
+	}
+
+	// Control plane replicas: preserve provider ownership. When the tenant
+	// omits replicas (nil), leave the field unset downstream so Steward /
+	// capi-steward applies its own default. Only set it when explicit.
+	if b.tc.Spec.ControlPlane.Replicas != nil {
+		spec["replicas"] = int64(*b.tc.Spec.ControlPlane.Replicas)
 	}
 
 	// Add control plane resources if configured (ButlerConfig defaults + TenantCluster overrides)

@@ -256,12 +256,61 @@ func TestBuildStewardControlPlane(t *testing.T) {
 	if spec["version"] != "v1.30.2" {
 		t.Errorf("expected version 'v1.30.2', got '%v'", spec["version"])
 	}
-	if spec["replicas"].(int64) != 1 {
-		t.Errorf("expected replicas 1, got '%v'", spec["replicas"])
+	// Replicas omitted on the TenantCluster must be omitted downstream so the
+	// provider (Steward / capi-steward) applies its own default.
+	if v, ok := spec["replicas"]; ok {
+		t.Errorf("expected replicas to be omitted when unset on the TenantCluster, got '%v'", v)
 	}
 	if spec["dataStoreName"] != "default" {
 		t.Errorf("expected dataStoreName 'default', got '%v'", spec["dataStoreName"])
 	}
+}
+
+// TestBuildStewardControlPlane_Replicas proves the provider-owned replicas
+// contract at the point where Butler builds the StewardControlPlane spec:
+// an omitted (nil) value is omitted downstream so the provider chooses its
+// own default; explicit values are copied exactly; and an explicit zero is
+// preserved (never synthesized from nil).
+func TestBuildStewardControlPlane_Replicas(t *testing.T) {
+	ptrI32 := func(v int32) *int32 { return &v }
+	pc := newTestProviderConfig("harvester")
+
+	scpSpec := func(t *testing.T, r *int32) map[string]interface{} {
+		t.Helper()
+		tc := newTestTenantCluster("cp-replicas", "default")
+		tc.Spec.ControlPlane.Replicas = r
+		rs, err := NewBuilder(tc, pc, "cp-replicas-12345678").Build()
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		return rs.ControlPlane.Object["spec"].(map[string]interface{})
+	}
+
+	t.Run("omitted is omitted downstream", func(t *testing.T) {
+		if v, ok := scpSpec(t, nil)["replicas"]; ok {
+			t.Fatalf("replicas must be omitted when unset, got %v", v)
+		}
+	})
+
+	for _, n := range []int32{1, 2, 3} {
+		n := n
+		t.Run("explicit preserved", func(t *testing.T) {
+			got, ok := scpSpec(t, ptrI32(n))["replicas"]
+			if !ok {
+				t.Fatalf("replicas %d must be present", n)
+			}
+			if got.(int64) != int64(n) {
+				t.Fatalf("replicas = %v, want %d", got, n)
+			}
+		})
+	}
+
+	t.Run("explicit zero preserved, never from nil", func(t *testing.T) {
+		got, ok := scpSpec(t, ptrI32(0))["replicas"]
+		if !ok || got.(int64) != 0 {
+			t.Fatalf("explicit zero must emit 0, got present=%v val=%v", ok, got)
+		}
+	})
 }
 
 func TestBuildMachineDeployment(t *testing.T) {
