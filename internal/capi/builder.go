@@ -545,6 +545,17 @@ func (b *Builder) buildStewardControlPlane(name string) *unstructured.Unstructur
 		if resources.Scheduler != nil {
 			spec["scheduler"] = b.componentResourceMap(resources.Scheduler)
 		}
+		if resources.Konnectivity != nil {
+			// Konnectivity is a Steward addon, not a top-level control plane
+			// component, so its resources go into the addons block. capi-steward
+			// copies addons onto the TenantControlPlane, which renders them onto
+			// the konnectivity-server container (addons.konnectivity.server.resources).
+			addons["konnectivity"] = map[string]interface{}{
+				"server": map[string]interface{}{
+					"resources": b.componentResourceMap(resources.Konnectivity),
+				},
+			}
+		}
 	}
 
 	// Add certSANs if specified
@@ -1195,6 +1206,9 @@ func ResolveControlPlaneResources(tc *butlerv1alpha1.TenantCluster, butlerConfig
 	}
 	if tcResources.Scheduler != nil {
 		merged.Scheduler = tcResources.Scheduler
+	}
+	if tcResources.Konnectivity != nil {
+		merged.Konnectivity = tcResources.Konnectivity
 	}
 	return merged
 }
