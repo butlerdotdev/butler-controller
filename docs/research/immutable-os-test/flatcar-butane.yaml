@@ -1,0 +1,144 @@
+variant: flatcar
+version: 1.1.0
+
+# Flatcar Container Linux - kubeadm join config for Steward TCP
+# TCP: trustd-test at 10.40.0.214:6443 (v1.30.2)
+#
+# This Butane YAML must be transpiled to Ignition JSON before use:
+#   butane --strict flatcar-butane.yaml > flatcar-ignition.json
+
+storage:
+  files:
+    # Kernel networking prerequisites for Kubernetes
+    - path: /etc/sysctl.d/k8s.conf
+      mode: 0644
+      contents:
+        inline: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+
+    # Kernel modules for container networking
+    - path: /etc/modules-load.d/k8s.conf
+      mode: 0644
+      contents:
+        inline: |
+          overlay
+          br_netfilter
+
+    # containerd: enable systemd cgroup driver
+    - path: /etc/containerd/config.toml
+      mode: 0644
+      overwrite: true
+      contents:
+        inline: |
+          version = 2
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+            runtime_type = "io.containerd.runc.v2"
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+            SystemdCgroup = true
+
+    # kubeadm join configuration
+    - path: /etc/kubeadm-join-config.yaml
+      mode: 0644
+      contents:
+        inline: |
+          apiVersion: kubeadm.k8s.io/v1beta4
+          kind: JoinConfiguration
+          discovery:
+            bootstrapToken:
+              apiServerEndpoint: "10.40.0.214:6443"
+              token: "13c53e.fb7d6c11b1ea9d8d"
+              caCertHashes:
+                - "sha256:68439a2b73940beb3ce6ce06266d0764240a831066a5b31b7b85324550719761"
+          nodeRegistration:
+            criSocket: "unix:///run/containerd/containerd.sock"
+            kubeletExtraArgs:
+              - name: "cloud-provider"
+                value: "external"
+
+    # Script to download and install Kubernetes sysext, then join
+    - path: /opt/bin/setup-kubernetes.sh
+      mode: 0755
+      contents:
+        inline: |
+          #!/bin/bash
+          set -euo pipefail
+
+          K8S_VERSION="v1.30.2"
+          ARCH="x86-64"
+
+          echo "=== Downloading Kubernetes sysext ==="
+          # Try the official Flatcar sysext-bakery release
+          SYSEXT_URL="https://github.com/flatcar/sysext-bakery/releases/download/latest/kubernetes-${K8S_VERSION}-${ARCH}.raw"
+
+          # Fallback: download static binaries directly
+          if ! curl -fsSL -o /var/lib/extensions/kubernetes.raw "${SYSEXT_URL}"; then
+            echo "Sysext download failed, falling back to static binaries..."
+
+            mkdir -p /opt/bin
+            K8S_DL="https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64"
+
+            curl -fsSL -o /opt/bin/kubeadm "${K8S_DL}/kubeadm"
+            curl -fsSL -o /opt/bin/kubelet "${K8S_DL}/kubelet"
+            curl -fsSL -o /opt/bin/kubectl "${K8S_DL}/kubectl"
+            chmod +x /opt/bin/kubeadm /opt/bin/kubelet /opt/bin/kubectl
+
+            # Create kubelet systemd service
+            curl -fsSL "https://raw.githubusercontent.com/kubernetes/release/master/cmd/krel/templates/latest/kubelet/kubelet.service" \
+              | sed "s:/usr/bin:/opt/bin:g" > /etc/systemd/system/kubelet.service
+
+            mkdir -p /etc/systemd/system/kubelet.service.d
+            curl -fsSL "https://raw.githubusercontent.com/kubernetes/release/master/cmd/krel/templates/latest/kubeadm/10-kubeadm.conf" \
+              | sed "s:/usr/bin:/opt/bin:g" > /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+          else
+            echo "Sysext downloaded, refreshing extensions..."
+            systemd-sysext refresh
+          fi
+
+          echo "=== Loading kernel modules ==="
+          modprobe overlay
+          modprobe br_netfilter
+          sysctl --system
+
+          echo "=== Restarting containerd ==="
+          systemctl daemon-reload
+          systemctl restart containerd
+
+          echo "=== Enabling kubelet ==="
+          systemctl enable kubelet
+
+          echo "=== Waiting for API server ==="
+          until curl -sk https://10.40.0.214:6443/healthz; do
+            echo "Waiting for API server..."
+            sleep 5
+          done
+
+          echo "=== Running kubeadm join ==="
+          # Use /opt/bin/kubeadm if static binaries, or system kubeadm if sysext
+          KUBEADM=$(which kubeadm || echo /opt/bin/kubeadm)
+          ${KUBEADM} join --config /etc/kubeadm-join-config.yaml --v=5
+
+          echo "=== Node joined successfully ==="
+
+systemd:
+  units:
+    # Setup and join service
+    - name: setup-kubernetes.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Setup Kubernetes and join cluster
+        After=containerd.service network-online.target
+        Wants=network-online.target
+        ConditionPathExists=!/var/lib/kubelet/config.yaml
+
+        [Service]
+        Type=oneshot
+        RemainAfterExit=true
+        ExecStart=/opt/bin/setup-kubernetes.sh
+        StandardOutput=journal+console
+        StandardError=journal+console
+
+        [Install]
+        WantedBy=multi-user.target

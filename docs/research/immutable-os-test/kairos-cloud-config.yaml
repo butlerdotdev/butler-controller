@@ -1,0 +1,88 @@
+#cloud-config
+
+# Kairos - kubeadm worker join config for Steward TCP
+# TCP: trustd-test at 10.40.0.214:6443 (v1.30.2)
+#
+# STATUS: This cloud-config documents the INTENDED configuration for Kairos.
+# It does NOT work with the core ISO alone — the core ISO lacks containerd,
+# kubeadm, and kubelet. A custom ISO built with auroraboot is required.
+#
+# FINDINGS FROM HANDS-ON TESTING (2026-02-16):
+#
+# 1. Core ISO (Alpine or Ubuntu) is too minimal — no containerd, no kubeadm.
+#    The install.image pull fails because network isn't up during install.
+#
+# 2. systemd-networkd (Ubuntu variant) ships NO .network files for physical
+#    interfaces. Must add one matching the platform's NIC naming:
+#    - KubeVirt: enp1s0 (predictable naming) — use Name=enp*
+#    - Bare metal: varies — use Name=en* or Name=* for all
+#
+# 3. Boot stages (stages.boot) do NOT execute on the installed core system.
+#    The kairos-agent stage executor isn't running after install.
+#
+# 4. Alpine ISOs are not viable — no systemd, no auto-DHCP.
+#
+# TO BUILD A WORKING ISO:
+#   1. Patch Clastix image: add KAIROS_ARCH="amd64" to /etc/os-release
+#   2. Add /etc/systemd/network/20-dhcp.network to the image
+#   3. Run: auroraboot build-iso -o /output "patched-image:tag"
+#   4. Upload ISO to Harvester, boot VM with CD + empty disk
+
+install:
+  device: "auto"
+  auto: true
+  reboot: true
+  # This image has containerd + kubeadm + kubelet + provider-kubeadm.
+  # Only works if baked into ISO via auroraboot (runtime pull fails).
+  image: "quay.io/clastix/core-ubuntu-22-lts-kubeadm:1.31.1"
+
+users:
+  - name: kairos
+    passwd: kairos
+    groups:
+      - admin
+    ssh_authorized_keys: []
+
+# Provider-kubeadm cluster configuration
+# When the kubeadm image IS installed, provider-kubeadm reads this section
+# and translates it to a kubeadm JoinConfiguration, then runs kubeadm join.
+cluster:
+  cluster_token: "13c53e.fb7d6c11b1ea9d8d"
+  control_plane_host: "10.40.0.214"
+  role: worker
+  config: |
+    joinConfiguration:
+      discovery:
+        bootstrapToken:
+          apiServerEndpoint: "10.40.0.214:6443"
+          token: "13c53e.fb7d6c11b1ea9d8d"
+          caCertHashes:
+            - "sha256:68439a2b73940beb3ce6ce06266d0764240a831066a5b31b7b85324550719761"
+      nodeRegistration:
+        criSocket: "unix:///run/containerd/containerd.sock"
+        kubeletExtraArgs:
+          - name: "cloud-provider"
+            value: "external"
+
+# These stages are intended to run on the installed system, but the core
+# ISO's kairos-agent does NOT execute them. They would work if the kubeadm
+# image (with full kairos-agent) is properly installed via auroraboot ISO.
+stages:
+  initramfs:
+    - commands:
+        - modprobe overlay
+        - modprobe br_netfilter
+  boot:
+    - files:
+        # systemd-networkd DHCP config for KubeVirt NICs
+        # Must use enp* (not eth*) — KubeVirt uses predictable interface naming
+        - path: /etc/systemd/network/20-dhcp.network
+          permissions: 0644
+          content: |
+            [Match]
+            Name=enp*
+
+            [Network]
+            DHCP=yes
+    - commands:
+        - systemctl restart systemd-networkd

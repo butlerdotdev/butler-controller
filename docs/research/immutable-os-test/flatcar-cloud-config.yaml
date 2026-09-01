@@ -1,0 +1,116 @@
+# Flatcar Container Linux - Working cloud-config for Steward TCP worker join
+# TCP: trustd-test at 10.40.0.214:6443 (v1.30.2)
+#
+# IMPORTANT: Flatcar on KubeVirt must use coreos-cloudinit cloud-config format,
+# NOT Ignition. KubeVirt presents platform as "qemu" which causes Flatcar's
+# Ignition to read from fw_cfg instead of the config-2 drive.
+#
+# Key learnings:
+# - /usr/local/bin is READ-ONLY on Flatcar (immutable /usr partition)
+# - Use /opt/bin for all binaries + export PATH="/opt/bin:$PATH"
+# - kubeadm v1.30.x uses API v1beta3 (NOT v1beta4)
+# - Flatcar ships containerd but NOT kubeadm/kubelet (download from dl.k8s.io)
+# - Harvester DataVolume must use volumeMode: Block + storageClassName: longhorn-image-*
+#
+# Result: Node joined successfully as "flatcar-litmus-test" with:
+#   OS: Flatcar Container Linux by Kinvolk 4459.2.3 (Oklo)
+#   Kernel: 6.12.66-flatcar
+#   Container Runtime: containerd://2.0.7
+#   Kubelet: v1.30.2
+#   CSR: Auto-approved by Steward bootstrap token flow
+#cloud-config
+
+write_files:
+  - path: /etc/sysctl.d/k8s.conf
+    permissions: "0644"
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+
+  - path: /etc/modules-load.d/k8s.conf
+    permissions: "0644"
+    content: |
+      overlay
+      br_netfilter
+
+  - path: /etc/kubeadm-join-config.yaml
+    permissions: "0644"
+    content: |
+      apiVersion: kubeadm.k8s.io/v1beta3
+      kind: JoinConfiguration
+      discovery:
+        bootstrapToken:
+          apiServerEndpoint: "10.40.0.214:6443"
+          token: "13c53e.fb7d6c11b1ea9d8d"
+          caCertHashes:
+            - "sha256:68439a2b73940beb3ce6ce06266d0764240a831066a5b31b7b85324550719761"
+      nodeRegistration:
+        criSocket: "unix:///run/containerd/containerd.sock"
+
+  - path: /opt/bin/setup-kubernetes.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      export PATH="/opt/bin:$PATH"
+      K8S_VERSION="v1.30.2"
+
+      echo "=== Loading kernel modules ==="
+      modprobe overlay
+      modprobe br_netfilter
+      sysctl --system
+
+      echo "=== Downloading Kubernetes binaries ==="
+      mkdir -p /opt/bin
+      K8S_DL="https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64"
+
+      curl -fsSL -o /opt/bin/kubeadm "${K8S_DL}/kubeadm"
+      curl -fsSL -o /opt/bin/kubelet "${K8S_DL}/kubelet"
+      curl -fsSL -o /opt/bin/kubectl "${K8S_DL}/kubectl"
+      chmod +x /opt/bin/kubeadm /opt/bin/kubelet /opt/bin/kubectl
+
+      echo "=== Setting up kubelet service ==="
+      curl -fsSL "https://raw.githubusercontent.com/kubernetes/release/master/cmd/krel/templates/latest/kubelet/kubelet.service" \
+        | sed "s:/usr/bin:/opt/bin:g" > /etc/systemd/system/kubelet.service
+
+      mkdir -p /etc/systemd/system/kubelet.service.d
+      curl -fsSL "https://raw.githubusercontent.com/kubernetes/release/master/cmd/krel/templates/latest/kubeadm/10-kubeadm.conf" \
+        | sed "s:/usr/bin:/opt/bin:g" > /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+
+      echo "=== Restarting containerd ==="
+      systemctl daemon-reload
+      systemctl enable kubelet
+
+      echo "=== Waiting for API server ==="
+      until curl -sk https://10.40.0.214:6443/healthz; do
+        echo "Waiting for API server..."
+        sleep 5
+      done
+
+      echo "=== Running kubeadm join ==="
+      /opt/bin/kubeadm join --config /etc/kubeadm-join-config.yaml --v=5
+
+      echo "=== Node joined successfully ==="
+
+coreos:
+  units:
+    - name: setup-kubernetes.service
+      command: start
+      content: |
+        [Unit]
+        Description=Setup Kubernetes and join cluster
+        After=containerd.service network-online.target
+        Wants=network-online.target
+        ConditionPathExists=!/var/lib/kubelet/config.yaml
+
+        [Service]
+        Type=oneshot
+        RemainAfterExit=true
+        ExecStart=/opt/bin/setup-kubernetes.sh
+        StandardOutput=journal+console
+        StandardError=journal+console
+
+        [Install]
+        WantedBy=multi-user.target
