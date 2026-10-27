@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
@@ -138,7 +139,7 @@ var _ = Describe("Team Controller", func() {
 				return err == nil
 			}, timeout, interval).Should(BeTrue())
 
-			Expect(adminRB.RoleRef.Name).To(Equal("cluster-admin"))
+			Expect(adminRB.RoleRef.Name).To(Equal("admin"))
 			Expect(adminRB.Subjects).To(HaveLen(1))
 			Expect(adminRB.Subjects[0].Name).To(Equal("admin@example.com"))
 			Expect(adminRB.Subjects[0].Kind).To(Equal(rbacv1.UserKind))
@@ -205,7 +206,7 @@ var _ = Describe("Team Controller", func() {
 				return err == nil
 			}, timeout, interval).Should(BeTrue())
 
-			Expect(adminRB.RoleRef.Name).To(Equal("cluster-admin"))
+			Expect(adminRB.RoleRef.Name).To(Equal("admin"))
 			Expect(adminRB.Subjects[0].Kind).To(Equal(rbacv1.GroupKind))
 
 			// Verify AD group RoleBinding (sanitized name)
@@ -219,6 +220,7 @@ var _ = Describe("Team Controller", func() {
 			}, timeout, interval).Should(BeTrue())
 
 			Expect(adRB.Subjects[0].Name).To(Equal("CN=APP-K8S-Users,OU=Groups,DC=corp"))
+			Expect(adRB.RoleRef.Name).To(Equal("edit"))
 
 			// Cleanup
 			Expect(k8sClient.Delete(testCtx, team)).Should(Succeed())
@@ -511,7 +513,7 @@ var _ = Describe("Team Controller", func() {
 				return err == nil
 			}, timeout, interval).Should(BeTrue())
 
-			Expect(newRB.RoleRef.Name).To(Equal("cluster-admin"))
+			Expect(newRB.RoleRef.Name).To(Equal("admin"))
 
 			// Verify old RoleBinding is deleted
 			Eventually(func() bool {
@@ -526,9 +528,176 @@ var _ = Describe("Team Controller", func() {
 			Expect(k8sClient.Delete(testCtx, team)).Should(Succeed())
 		})
 	})
+
+	Context("When mapping team roles to Kubernetes RBAC", func() {
+		getRB := func(ns, name string) *rbacv1.RoleBinding {
+			rb := &rbacv1.RoleBinding{}
+			Eventually(func() error {
+				return k8sClient.Get(testCtx, types.NamespacedName{Name: name, Namespace: ns}, rb)
+			}, timeout, interval).Should(Succeed())
+			return rb
+		}
+
+		reconcileN := func(name string, n int) {
+			for i := 0; i < n; i++ {
+				_, err := testReconciler.Reconcile(testCtx, reconcile.Request{
+					NamespacedName: types.NamespacedName{Name: name},
+				})
+				Expect(err).NotTo(HaveOccurred())
+			}
+		}
+
+		It("Should bind admin->admin, operator->edit, viewer->view (never cluster-admin)", func() {
+			team := &butlerv1alpha1.Team{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-team-role-map"},
+				Spec: butlerv1alpha1.TeamSpec{
+					DisplayName: "Test Team Role Map",
+					Access: butlerv1alpha1.TeamAccess{
+						Users: []butlerv1alpha1.TeamUser{
+							{Name: "a@example.com", Role: butlerv1alpha1.TeamRoleAdmin},
+							{Name: "o@example.com", Role: butlerv1alpha1.TeamRoleOperator},
+							{Name: "v@example.com", Role: butlerv1alpha1.TeamRoleViewer},
+						},
+						Groups: []butlerv1alpha1.TeamGroup{
+							{Name: "viewers", Role: butlerv1alpha1.TeamRoleViewer},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(testCtx, team)).Should(Succeed())
+			reconcileN(team.Name, 3)
+
+			Expect(getRB(team.Name, "butler-team-user-a-example-com").RoleRef.Name).To(Equal("admin"))
+			Expect(getRB(team.Name, "butler-team-user-o-example-com").RoleRef.Name).To(Equal("edit"))
+			viewerRB := getRB(team.Name, "butler-team-user-v-example-com")
+			Expect(viewerRB.RoleRef.Kind).To(Equal("ClusterRole"))
+			Expect(viewerRB.RoleRef.Name).To(Equal("view"))
+			Expect(viewerRB.Subjects).To(ConsistOf(rbacv1.Subject{
+				Kind: rbacv1.UserKind, APIGroup: rbacv1.GroupName, Name: "v@example.com",
+			}))
+			Expect(getRB(team.Name, "butler-team-group-viewers").RoleRef.Name).To(Equal("view"))
+
+			rbList := &rbacv1.RoleBindingList{}
+			Expect(k8sClient.List(testCtx, rbList, client.InNamespace(team.Name))).To(Succeed())
+			for _, rb := range rbList.Items {
+				Expect(rb.RoleRef.Name).NotTo(Equal("cluster-admin"), "binding %s", rb.Name)
+			}
+
+			Expect(k8sClient.Delete(testCtx, team)).Should(Succeed())
+		})
+
+		It("Should recreate the binding with edit when a viewer becomes an operator", func() {
+			team := &butlerv1alpha1.Team{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-team-role-change"},
+				Spec: butlerv1alpha1.TeamSpec{
+					DisplayName: "Test Team Role Change",
+					Access: butlerv1alpha1.TeamAccess{
+						Users: []butlerv1alpha1.TeamUser{
+							{Name: "promote@example.com", Role: butlerv1alpha1.TeamRoleViewer},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(testCtx, team)).Should(Succeed())
+			reconcileN(team.Name, 3)
+
+			rbName := "butler-team-user-promote-example-com"
+			before := getRB(team.Name, rbName)
+			Expect(before.RoleRef.Name).To(Equal("view"))
+			oldUID := before.UID
+
+			Eventually(func() error {
+				latest := &butlerv1alpha1.Team{}
+				if err := k8sClient.Get(testCtx, types.NamespacedName{Name: team.Name}, latest); err != nil {
+					return err
+				}
+				latest.Spec.Access.Users[0].Role = butlerv1alpha1.TeamRoleOperator
+				return k8sClient.Update(testCtx, latest)
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				_, _ = testReconciler.Reconcile(testCtx, reconcile.Request{
+					NamespacedName: types.NamespacedName{Name: team.Name},
+				})
+				after := &rbacv1.RoleBinding{}
+				g.Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: rbName, Namespace: team.Name}, after)).To(Succeed())
+				g.Expect(after.RoleRef.Name).To(Equal("edit"))
+				g.Expect(after.UID).NotTo(Equal(oldUID))
+			}, timeout, interval).Should(Succeed())
+
+			Expect(k8sClient.Delete(testCtx, team)).Should(Succeed())
+		})
+
+		It("Should migrate a legacy cluster-admin binding to admin", func() {
+			team := &butlerv1alpha1.Team{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-team-legacy-admin"},
+				Spec: butlerv1alpha1.TeamSpec{
+					DisplayName: "Test Team Legacy Admin",
+					Access: butlerv1alpha1.TeamAccess{
+						Users: []butlerv1alpha1.TeamUser{
+							{Name: "boss@example.com", Role: butlerv1alpha1.TeamRoleAdmin},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(testCtx, team)).Should(Succeed())
+			// Create the namespace, then replace the binding with a pre-fix (cluster-admin) one.
+			reconcileN(team.Name, 3)
+			Eventually(func() error {
+				return k8sClient.Get(testCtx, types.NamespacedName{Name: team.Name}, &corev1.Namespace{})
+			}, timeout, interval).Should(Succeed())
+			rbName := "butler-team-user-boss-example-com"
+			_ = k8sClient.Delete(testCtx, &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: rbName, Namespace: team.Name}})
+			Eventually(func() bool {
+				err := k8sClient.Get(testCtx, types.NamespacedName{Name: rbName, Namespace: team.Name}, &rbacv1.RoleBinding{})
+				return apierrors.IsNotFound(err)
+			}, timeout, interval).Should(BeTrue())
+			legacy := &rbacv1.RoleBinding{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: rbName, Namespace: team.Name,
+					Labels: map[string]string{
+						butlerv1alpha1.LabelTeam:      team.Name,
+						butlerv1alpha1.LabelManagedBy: "butler",
+					},
+				},
+				Subjects: []rbacv1.Subject{{Kind: rbacv1.UserKind, APIGroup: rbacv1.GroupName, Name: "boss@example.com"}},
+				RoleRef:  rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "cluster-admin"},
+			}
+			Expect(k8sClient.Create(testCtx, legacy)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				_, _ = testReconciler.Reconcile(testCtx, reconcile.Request{
+					NamespacedName: types.NamespacedName{Name: team.Name},
+				})
+				after := &rbacv1.RoleBinding{}
+				g.Expect(k8sClient.Get(testCtx, types.NamespacedName{Name: rbName, Namespace: team.Name}, after)).To(Succeed())
+				g.Expect(after.RoleRef.Name).To(Equal("admin"))
+			}, timeout, interval).Should(Succeed())
+
+			Expect(k8sClient.Delete(testCtx, team)).Should(Succeed())
+		})
+	})
 })
 
 // Unit tests for helper functions (standard Go tests, not Ginkgo)
+func TestClusterRoleForTeamRole(t *testing.T) {
+	tests := []struct {
+		role butlerv1alpha1.TeamRole
+		want string
+	}{
+		{butlerv1alpha1.TeamRoleAdmin, "admin"},
+		{butlerv1alpha1.TeamRoleOperator, "edit"},
+		{butlerv1alpha1.TeamRoleViewer, "view"},
+		{"", "view"},
+		{"superuser", "view"},
+		{"Admin", "view"},
+	}
+	for _, tt := range tests {
+		if got := clusterRoleForTeamRole(tt.role); got != tt.want {
+			t.Errorf("clusterRoleForTeamRole(%q) = %q, want %q", tt.role, got, tt.want)
+		}
+	}
+}
 func TestSanitizeName(t *testing.T) {
 	tests := []struct {
 		name     string
