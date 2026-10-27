@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	butlerv1alpha1 "github.com/butlerdotdev/butler-api/api/v1alpha1"
 )
@@ -427,7 +428,7 @@ var _ = Describe("TenantCluster Controller", func() {
 			Expect(k8sClient.Create(ctx, butlerConfig)).To(Succeed())
 		})
 
-		It("should create RoleBinding in tenant namespace for team access", func() {
+		It("should create per-role RoleBindings in tenant namespace for team access", func() {
 			// Create team namespace
 			teamNS := newNamespace("team-gamma")
 			Expect(k8sClient.Create(ctx, teamNS)).To(Succeed())
@@ -443,9 +444,11 @@ var _ = Describe("TenantCluster Controller", func() {
 						Users: []butlerv1alpha1.TeamUser{
 							{Name: "alice@example.com", Role: butlerv1alpha1.TeamRoleAdmin},
 							{Name: "bob@example.com", Role: butlerv1alpha1.TeamRoleOperator},
+							{Name: "carol@example.com", Role: butlerv1alpha1.TeamRoleViewer},
 						},
 						Groups: []butlerv1alpha1.TeamGroup{
 							{Name: "developers", Role: butlerv1alpha1.TeamRoleOperator},
+							{Name: "auditors", Role: butlerv1alpha1.TeamRoleViewer},
 						},
 					},
 				},
@@ -481,22 +484,150 @@ var _ = Describe("TenantCluster Controller", func() {
 				return tenantNS
 			}, timeout, interval).ShouldNot(BeEmpty())
 
-			// Verify RoleBinding exists
-			rb := &rbacv1.RoleBinding{}
-			rbName := "butler-team-team-gamma-access"
-			Eventually(func() error {
-				return k8sClient.Get(ctx, types.NamespacedName{
-					Name:      rbName,
-					Namespace: tenantNS,
-				}, rb)
-			}, timeout, interval).Should(Succeed())
+			user := func(n string) rbacv1.Subject {
+				return rbacv1.Subject{Kind: rbacv1.UserKind, APIGroup: rbacv1.GroupName, Name: n}
+			}
+			group := func(n string) rbacv1.Subject {
+				return rbacv1.Subject{Kind: rbacv1.GroupKind, APIGroup: rbacv1.GroupName, Name: n}
+			}
+			expectBinding := func(rbName, clusterRole string, subjects ...rbacv1.Subject) {
+				rb := &rbacv1.RoleBinding{}
+				Eventually(func() error {
+					return k8sClient.Get(ctx, types.NamespacedName{Name: rbName, Namespace: tenantNS}, rb)
+				}, timeout, interval).Should(Succeed())
+				Expect(rb.RoleRef.Kind).To(Equal("ClusterRole"))
+				Expect(rb.RoleRef.Name).To(Equal(clusterRole))
+				Expect(rb.Subjects).To(ConsistOf(subjects))
+				Expect(rb.Labels).To(HaveKeyWithValue(butlerv1alpha1.LabelManagedBy, "butler"))
+				Expect(rb.Labels).To(HaveKeyWithValue(butlerv1alpha1.LabelTeam, "team-gamma"))
+				Expect(rb.Labels).To(HaveKeyWithValue(butlerv1alpha1.LabelTenant, tc.Name))
+			}
 
-			// Verify RoleBinding has correct subjects
-			Expect(rb.RoleRef.Kind).To(Equal("ClusterRole"))
-			Expect(rb.RoleRef.Name).To(Equal("admin"))
-			Expect(rb.Subjects).To(HaveLen(3)) // 2 users + 1 group
+			expectBinding("butler-team-team-gamma-admin-access", "admin", user("alice@example.com"))
+			expectBinding("butler-team-team-gamma-operator-access", "edit",
+				user("bob@example.com"), group("developers"))
+			expectBinding("butler-team-team-gamma-viewer-access", "view",
+				user("carol@example.com"), group("auditors"))
+
+			// The legacy all-members admin binding must not exist.
+			err := k8sClient.Get(ctx, types.NamespacedName{
+				Name: "butler-team-team-gamma-access", Namespace: tenantNS,
+			}, &rbacv1.RoleBinding{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+			// Only admins hold ClusterRole admin (which can read the admin kubeconfig Secret).
+			rbList := &rbacv1.RoleBindingList{}
+			Expect(k8sClient.List(ctx, rbList, client.InNamespace(tenantNS))).To(Succeed())
+			for _, rb := range rbList.Items {
+				if rb.RoleRef.Name == "admin" || rb.RoleRef.Name == "cluster-admin" {
+					Expect(rb.Subjects).To(ConsistOf(user("alice@example.com")), "binding %s", rb.Name)
+				}
+			}
 
 			// Clean up
+			_ = k8sClient.Delete(ctx, teamNS)
+		})
+
+		It("should delete the legacy binding and empty per-role bindings", func() {
+			teamNS := newNamespace("team-delta")
+			Expect(k8sClient.Create(ctx, teamNS)).To(Succeed())
+
+			team := &butlerv1alpha1.Team{
+				ObjectMeta: metav1.ObjectMeta{Name: "team-delta"},
+				Spec: butlerv1alpha1.TeamSpec{
+					DisplayName: "Team Delta",
+					Access: butlerv1alpha1.TeamAccess{
+						Users: []butlerv1alpha1.TeamUser{
+							{Name: "dana@example.com", Role: butlerv1alpha1.TeamRoleAdmin},
+							{Name: "vic@example.com", Role: butlerv1alpha1.TeamRoleViewer},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, team)).To(Succeed())
+
+			// Exercise the namespace reconcile directly with a non-cached client so
+			// the test is deterministic regardless of the running manager.
+			tenantNS := newNamespace("delta-tenant-ns")
+			Expect(k8sClient.Create(ctx, tenantNS)).To(Succeed())
+			teamName := team.Name
+			tc := newTenantCluster("delta-cluster", "team-delta", &teamName)
+			r := &Reconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+
+			// Pre-existing legacy binding that granted admin to every member.
+			legacy := &rbacv1.RoleBinding{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "butler-team-team-delta-access",
+					Namespace: tenantNS.Name,
+					Labels: map[string]string{
+						butlerv1alpha1.LabelManagedBy: "butler",
+						butlerv1alpha1.LabelTeam:      "team-delta",
+						butlerv1alpha1.LabelTenant:    tc.Name,
+					},
+				},
+				RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "admin"},
+				Subjects: []rbacv1.Subject{
+					{Kind: rbacv1.UserKind, APIGroup: rbacv1.GroupName, Name: "dana@example.com"},
+					{Kind: rbacv1.UserKind, APIGroup: rbacv1.GroupName, Name: "vic@example.com"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, legacy)).To(Succeed())
+
+			Expect(r.reconcileTeamRoleBinding(ctx, tc, tenantNS.Name)).To(Succeed())
+
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "butler-team-team-delta-access", Namespace: tenantNS.Name,
+			}, &rbacv1.RoleBinding{}))).To(BeTrue())
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "butler-team-team-delta-operator-access", Namespace: tenantNS.Name,
+			}, &rbacv1.RoleBinding{}))).To(BeTrue(), "no operator subjects -> no operator binding")
+
+			viewerRB := &rbacv1.RoleBinding{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "butler-team-team-delta-viewer-access", Namespace: tenantNS.Name,
+			}, viewerRB)).To(Succeed())
+			Expect(viewerRB.RoleRef.Name).To(Equal("view"))
+
+			// Idempotent.
+			Expect(r.reconcileTeamRoleBinding(ctx, tc, tenantNS.Name)).To(Succeed())
+
+			// Promote the viewer to operator: viewer binding is removed, operator created.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: team.Name}, team)).To(Succeed())
+			team.Spec.Access.Users[1].Role = butlerv1alpha1.TeamRoleOperator
+			Expect(k8sClient.Update(ctx, team)).To(Succeed())
+
+			Expect(r.reconcileTeamRoleBinding(ctx, tc, tenantNS.Name)).To(Succeed())
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "butler-team-team-delta-viewer-access", Namespace: tenantNS.Name,
+			}, &rbacv1.RoleBinding{}))).To(BeTrue())
+			opRB := &rbacv1.RoleBinding{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "butler-team-team-delta-operator-access", Namespace: tenantNS.Name,
+			}, opRB)).To(Succeed())
+			Expect(opRB.RoleRef.Name).To(Equal("edit"))
+			Expect(opRB.Subjects).To(ConsistOf(rbacv1.Subject{
+				Kind: rbacv1.UserKind, APIGroup: rbacv1.GroupName, Name: "vic@example.com",
+			}))
+
+			// A per-role binding with a drifted roleRef is recreated.
+			adminRB := &rbacv1.RoleBinding{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "butler-team-team-delta-admin-access", Namespace: tenantNS.Name,
+			}, adminRB)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, adminRB)).To(Succeed())
+			drifted := &rbacv1.RoleBinding{
+				ObjectMeta: metav1.ObjectMeta{Name: "butler-team-team-delta-admin-access", Namespace: tenantNS.Name},
+				RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "cluster-admin"},
+				Subjects:   adminRB.Subjects,
+			}
+			Expect(k8sClient.Create(ctx, drifted)).To(Succeed())
+			Expect(r.reconcileTeamRoleBinding(ctx, tc, tenantNS.Name)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: "butler-team-team-delta-admin-access", Namespace: tenantNS.Name,
+			}, adminRB)).To(Succeed())
+			Expect(adminRB.RoleRef.Name).To(Equal("admin"))
+
+			_ = k8sClient.Delete(ctx, tenantNS)
 			_ = k8sClient.Delete(ctx, teamNS)
 		})
 	})

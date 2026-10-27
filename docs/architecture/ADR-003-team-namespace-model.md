@@ -29,7 +29,7 @@ We implement a two-level namespace model:
 - Generated name: `{cluster-name}-{uid-prefix}` (e.g., `production-a7b8c9`)
 - Contains CAPI Cluster, MachineDeployment, KamajiControlPlane
 - Contains Kamaji pods (kube-apiserver, controller-manager, etc.)
-- Butler auto-creates RoleBindings for team access
+- Butler auto-creates per-role RoleBindings for team access (admin -> `admin`, operator -> `edit`, viewer -> `view`; see ARCHITECTURE.md "RBAC Model")
 - Labels connect back to source Team and TenantCluster
 
 ```

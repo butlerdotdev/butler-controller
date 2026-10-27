@@ -41,12 +41,6 @@ const (
 	// roleBindingPrefix is the prefix for RoleBinding names created by this controller.
 	roleBindingPrefix = "butler-team-"
 
-	// clusterRoleAdmin is the ClusterRole for admin users.
-	clusterRoleAdmin = "cluster-admin"
-
-	// clusterRoleMember is the ClusterRole for member users.
-	clusterRoleMember = "edit"
-
 	requeueInterval = 5 * time.Minute
 )
 
@@ -340,10 +334,7 @@ func (r *Reconciler) ensureRoleBinding(
 	logger := log.FromContext(ctx)
 
 	// Determine ClusterRole based on TeamRole
-	clusterRole := clusterRoleMember
-	if role == butlerv1alpha1.TeamRoleAdmin {
-		clusterRole = clusterRoleAdmin
-	}
+	clusterRole := clusterRoleForTeamRole(role)
 
 	// Check if RoleBinding already exists
 	existing := &rbacv1.RoleBinding{}
@@ -406,6 +397,27 @@ func (r *Reconciler) ensureRoleBinding(
 
 	logger.V(1).Info("RoleBinding reconciled", "name", name, "subject", subjectName, "role", role, "operation", "created")
 	return nil
+}
+
+// clusterRoleForTeamRole maps a Butler TeamRole to the Kubernetes built-in
+// ClusterRole bound in the team namespace. The mapping is least-privilege:
+//
+//   - admin    -> "admin" (namespace-scoped admin, including RBAC within the namespace)
+//   - operator -> "edit"  (create/modify workloads and TenantClusters, no RBAC)
+//   - viewer   -> "view"  (read-only, no Secrets)
+//
+// Any unknown or empty role is treated as viewer, matching the API default
+// (+kubebuilder:default="viewer"), so an unrecognized value can never widen
+// access.
+func clusterRoleForTeamRole(role butlerv1alpha1.TeamRole) string {
+	switch role {
+	case butlerv1alpha1.TeamRoleAdmin:
+		return "admin"
+	case butlerv1alpha1.TeamRoleOperator:
+		return "edit"
+	default:
+		return "view"
+	}
 }
 
 // updateRoleBinding updates an existing RoleBinding's labels and subjects (but not roleRef).
